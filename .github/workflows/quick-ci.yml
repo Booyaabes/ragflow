@@ -1,0 +1,129 @@
+name: quick-ci
+
+# Lightweight checks that run on stock GitHub-hosted ubuntu-latest runners,
+# unlike sep-tests.yml/release.yml/serenedb.yml which require Infiniflow's
+# self-hosted ragflow-test/ragflow-release runners and pre-seeded native
+# libs/testdata. This workflow covers: Go build + unit tests, Python
+# lint + tests, and frontend lint + type-check + tests.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: quick-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go-test:
+    name: Go build + unit tests
+    runs-on: ubuntu-latest
+    env:
+      # onnxruntime_go is a fresh org mirror not yet in the public Go checksum
+      # database, so Go must resolve it directly from GitHub instead of the
+      # module proxy/sumdb.
+      GOPRIVATE: github.com/infiniflow/onnxruntime_go
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v3
+
+      - name: Install native build toolchain (cmake, clang-20, lld-20)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates gpg wget libpcre2-dev
+          wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null \
+            | gpg --dearmor - | sudo tee /usr/share/keyrings/kitware-archive-keyring.gpg >/dev/null
+          echo 'deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ noble main' \
+            | sudo tee /etc/apt/sources.list.d/kitware.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y kitware-archive-keyring
+          sudo apt-get update
+          sudo apt-get install -y cmake clang-20 lld-20
+          sudo ln -sf /usr/bin/clang++-20 /usr/bin/clang++
+          sudo ln -sf /usr/bin/clang-20 /usr/bin/clang
+          sudo ln -sf /usr/bin/ld.lld-20 /usr/bin/ld.lld
+
+      - name: Cache native static libs (office_oxide/pdfium/pdf_oxide/onnxruntime)
+        uses: actions/cache@v4
+        with:
+          path: ~/ragflow-native-libs
+          key: ragflow-native-libs-${{ hashFiles('ragflow_deps/download_go_deps.py') }}
+
+      - name: Download Go native deps
+        run: uv run python3 ragflow_deps/download_go_deps.py
+
+      - name: Run Go unit tests
+        run: bash build.sh --test ./...
+
+  python-test:
+    name: Python lint + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v3
+
+      - name: Install dependencies
+        run: |
+          uv sync --python 3.13 --group test --frozen
+          uv pip install -e sdk/python
+
+      - name: Ruff check
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      # pytest's default testpaths (test/) are HTTP/SDK/web-API integration
+      # suites that expect a live docker-compose'd RAGFlow instance plus real
+      # LLM credentials (see sep-tests.yml) — they cannot run standalone on
+      # ubuntu-latest. ragflow_deps/test_download_go_deps.py is the one
+      # genuinely self-contained unit test outside that tree.
+      - name: Run standalone unit tests
+        run: uv run pytest ragflow_deps/test_download_go_deps.py -q --durations=100
+
+  frontend-test:
+    name: Frontend lint + type-check + tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint (oxlint)
+        run: npm run lint
+
+      - name: Format check (oxfmt)
+        run: npm run format:check
+
+      - name: Type check
+        run: npm run type-check
+
+      - name: Tests (jest)
+        run: npm run test
