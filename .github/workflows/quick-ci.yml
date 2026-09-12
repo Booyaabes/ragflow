@@ -70,6 +70,19 @@ jobs:
       - name: Build C++ tokenizer static library
         run: bash build.sh --cpp
 
+      # internal/tokenizer's BPE loader is offline-only by design (see
+      # internal/tokenizer/bpe_loader.go) — it never hits the network itself,
+      # it only reads ragflow_deps/cl100k_base.tiktoken (or TIKTOKEN_CACHE_DIR)
+      # from disk, and panics loudly rather than silently zeroing every token
+      # count. Fetch that one small table directly instead of running the full
+      # ragflow_deps/download_deps.py (which also pulls GBs of HF models/NLTK
+      # data unrelated to unit tests) — mirrors sep-tests.yml's own fallback.
+      - name: Fetch cl100k_base BPE table
+        run: |
+          mkdir -p ragflow_deps
+          curl -fsSL -o ragflow_deps/cl100k_base.tiktoken \
+            https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken
+
       - name: Run Go unit tests
         run: bash build.sh --test ./...
 
