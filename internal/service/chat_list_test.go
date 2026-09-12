@@ -122,6 +122,15 @@ func TestChatServiceListChatsFiltersByOwnerIDs(t *testing.T) {
 
 	createChatListTestChat(t, db, "chat-own", "user-1", "own_chat")
 	createChatListTestChat(t, db, "chat-team", "tenant-2", "team_chat")
+	createChatListTestChat(t, db, "chat-team-private", "tenant-2", "team_private_chat")
+	// Cross-tenant visibility (owner_ids filtering into another tenant) requires
+	// that tenant's chat to be explicitly team-shared, mirroring the dataset
+	// permission gate in kb.go; chat-team-private is left at its default
+	// permission="" (not "team") and must stay excluded.
+	if err := db.Model(&entity.Chat{}).Where("id = ?", "chat-team").
+		Update("permission", string(entity.TenantPermissionTeam)).Error; err != nil {
+		t.Fatalf("failed to mark chat-team as team-shared: %v", err)
+	}
 
 	svc := NewChatService()
 	ctx := t.Context()
@@ -129,14 +138,25 @@ func TestChatServiceListChatsFiltersByOwnerIDs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListChats failed: %v", err)
 	}
-	if result.Total != 1 || len(result.Chats) != 1 {
-		t.Fatalf("expected one filtered chat, got total=%d len=%d", result.Total, len(result.Chats))
+	// The caller's own chats stay visible alongside the filtered tenant's
+	// team-shared chats (mirrors kb.go's GetByTenantIDs, which always
+	// includes the caller's own tenant); the filtered tenant's non-team-shared
+	// chat must not leak through.
+	if result.Total != 2 || len(result.Chats) != 2 {
+		t.Fatalf("expected 2 chats (own + team-shared), got total=%d len=%d", result.Total, len(result.Chats))
 	}
-	if result.Chats[0].TenantID != "tenant-2" {
-		t.Fatalf("expected tenant-2 chat, got tenant %q", result.Chats[0].TenantID)
+	seen := make(map[string]bool)
+	for _, chat := range result.Chats {
+		seen[chat.ID] = true
 	}
-	if result.Chats[0].Nickname != "team owner" {
-		t.Fatalf("expected nickname team owner, got %q", result.Chats[0].Nickname)
+	if !seen["chat-own"] {
+		t.Fatal("expected caller's own chat to remain visible")
+	}
+	if !seen["chat-team"] {
+		t.Fatal("expected the filtered tenant's team-shared chat to be visible")
+	}
+	if seen["chat-team-private"] {
+		t.Fatal("expected the filtered tenant's non-team-shared chat to stay hidden")
 	}
 }
 
