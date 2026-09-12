@@ -50,6 +50,7 @@ type chatSessionStore interface {
 	ListByChatID(ctx context.Context, db *gorm.DB, chatID, sessionID, name, orderby string, desc bool, page, pageSize int) ([]*entity.ChatSession, error)
 	GetDialogByID(ctx context.Context, db *gorm.DB, chatID string) (*entity.Chat, error)
 	CheckDialogExists(ctx context.Context, db *gorm.DB, tenantID, chatID string) (bool, error)
+	CheckDialogTeamShared(ctx context.Context, db *gorm.DB, tenantID, chatID string) (bool, error)
 }
 
 type userTenantStore interface {
@@ -178,33 +179,15 @@ func (s *ChatSessionService) SetChatSession(ctx context.Context, userID string, 
 // RemoveChatSessions removes chat sessions.
 // Kept as a compatibility entrypoint for older chat-session callers.
 func (s *ChatSessionService) RemoveChatSessions(ctx context.Context, userID string, chatSessions []string) error {
-	tenantIDs, err := s.userTenantDAO.GetTenantIDsByUserID(ctx, dao.DB, userID)
-	if err != nil {
-		return err
-	}
-
-	tenantIDSet := make(map[string]bool)
-	for _, tid := range tenantIDs {
-		tenantIDSet[tid] = true
-	}
-	tenantIDSet[userID] = true
-
 	for _, convID := range chatSessions {
 		session, err := s.chatSessionDAO.GetByID(ctx, dao.DB, convID)
 		if err != nil {
 			return fmt.Errorf("chat session not found: %s", convID)
 		}
 
-		isOwner := false
-		for tenantID := range tenantIDSet {
-			exists, err := s.chatSessionDAO.CheckDialogExists(ctx, dao.DB, tenantID, session.DialogID)
-			if err != nil {
-				return err
-			}
-			if exists {
-				isOwner = true
-				break
-			}
+		isOwner, err := s.ensureOwnedChat(ctx, userID, session.DialogID)
+		if err != nil {
+			return err
 		}
 		if !isOwner {
 			return errors.New("only owner of chat session authorized for this operation")
@@ -244,36 +227,10 @@ type ChatSessionPayload struct {
 
 // ListChatSessions lists chat sessions for a dialog
 func (s *ChatSessionService) ListChatSessions(ctx context.Context, userID, chatID, sessionID, name, orderby string, desc bool, page, pageSize int) (*ListChatSessionsResponse, error) {
-	// Get user's tenants
-	tenantIDs, err := s.userTenantDAO.GetTenantIDsByUserID(ctx, dao.DB, userID)
+	isOwner, err := s.ensureOwnedChat(ctx, userID, chatID)
 	if err != nil {
 		return nil, err
 	}
-
-	// Check if user is the owner of the dialog
-	isOwner := false
-	for _, tenantID := range tenantIDs {
-		var exists bool
-		exists, err = s.chatSessionDAO.CheckDialogExists(ctx, dao.DB, tenantID, chatID)
-		if err != nil {
-			return nil, err
-		}
-		if exists {
-			isOwner = true
-			break
-		}
-	}
-
-	// Also check with userID as tenant
-	if !isOwner {
-		var exists bool
-		exists, err = s.chatSessionDAO.CheckDialogExists(ctx, dao.DB, userID, chatID)
-		if err != nil {
-			return nil, err
-		}
-		isOwner = exists
-	}
-
 	if !isOwner {
 		return nil, errors.New("no authorization")
 	}
@@ -709,32 +666,34 @@ func (s *ChatSessionService) DeleteSessionMessage(ctx context.Context, userID, c
 
 func (s *ChatSessionService) UpdateMessageFeedback(ctx context.Context, userID, chatID, sessionID, msgID string, req map[string]interface{}) (*ChatSessionPayload, common.ErrorCode, error) {
 
+	// Resolve ownerTenantID: the dialog's own tenant when userID owns it
+	// directly, or the joined tenant whose team-shared dialog matches
+	// otherwise. Mirrors ensureOwnedChat but also needs which tenant owns the
+	// dialog for the shared-session readonly rule below.
 	ownerTenantID := ""
-	tenantIDs, err := s.userTenantDAO.GetTenantIDsByUserID(ctx, dao.DB, userID)
+	exists, err := s.chatSessionDAO.CheckDialogExists(ctx, dao.DB, userID, chatID)
 	if err != nil {
 		return nil, common.CodeServerError, err
 	}
-	for _, tenantID := range tenantIDs {
-		exists, err := s.chatSessionDAO.CheckDialogExists(ctx, dao.DB, tenantID, chatID)
+	if exists {
+		ownerTenantID = userID
+	} else {
+		tenantIDs, err := s.userTenantDAO.GetTenantIDsByUserID(ctx, dao.DB, userID)
 		if err != nil {
 			return nil, common.CodeServerError, err
 		}
-		if exists {
-			ownerTenantID = tenantID
-			break
+		for _, tenantID := range tenantIDs {
+			shared, err := s.chatSessionDAO.CheckDialogTeamShared(ctx, dao.DB, tenantID, chatID)
+			if err != nil {
+				return nil, common.CodeServerError, err
+			}
+			if shared {
+				ownerTenantID = tenantID
+				break
+			}
 		}
 	}
 	if ownerTenantID == "" {
-		exists, err := s.chatSessionDAO.CheckDialogExists(ctx, dao.DB, userID, chatID)
-		if err != nil {
-			return nil, common.CodeServerError, err
-		}
-		if exists {
-			ownerTenantID = userID
-		}
-	}
-	ok := ownerTenantID != ""
-	if !ok {
 		return nil, common.CodeAuthenticationError, errors.New("no authorization")
 	}
 
@@ -1142,27 +1101,34 @@ func floatValue(value interface{}) (float64, bool) {
 	}
 }
 
+// ensureOwnedChat reports whether userID may access chatID: either userID is
+// the dialog's own tenant, or the dialog is team-shared (permission=team) and
+// userID belongs to a tenant it joined. Mirrors HasChatTeamPermission for the
+// session layer, which addresses dialogs via the boolean CheckDialogExists/
+// CheckDialogTeamShared DAO calls rather than fetching the full entity.
 func (s *ChatSessionService) ensureOwnedChat(ctx context.Context, userID, chatID string) (bool, error) {
-	tenantIDs, err := s.userTenantDAO.GetTenantIDsByUserID(ctx, dao.DB, userID)
-	if err != nil {
-		return false, err
-	}
-
-	for _, tenantID := range tenantIDs {
-		exists, err := s.chatSessionDAO.CheckDialogExists(ctx, dao.DB, tenantID, chatID)
-		if err != nil {
-			return false, err
-		}
-		if exists {
-			return true, nil
-		}
-	}
-
 	exists, err := s.chatSessionDAO.CheckDialogExists(ctx, dao.DB, userID, chatID)
 	if err != nil {
 		return false, err
 	}
-	return exists, nil
+	if exists {
+		return true, nil
+	}
+
+	tenantIDs, err := s.userTenantDAO.GetTenantIDsByUserID(ctx, dao.DB, userID)
+	if err != nil {
+		return false, err
+	}
+	for _, tenantID := range tenantIDs {
+		shared, err := s.chatSessionDAO.CheckDialogTeamShared(ctx, dao.DB, tenantID, chatID)
+		if err != nil {
+			return false, err
+		}
+		if shared {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // errSharedSessionReadonly is returned when a caller who can read a chat

@@ -1566,6 +1566,20 @@ def _load_chat_routes_unit_module(monkeypatch):
     user_service_mod.UserTenantService = type("UserTenantService", (), {"query": staticmethod(lambda **_kwargs: [])})
     monkeypatch.setitem(sys.modules, "api.db.services.user_service", user_service_mod)
 
+    check_team_permission_mod = ModuleType("api.common.check_team_permission")
+
+    def _stub_check_dialog_team_permission(dialog, other):
+        data = dialog.to_dict() if hasattr(dialog, "to_dict") else dict(dialog)
+        if data.get("tenant_id") == other:
+            return True
+        if data.get("permission") != "team":
+            return False
+        joined = user_service_mod.TenantService.get_joined_tenants_by_user_id(other)
+        return any(tenant["tenant_id"] == data.get("tenant_id") for tenant in joined)
+
+    check_team_permission_mod.check_dialog_team_permission = _stub_check_dialog_team_permission
+    monkeypatch.setitem(sys.modules, "api.common.check_team_permission", check_team_permission_mod)
+
     chunk_feedback_service_mod = ModuleType("api.db.services.chunk_feedback_service")
     chunk_feedback_service_mod.ChunkFeedbackService = type("ChunkFeedbackService", (), {"apply_feedback": staticmethod(lambda **_kwargs: {"success_count": 0, "fail_count": 0, "chunk_ids": []})})
     monkeypatch.setitem(sys.modules, "api.db.services.chunk_feedback_service", chunk_feedback_service_mod)

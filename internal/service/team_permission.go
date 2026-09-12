@@ -30,3 +30,26 @@ func HasKBTeamPermission(ctx context.Context, kb *entity.Knowledgebase, userID s
 	}
 	return false
 }
+
+// HasChatTeamPermission mirrors HasKBTeamPermission for chats (dialog table).
+func HasChatTeamPermission(ctx context.Context, chat *entity.Chat, userID string, tenantDAO *dao.TenantDAO) bool {
+	if chat == nil {
+		return false
+	}
+	if chat.TenantID == userID {
+		return true
+	}
+	if chat.Permission != string(entity.TenantPermissionTeam) {
+		return false
+	}
+	joinedTenants, err := tenantDAO.GetJoinedTenantsByUserID(ctx, dao.DB, userID)
+	if err != nil {
+		return false
+	}
+	for _, tenant := range joinedTenants {
+		if tenant.TenantID == chat.TenantID {
+			return true
+		}
+	}
+	return false
+}

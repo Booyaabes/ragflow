@@ -24,6 +24,7 @@ class Chat(Base):
         self.id = ""
         self.name = "assistant"
         self.icon = ""
+        self.permission = "me"
         self.dataset_ids = []
         self.llm_id = None
         self.llm_setting = {}

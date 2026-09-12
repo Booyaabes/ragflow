@@ -27,6 +27,7 @@ type fakeSessionStore struct {
 	sessions      map[string]*entity.ChatSession
 	dialogs       map[string]*entity.Chat
 	dialogExists  map[string]bool // key: tenantID|chatID
+	teamShared    map[string]bool // key: tenantID|chatID; team-shared (permission=team) dialogs
 	getByIDErr    error
 	createErr     error
 	updateByIDErr error
@@ -44,6 +45,7 @@ func newFakeSessionStore() *fakeSessionStore {
 		sessions:     make(map[string]*entity.ChatSession),
 		dialogs:      make(map[string]*entity.Chat),
 		dialogExists: make(map[string]bool),
+		teamShared:   make(map[string]bool),
 	}
 }
 
@@ -155,6 +157,11 @@ func (f *fakeSessionStore) GetDialogByID(ctx context.Context, db *gorm.DB, chatI
 func (f *fakeSessionStore) CheckDialogExists(ctx context.Context, db *gorm.DB, tenantID, chatID string) (bool, error) {
 	key := tenantID + "|" + chatID
 	return f.dialogExists[key], nil
+}
+
+func (f *fakeSessionStore) CheckDialogTeamShared(ctx context.Context, db *gorm.DB, tenantID, chatID string) (bool, error) {
+	key := tenantID + "|" + chatID
+	return f.teamShared[key], nil
 }
 
 // ---------------------------------------------------------------------------
@@ -295,7 +302,10 @@ func TestListChatSessions_Success(t *testing.T) {
 	store := newFakeSessionStore()
 	store.sessions["s1"] = &entity.ChatSession{ID: "s1", DialogID: "chat-1"}
 	store.sessions["s2"] = &entity.ChatSession{ID: "s2", DialogID: "chat-1"}
+	// user-1 is a joined member of tenant-1, not tenant-1 itself: access
+	// requires the dialog to be team-shared.
 	store.dialogExists["tenant-1|chat-1"] = true
+	store.teamShared["tenant-1|chat-1"] = true
 
 	svc := &ChatSessionService{
 		chatSessionDAO: store,
@@ -310,6 +320,27 @@ func TestListChatSessions_Success(t *testing.T) {
 	}
 	if len(resp.Sessions) != 2 {
 		t.Fatalf("expected 2 sessions, got %d", len(resp.Sessions))
+	}
+}
+
+// TestListChatSessions_JoinedTenantWithoutTeamSharingIsDenied guards the
+// permission gate itself: being a joined member of the owning tenant is not
+// enough on its own — the dialog must also be team-shared (permission=team).
+func TestListChatSessions_JoinedTenantWithoutTeamSharingIsDenied(t *testing.T) {
+	store := newFakeSessionStore()
+	// tenant-1 owns chat-1, but it is not marked team-shared.
+	store.dialogExists["tenant-1|chat-1"] = true
+
+	svc := &ChatSessionService{
+		chatSessionDAO: store,
+		userTenantDAO:  &fakeTenantStore{tenantIDs: []string{"tenant-1"}},
+		pipeline:       &fakePipeline{},
+	}
+
+	ctx := t.Context()
+	_, err := svc.ListChatSessions(ctx, "user-1", "chat-1", "", "", "create_time", true, 1, 30)
+	if err == nil || !strings.Contains(err.Error(), "no authorization") {
+		t.Fatalf("expected no authorization for a non-team-shared chat, got %v", err)
 	}
 }
 
@@ -556,7 +587,9 @@ func TestDeleteSessionMessage_RemovesMessagePairAndReference(t *testing.T) {
 			{"chunks":[{"id":"chunk-2","kb_id":"kb-2"}]}
 		]`),
 	}
+	// user-1 is a joined member of tenant-1: access requires team-sharing.
 	store.dialogExists["tenant-1|chat-1"] = true
+	store.teamShared["tenant-1|chat-1"] = true
 
 	svc := &ChatSessionService{
 		chatSessionDAO: store,
@@ -609,7 +642,9 @@ func TestUpdateMessageFeedback_AppliesChunkFeedbackWithResolvedTenantAndContext(
 			{"chunks":[{"id":"chunk-1","kb_id":"kb-1","similarity":0.9}]}
 		]`),
 	}
+	// user-1 is a joined member of tenant-owner: access requires team-sharing.
 	store.dialogExists["tenant-owner|chat-1"] = true
+	store.teamShared["tenant-owner|chat-1"] = true
 	docEngine := &fakeFeedbackDocEngine{}
 	svc := &ChatSessionService{
 		chatSessionDAO: store,
@@ -668,7 +703,9 @@ func TestUpdateMessageFeedback_ToggleUsesResolvedTenantForUndoAndApply(t *testin
 			{"chunks":[{"chunk_id":"chunk-1","dataset_id":"kb-1"}]}
 		]`),
 	}
+	// user-1 is a joined member of tenant-owner: access requires team-sharing.
 	store.dialogExists["tenant-owner|chat-1"] = true
+	store.teamShared["tenant-owner|chat-1"] = true
 	docEngine := &fakeFeedbackDocEngine{}
 	svc := &ChatSessionService{
 		chatSessionDAO: store,
@@ -908,7 +945,9 @@ func TestChatCompletionsPassesRequestUserIDToPipeline(t *testing.T) {
 			"parameters": []interface{}{},
 		},
 	}
+	// user-1 is a joined member of tenant-owner: access requires team-sharing.
 	store.dialogExists["tenant-owner|dialog-1"] = true
+	store.teamShared["tenant-owner|dialog-1"] = true
 
 	pipeline := &fakePipeline{
 		resultChan: makeResultChan(
@@ -968,7 +1007,9 @@ func TestChatCompletionsStreamFinalCarriesDecoratedReference(t *testing.T) {
 			"parameters": []interface{}{},
 		},
 	}
+	// user-1 is a joined member of tenant-owner: access requires team-sharing.
 	store.dialogExists["tenant-owner|dialog-1"] = true
+	store.teamShared["tenant-owner|dialog-1"] = true
 
 	finalReference := map[string]interface{}{
 		"chunks": []map[string]interface{}{
@@ -1085,7 +1126,9 @@ func TestChatCompletionsModelIDOverrideUsesModelResolver(t *testing.T) {
 		LLMSetting:   entity.JSONMap{},
 		PromptConfig: entity.JSONMap{"parameters": []interface{}{}},
 	}
+	// user-1 is a joined member of tenant-owner: access requires team-sharing.
 	store.dialogExists["tenant-owner|dialog-1"] = true
+	store.teamShared["tenant-owner|dialog-1"] = true
 
 	pipeline := &fakePipeline{
 		resultChan: makeResultChan(
@@ -1145,7 +1188,9 @@ func TestChatCompletionsStoreHistoryFalseDoesNotPersistSession(t *testing.T) {
 			"prologue":   "Welcome!",
 		},
 	}
+	// user-1 is a joined member of tenant-owner: access requires team-sharing.
 	store.dialogExists["tenant-owner|dialog-1"] = true
+	store.teamShared["tenant-owner|dialog-1"] = true
 
 	pipeline := &fakePipeline{
 		resultChan: makeResultChan(
@@ -1730,6 +1775,7 @@ func newSharedChatReadonlyService() (*ChatSessionService, *fakeSessionStore) {
 	// The chat is owned by tenant-owner and team-shared: "user-1" joined
 	// that tenant, so reads pass ensureOwnedChat.
 	store.dialogExists["tenant-owner|chat-1"] = true
+	store.teamShared["tenant-owner|chat-1"] = true
 	// The session was created by the chat owner, not by user-1.
 	owner := "tenant-owner"
 	store.sessions["session-1"] = &entity.ChatSession{

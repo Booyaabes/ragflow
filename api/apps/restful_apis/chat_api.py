@@ -37,13 +37,14 @@ from api.db.joint_services.tenant_model_service import (
     resolve_model_config,
     resolve_model_id,
 )
+from api.common.check_team_permission import check_dialog_team_permission
 from api.db.services.chunk_feedback_service import ChunkFeedbackService
 from api.db.services.conversation_service import ConversationService, structure_answer
 from api.db.services.dialog_service import DialogService, gen_mindmap, rag_agent
 from api.db.services.knowledgebase_service import KnowledgebaseService, validate_dataset_embedding_models
 from api.db.services.llm_service import LLMBundle
 from api.db.services.search_service import SearchService
-from api.db.services.user_service import TenantService, UserTenantService
+from api.db.services.user_service import TenantService
 from api.utils.api_utils import (
     check_duplicate_ids,
     get_data_error_result,
@@ -188,7 +189,17 @@ def _build_session_response(conv: dict) -> dict:
 
 
 async def _ensure_owned_chat(chat_id):
-    return await thread_pool_exec(DialogService.query, tenant_id=current_user.id, id=chat_id, status=StatusEnum.VALID.value)
+    owned = await thread_pool_exec(DialogService.query, tenant_id=current_user.id, id=chat_id, status=StatusEnum.VALID.value)
+    if owned:
+        return owned
+
+    matches = await thread_pool_exec(DialogService.query, id=chat_id, status=StatusEnum.VALID.value)
+    if not matches:
+        return []
+    chat = matches[0]
+    if check_dialog_team_permission(chat, current_user.id):
+        return [chat]
+    return []
 
 
 def _build_default_completion_dialog():
@@ -532,6 +543,11 @@ async def list_chats():
         items_per_page = validate_rest_api_page_size(request.args.get("page_size", DEFAULT_PAGE_SIZE))
 
         if owner_ids:
+            tenants = await thread_pool_exec(TenantService.get_joined_tenants_by_user_id, current_user.id)
+            allowed_tenant_ids = {tenant["tenant_id"] for tenant in tenants}
+            allowed_tenant_ids.add(current_user.id)
+            owner_ids = [owner_id for owner_id in owner_ids if owner_id in allowed_tenant_ids]
+
             chats, total = await thread_pool_exec(
                 DialogService.get_by_tenant_ids,
                 owner_ids,
@@ -549,9 +565,11 @@ async def list_chats():
                 start = (page_number - 1) * items_per_page
                 chats = chats[start : start + items_per_page]
         else:
+            tenants = await thread_pool_exec(TenantService.get_joined_tenants_by_user_id, current_user.id)
+            joined_tenant_ids = [tenant["tenant_id"] for tenant in tenants]
             chats, total = await thread_pool_exec(
                 DialogService.get_by_tenant_ids,
-                [],
+                joined_tenant_ids,
                 current_user.id,
                 page_number,
                 items_per_page,
@@ -570,25 +588,16 @@ async def list_chats():
 @login_required
 async def get_chat(chat_id):
     try:
-        tenants = await thread_pool_exec(UserTenantService.query, user_id=current_user.id)
-        for tenant in tenants:
-            if await thread_pool_exec(
-                DialogService.query,
-                tenant_id=tenant.tenant_id,
-                id=chat_id,
-                status=StatusEnum.VALID.value,
-            ):
-                break
-        else:
+        matches = await thread_pool_exec(DialogService.query, id=chat_id, status=StatusEnum.VALID.value)
+        if not matches:
+            return get_data_error_result(message="Chat not found!")
+        chat = matches[0]
+        if not check_dialog_team_permission(chat, current_user.id):
             return get_json_result(
                 data=False,
                 message="no authorization",
                 code=RetCode.AUTHENTICATION_ERROR,
             )
-
-        ok, chat = await thread_pool_exec(DialogService.get_by_id, chat_id)
-        if not ok:
-            return get_data_error_result(message="Chat not found!")
         return get_json_result(data=_build_chat_response(chat))
     except Exception as ex:
         return server_error_response(ex)

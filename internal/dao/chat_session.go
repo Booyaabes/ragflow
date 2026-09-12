@@ -148,6 +148,21 @@ func (dao *ChatSessionDAO) CheckDialogExists(ctx context.Context, db *gorm.DB, t
 	return count > 0, nil
 }
 
+// CheckDialogTeamShared checks if a team-shared dialog (permission=team) exists
+// with the given owning tenant_id and dialog_id. Used to grant a joined team
+// member session-level access to a teammate's team-shared chat, mirroring
+// HasChatTeamPermission at the chat layer.
+func (dao *ChatSessionDAO) CheckDialogTeamShared(ctx context.Context, db *gorm.DB, tenantID, chatID string) (bool, error) {
+	var count int64
+	err := db.WithContext(ctx).Model(&entity.Chat{}).
+		Where("tenant_id = ? AND id = ? AND status = ? AND permission = ?", tenantID, chatID, common.StatusDialogValid, string(entity.TenantPermissionTeam)).
+		Count(&count).Error
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 // GetDialogByID gets dialog by ID
 func (dao *ChatSessionDAO) GetDialogByID(ctx context.Context, db *gorm.DB, chatID string) (*entity.Chat, error) {
 	var dialog entity.Chat

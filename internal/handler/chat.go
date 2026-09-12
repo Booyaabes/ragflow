@@ -376,6 +376,7 @@ func (h *ChatHandler) GetChat(c *gin.Context) {
 		"dataset_ids":              chat.DatasetIDs,
 		"kb_names":                 chat.KBNames,
 		"status":                   chat.Status,
+		"permission":               chat.Permission,
 		"create_time":              chat.CreateTime,
 		"create_date":              chat.CreateDate,
 		"update_time":              chat.UpdateTime,
