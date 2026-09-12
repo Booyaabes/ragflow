@@ -1,0 +1,87 @@
+name: docker-ghcr
+
+# Builds the production Docker image (root Dockerfile) and pushes it to this
+# repo's GitHub Container Registry. Runs on stock ubuntu-latest — unlike
+# release.yml, which builds the same image but only on Infiniflow's
+# self-hosted ragflow-release runners and pushes to Docker Hub
+# (infiniflow/ragflow), not GHCR.
+#
+# Not wired to pull_request: the image is multi-GB and pushing on every PR
+# would be wasteful, and PR builds should not have write access to the
+# registry. Trigger manually or push/tag on main instead.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+concurrency:
+  group: docker-ghcr-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # The image bundles ML models/NLTK data/TeXLive pulled in from
+      # infiniflow/ragflow_deps:latest and is several GB — ubuntu-latest's
+      # ~14GB free disk is tight. Clear preinstalled toolchains we don't use
+      # (Android SDK, .NET, Haskell, GHC) before building.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR requires a lowercase owner/repo path; github.repository preserves
+      # case (e.g. Booyaabes/ragflow).
+      - name: Compute lowercase image name
+        id: image
+        run: echo "name=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha,prefix=
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            NEED_MIRROR=0
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
