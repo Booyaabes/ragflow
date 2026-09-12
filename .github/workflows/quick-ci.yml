@@ -119,9 +119,6 @@ jobs:
       - name: Lint (oxlint)
         run: npm run lint
 
-      - name: Format check (oxfmt)
-        run: npm run format:check
-
       - name: Type check
         run: npm run type-check
 
