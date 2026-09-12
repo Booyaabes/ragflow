@@ -50,6 +50,7 @@ type chatSessionStore interface {
 	ListByChatID(ctx context.Context, db *gorm.DB, chatID, sessionID, name, orderby string, desc bool, page, pageSize int) ([]*entity.ChatSession, error)
 	GetDialogByID(ctx context.Context, db *gorm.DB, chatID string) (*entity.Chat, error)
 	CheckDialogExists(ctx context.Context, db *gorm.DB, tenantID, chatID string) (bool, error)
+	CheckDialogTeamShared(ctx context.Context, db *gorm.DB, tenantID, chatID string) (bool, error)
 }
 
 type userTenantStore interface {
@@ -665,21 +666,36 @@ func (s *ChatSessionService) DeleteSessionMessage(ctx context.Context, userID, c
 
 func (s *ChatSessionService) UpdateMessageFeedback(ctx context.Context, userID, chatID, sessionID, msgID string, req map[string]interface{}) (*ChatSessionPayload, common.ErrorCode, error) {
 
-	dialog, err := s.chatSessionDAO.GetDialogByID(ctx, dao.DB, chatID)
+	// Resolve ownerTenantID: the dialog's own tenant when userID owns it
+	// directly, or the joined tenant whose team-shared dialog matches
+	// otherwise. Mirrors ensureOwnedChat but also needs which tenant owns the
+	// dialog for the shared-session readonly rule below.
+	ownerTenantID := ""
+	exists, err := s.chatSessionDAO.CheckDialogExists(ctx, dao.DB, userID, chatID)
 	if err != nil {
-		if isChatSessionNotFound(err) {
-			return nil, common.CodeAuthenticationError, errors.New("no authorization")
+		return nil, common.CodeServerError, err
+	}
+	if exists {
+		ownerTenantID = userID
+	} else {
+		tenantIDs, err := s.userTenantDAO.GetTenantIDsByUserID(ctx, dao.DB, userID)
+		if err != nil {
+			return nil, common.CodeServerError, err
 		}
-		return nil, common.CodeServerError, err
+		for _, tenantID := range tenantIDs {
+			shared, err := s.chatSessionDAO.CheckDialogTeamShared(ctx, dao.DB, tenantID, chatID)
+			if err != nil {
+				return nil, common.CodeServerError, err
+			}
+			if shared {
+				ownerTenantID = tenantID
+				break
+			}
+		}
 	}
-	accessible, err := s.dialogAccessibleToUser(ctx, dialog, userID)
-	if err != nil {
-		return nil, common.CodeServerError, err
-	}
-	if !accessible {
+	if ownerTenantID == "" {
 		return nil, common.CodeAuthenticationError, errors.New("no authorization")
 	}
-	ownerTenantID := dialog.TenantID
 
 	session, err := s.chatSessionDAO.GetByID(ctx, dao.DB, sessionID)
 	if err != nil || session.DialogID != chatID {
@@ -1085,35 +1101,30 @@ func floatValue(value interface{}) (float64, bool) {
 	}
 }
 
+// ensureOwnedChat reports whether userID may access chatID: either userID is
+// the dialog's own tenant, or the dialog is team-shared (permission=team) and
+// userID belongs to a tenant it joined. Mirrors HasChatTeamPermission for the
+// session layer, which addresses dialogs via the boolean CheckDialogExists/
+// CheckDialogTeamShared DAO calls rather than fetching the full entity.
 func (s *ChatSessionService) ensureOwnedChat(ctx context.Context, userID, chatID string) (bool, error) {
-	dialog, err := s.chatSessionDAO.GetDialogByID(ctx, dao.DB, chatID)
+	exists, err := s.chatSessionDAO.CheckDialogExists(ctx, dao.DB, userID, chatID)
 	if err != nil {
-		if isChatSessionNotFound(err) {
-			return false, nil
-		}
 		return false, err
 	}
-	return s.dialogAccessibleToUser(ctx, dialog, userID)
-}
-
-// dialogAccessibleToUser reports whether userID may access dialog: either userID
-// is the dialog's owning tenant, or the dialog is team-shared (permission=team)
-// and userID belongs to the owning tenant's team. Mirrors HasChatTeamPermission
-// for the session layer, which addresses dialogs by *entity.Chat rather than by
-// a *dao.TenantDAO-backed lookup.
-func (s *ChatSessionService) dialogAccessibleToUser(ctx context.Context, dialog *entity.Chat, userID string) (bool, error) {
-	if dialog.TenantID == userID {
+	if exists {
 		return true, nil
 	}
-	if dialog.Permission != string(entity.TenantPermissionTeam) {
-		return false, nil
-	}
+
 	tenantIDs, err := s.userTenantDAO.GetTenantIDsByUserID(ctx, dao.DB, userID)
 	if err != nil {
 		return false, err
 	}
 	for _, tenantID := range tenantIDs {
-		if tenantID == dialog.TenantID {
+		shared, err := s.chatSessionDAO.CheckDialogTeamShared(ctx, dao.DB, tenantID, chatID)
+		if err != nil {
+			return false, err
+		}
+		if shared {
 			return true, nil
 		}
 	}

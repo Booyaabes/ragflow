@@ -270,3 +270,70 @@ func TestChatSessionDAOListAgentSessionsSearchesIDNameAndMessage(t *testing.T) {
 		}
 	}
 }
+
+func TestChatSessionDAOCheckDialogTeamShared(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{TranslateError: true})
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	if err := db.AutoMigrate(&entity.Chat{}); err != nil {
+		t.Fatalf("failed to migrate: %v", err)
+	}
+
+	status := string(entity.StatusValid)
+	name := "team chat"
+	if err := db.Create(&entity.Chat{
+		ID:           "chat-team",
+		TenantID:     "tenant-1",
+		Name:         &name,
+		LLMID:        "model-a",
+		LLMSetting:   entity.JSONMap{},
+		PromptConfig: entity.JSONMap{},
+		KBIDs:        entity.JSONSlice{},
+		Status:       &status,
+		Permission:   string(entity.TenantPermissionTeam),
+	}).Error; err != nil {
+		t.Fatalf("failed to create team chat: %v", err)
+	}
+	privateName := "private chat"
+	if err := db.Create(&entity.Chat{
+		ID:           "chat-private",
+		TenantID:     "tenant-1",
+		Name:         &privateName,
+		LLMID:        "model-a",
+		LLMSetting:   entity.JSONMap{},
+		PromptConfig: entity.JSONMap{},
+		KBIDs:        entity.JSONSlice{},
+		Status:       &status,
+		Permission:   string(entity.TenantPermissionMe),
+	}).Error; err != nil {
+		t.Fatalf("failed to create private chat: %v", err)
+	}
+
+	dao := NewChatSessionDAO()
+	ctx := t.Context()
+
+	shared, err := dao.CheckDialogTeamShared(ctx, db, "tenant-1", "chat-team")
+	if err != nil {
+		t.Fatalf("CheckDialogTeamShared failed: %v", err)
+	}
+	if !shared {
+		t.Fatal("expected chat-team to be reported as team-shared")
+	}
+
+	shared, err = dao.CheckDialogTeamShared(ctx, db, "tenant-1", "chat-private")
+	if err != nil {
+		t.Fatalf("CheckDialogTeamShared failed: %v", err)
+	}
+	if shared {
+		t.Fatal("expected chat-private (permission=me) to be reported as not team-shared")
+	}
+
+	shared, err = dao.CheckDialogTeamShared(ctx, db, "tenant-other", "chat-team")
+	if err != nil {
+		t.Fatalf("CheckDialogTeamShared failed: %v", err)
+	}
+	if shared {
+		t.Fatal("expected a mismatched tenant_id to be reported as not team-shared")
+	}
+}
