@@ -51,6 +51,7 @@ const (
 	discordDefaultIntents    = 1<<0 | 1<<9 | 1<<12 | 1<<15
 	discordSendMaxAttempts   = 3
 	discordMaxRetryAfter     = 30 * time.Second
+	discordMaxMessageLength  = 2000
 )
 
 type discordAccount struct {
@@ -227,7 +228,8 @@ func (c *discordChannel) Stop(ctx context.Context) error {
 	return nil
 }
 
-// Send posts an outgoing RAGFlow answer to a Discord channel.
+// Send posts an outgoing RAGFlow answer to a Discord channel, splitting it
+// into multiple messages if it exceeds Discord's per-message content limit.
 func (c *discordChannel) Send(ctx context.Context, msg core.OutgoingMessage) error {
 	if strings.TrimSpace(msg.ChatID) == "" {
 		return errors.New("chat_id is required")
@@ -235,19 +237,34 @@ func (c *discordChannel) Send(ctx context.Context, msg core.OutgoingMessage) err
 	if strings.TrimSpace(msg.Text) == "" {
 		return nil
 	}
+
+	for i, chunk := range splitDiscordMessage(msg.Text, discordMaxMessageLength) {
+		replyToMessageID := ""
+		if i == 0 {
+			replyToMessageID = msg.ReplyToMessageID
+		}
+		if err := c.sendOne(ctx, msg.ChatID, chunk, replyToMessageID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sendOne posts a single Discord message, retrying on rate limits.
+func (c *discordChannel) sendOne(ctx context.Context, chatID, text, replyToMessageID string) error {
 	payload := map[string]any{
-		"content":          msg.Text,
+		"content":          text,
 		"allowed_mentions": map[string]any{"parse": []string{}},
 	}
-	if strings.TrimSpace(msg.ReplyToMessageID) != "" {
+	if strings.TrimSpace(replyToMessageID) != "" {
 		payload["message_reference"] = map[string]any{
-			"message_id":         msg.ReplyToMessageID,
-			"channel_id":         msg.ChatID,
+			"message_id":         replyToMessageID,
+			"channel_id":         chatID,
 			"fail_if_not_exists": false,
 		}
 	}
 
-	path := "/channels/" + url.PathEscape(msg.ChatID) + "/messages"
+	path := "/channels/" + url.PathEscape(chatID) + "/messages"
 	var lastErr error
 	for attempt := 1; attempt <= discordSendMaxAttempts; attempt++ {
 		err := c.requestJSON(ctx, http.MethodPost, path, payload, nil)
@@ -275,6 +292,45 @@ func (c *discordChannel) Send(ctx context.Context, msg core.OutgoingMessage) err
 		}
 	}
 	return lastErr
+}
+
+// splitDiscordMessage breaks text into chunks that fit Discord's per-message
+// content limit, preferring to break on a newline or space over a hard cut.
+func splitDiscordMessage(text string, limit int) []string {
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return []string{text}
+	}
+
+	var chunks []string
+	for len(runes) > limit {
+		window := runes[:limit]
+		splitAt := lastIndexRune(window, '\n')
+		skip := 1
+		if splitAt <= 0 {
+			splitAt = lastIndexRune(window, ' ')
+		}
+		if splitAt <= 0 {
+			splitAt = limit
+			skip = 0
+		}
+		chunks = append(chunks, string(runes[:splitAt]))
+		runes = runes[splitAt+skip:]
+	}
+	if len(runes) > 0 {
+		chunks = append(chunks, string(runes))
+	}
+	return chunks
+}
+
+// lastIndexRune returns the last index of target in rs, or -1 if absent.
+func lastIndexRune(rs []rune, target rune) int {
+	for i := len(rs) - 1; i >= 0; i-- {
+		if rs[i] == target {
+			return i
+		}
+	}
+	return -1
 }
 
 // run reconnects to Discord Gateway until the channel is stopped.

@@ -18,9 +18,11 @@ package channels
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -133,6 +135,106 @@ func TestDiscordRequestJSONReturnsRateLimitError(t *testing.T) {
 	}
 	if !rateLimitErr.Global {
 		t.Fatal("global rate limit flag was not preserved")
+	}
+}
+
+func TestSplitDiscordMessageWithinLimitIsUnchanged(t *testing.T) {
+	text := "short answer"
+	got := splitDiscordMessage(text, 2000)
+	if len(got) != 1 || got[0] != text {
+		t.Fatalf("splitDiscordMessage() = %#v, want single chunk %q", got, text)
+	}
+}
+
+func TestSplitDiscordMessageBreaksOnNewline(t *testing.T) {
+	text := strings.Repeat("a", 5) + "\n" + strings.Repeat("b", 5)
+	got := splitDiscordMessage(text, 6)
+	want := []string{strings.Repeat("a", 5), strings.Repeat("b", 5)}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("splitDiscordMessage() = %#v, want %#v", got, want)
+	}
+}
+
+func TestSplitDiscordMessageHardCutsLongWord(t *testing.T) {
+	text := strings.Repeat("x", 10)
+	got := splitDiscordMessage(text, 4)
+	want := []string{"xxxx", "xxxx", "xx"}
+	if len(got) != len(want) {
+		t.Fatalf("splitDiscordMessage() = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("splitDiscordMessage()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestSplitDiscordMessagePreservesMultiByteRunes(t *testing.T) {
+	text := strings.Repeat("é", 10)
+	got := splitDiscordMessage(text, 4)
+	if joined := strings.Join(got, ""); joined != text {
+		t.Fatalf("splitDiscordMessage() lost content: got %q, want %q", joined, text)
+	}
+	for _, chunk := range got {
+		if len([]rune(chunk)) > 4 {
+			t.Fatalf("chunk %q exceeds limit of 4 runes", chunk)
+		}
+	}
+}
+
+func TestDiscordSendSplitsLongMessageAcrossMultipleRequests(t *testing.T) {
+	var requests []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		requests = append(requests, body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"message-1"}`))
+	}))
+	defer server.Close()
+
+	ch := newDiscordChannel(discordAccount{
+		AccountID:  "account-1",
+		Token:      "token-1",
+		APIBaseURL: server.URL,
+	})
+
+	longText := strings.Repeat("word ", 500) // well over discordMaxMessageLength
+	err := ch.Send(context.Background(), core.OutgoingMessage{
+		ChatID:           "chat-1",
+		Text:             longText,
+		ReplyToMessageID: "orig-1",
+	})
+	if err != nil {
+		t.Fatalf("Send returned error: %v", err)
+	}
+	if len(requests) < 2 {
+		t.Fatalf("expected multiple requests for a long message, got %d", len(requests))
+	}
+	for i, req := range requests {
+		content, _ := req["content"].(string)
+		if len([]rune(content)) > discordMaxMessageLength {
+			t.Fatalf("request %d content exceeds discord limit: %d runes", i, len([]rune(content)))
+		}
+		_, hasReference := req["message_reference"]
+		if i == 0 && !hasReference {
+			t.Fatalf("first chunk should carry the reply reference")
+		}
+		if i > 0 && hasReference {
+			t.Fatalf("chunk %d should not carry the reply reference", i)
+		}
+	}
+	var contents []string
+	for _, req := range requests {
+		content, _ := req["content"].(string)
+		contents = append(contents, content)
+	}
+	// Each chunk is sent as a separate Discord message, so the space/newline
+	// it split on is not part of either message; rejoin chunks with a space
+	// before comparing word content.
+	rebuilt := strings.Join(contents, " ")
+	if strings.Join(strings.Fields(rebuilt), " ") != strings.Join(strings.Fields(longText), " ") {
+		t.Fatalf("reassembled content does not match original text")
 	}
 }
 
