@@ -224,14 +224,16 @@ func TestDiscordSendSplitsLongMessageAcrossMultipleRequests(t *testing.T) {
 			t.Fatalf("chunk %d should not carry the reply reference", i)
 		}
 	}
-	var rebuilt strings.Builder
+	var contents []string
 	for _, req := range requests {
 		content, _ := req["content"].(string)
-		rebuilt.WriteString(content)
+		contents = append(contents, content)
 	}
-	// Chunk boundaries may consume the single space/newline they split on, so
-	// compare word content rather than exact whitespace.
-	if strings.Join(strings.Fields(rebuilt.String()), " ") != strings.Join(strings.Fields(longText), " ") {
+	// Each chunk is sent as a separate Discord message, so the space/newline
+	// it split on is not part of either message; rejoin chunks with a space
+	// before comparing word content.
+	rebuilt := strings.Join(contents, " ")
+	if strings.Join(strings.Fields(rebuilt), " ") != strings.Join(strings.Fields(longText), " ") {
 		t.Fatalf("reassembled content does not match original text")
 	}
 }
