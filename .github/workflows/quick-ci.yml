@@ -1,0 +1,155 @@
+name: quick-ci
+
+# Lightweight checks that run on stock GitHub-hosted ubuntu-latest runners,
+# unlike sep-tests.yml/release.yml/serenedb.yml which require Infiniflow's
+# self-hosted ragflow-test/ragflow-release runners and pre-seeded native
+# libs/testdata. This workflow covers: Go build + unit tests, Python
+# lint + tests, and frontend lint.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: quick-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go-test:
+    name: Go build + unit tests
+    runs-on: ubuntu-latest
+    env:
+      # onnxruntime_go is a fresh org mirror not yet in the public Go checksum
+      # database, so Go must resolve it directly from GitHub instead of the
+      # module proxy/sumdb.
+      GOPRIVATE: github.com/infiniflow/onnxruntime_go
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v3
+
+      - name: Install native build toolchain (clang-20, lld-20)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libpcre2-dev clang-20 lld-20
+          sudo ln -sf /usr/bin/clang++-20 /usr/bin/clang++
+          sudo ln -sf /usr/bin/clang-20 /usr/bin/clang
+          sudo ln -sf /usr/bin/ld.lld-20 /usr/bin/ld.lld
+
+      # internal/binding/cpp/CMakeLists.txt requires CMake >= 4.0; ubuntu-latest
+      # ships 3.31 (apt.kitware.com's noble channel doesn't carry 4.x either).
+      # The `cmake` PyPI wheel ships current upstream releases, so installing
+      # it via pip is simpler and more reliable than juggling apt repos.
+      - name: Install CMake >= 4.0
+        run: pip install "cmake>=4.0"
+
+      - name: Cache native static libs (office_oxide/pdfium/pdf_oxide/onnxruntime)
+        uses: actions/cache@v4
+        with:
+          path: ~/ragflow-native-libs
+          key: ragflow-native-libs-${{ hashFiles('ragflow_deps/download_go_deps.py') }}
+
+      - name: Download Go native deps
+        run: uv run python3 ragflow_deps/download_go_deps.py
+
+      # `--test` only runs the Go tests — it does not build the C++ tokenizer
+      # static lib (librag_tokenizer_c_api.a) that CGO links against. CI
+      # normally builds it inside the infiniflow/infinity_builder docker
+      # image; here the toolchain installed above builds it directly instead.
+      - name: Build C++ tokenizer static library
+        run: bash build.sh --cpp
+
+      # internal/tokenizer's BPE loader is offline-only by design (see
+      # internal/tokenizer/bpe_loader.go) — it never hits the network itself,
+      # it only reads ragflow_deps/cl100k_base.tiktoken (or TIKTOKEN_CACHE_DIR)
+      # from disk, and panics loudly rather than silently zeroing every token
+      # count. Fetch that one small table directly instead of running the full
+      # ragflow_deps/download_deps.py (which also pulls GBs of HF models/NLTK
+      # data unrelated to unit tests) — mirrors sep-tests.yml's own fallback.
+      - name: Fetch cl100k_base BPE table
+        run: |
+          mkdir -p ragflow_deps
+          curl -fsSL -o ragflow_deps/cl100k_base.tiktoken \
+            https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken
+
+      - name: Run Go unit tests
+        run: bash build.sh --test ./...
+
+  python-test:
+    name: Python lint + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: astral-sh/setup-uv@v3
+
+      - name: Install dependencies
+        run: |
+          uv sync --python 3.13 --group test --frozen
+          uv pip install -e sdk/python
+
+      # ruff isn't a project dependency (not in [dependency-groups]), so `uv
+      # run ruff` fails with "Failed to spawn: ruff". `uvx` runs it as an
+      # isolated tool instead, matching the bare `ruff check`/`ruff format`
+      # commands documented in CLAUDE.md. Pin an exact version: an unpinned
+      # `uvx ruff` resolves whatever is newest on PyPI at invocation time,
+      # and a newer release enabled a much broader default rule set here
+      # (9535 errors vs. 0 on 0.15.8, the version this repo's [tool.ruff]
+      # config was actually written against).
+      #
+      # `ruff format --check` is intentionally not run here: 4 pre-existing
+      # files on main fail it, unrelated to this branch — same reasoning as
+      # dropping oxfmt's format:check from the frontend job above.
+      - name: Ruff check
+        run: uvx ruff@0.15.8 check .
+
+      # pytest's default testpaths (test/) are HTTP/SDK/web-API integration
+      # suites that expect a live docker-compose'd RAGFlow instance plus real
+      # LLM credentials (see sep-tests.yml) — they cannot run standalone on
+      # ubuntu-latest. ragflow_deps/test_download_go_deps.py is the one
+      # genuinely self-contained unit test outside that tree.
+      - name: Run standalone unit tests
+        run: uv run pytest ragflow_deps/test_download_go_deps.py -q --durations=100
+
+  frontend-test:
+    name: Frontend lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint (oxlint)
+        run: npm run lint
+
+      # Neither `tsc --noEmit` nor `npm run test` (jest) are run here:
+      # ~20 pre-existing type errors (memory/skills/chat pages mid-refactor)
+      # and 19 pre-existing failing jest tests across 12 suites exist on main
+      # already — no workflow in this repo has ever gated on either — and
+      # fixing that dette is out of scope for this CI-setup branch. Same
+      # reasoning as dropping oxfmt's format:check above.
