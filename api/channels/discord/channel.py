@@ -12,11 +12,34 @@ from ..core.registry import register_channel
 
 LOGGER = logging.getLogger(__name__)
 
+# Discord rejects message content longer than 2000 characters.
+DISCORD_MAX_MESSAGE_LENGTH = 2000
+
 
 @dataclass
 class DiscordAccount:
     account_id: str
     token: str
+
+
+def _split_message(text: str, limit: int = DISCORD_MAX_MESSAGE_LENGTH) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    while len(text) > limit:
+        split_at = text.rfind("\n", 0, limit)
+        skip = 1
+        if split_at <= 0:
+            split_at = text.rfind(" ", 0, limit)
+        if split_at <= 0:
+            split_at = limit
+            skip = 0
+        chunks.append(text[:split_at])
+        text = text[split_at + skip :]
+    if text:
+        chunks.append(text)
+    return chunks
 
 
 def _chat_type(channel: discord.abc.Messageable) -> str:
@@ -119,10 +142,12 @@ class DiscordChannel(Channel):
             except (TypeError, ValueError):
                 reference = None
 
-        try:
-            await target.send(message.text, reference=reference)
-        except discord.HTTPException as err:
-            LOGGER.error("[discord:%s] send failed: %s", self.account_id, err)
+        for index, chunk in enumerate(_split_message(message.text)):
+            try:
+                await target.send(chunk, reference=reference if index == 0 else None)
+            except discord.HTTPException as err:
+                LOGGER.error("[discord:%s] send failed: %s", self.account_id, err)
+                return
 
 
 def _build(account_id: str, cfg: dict) -> Channel:
