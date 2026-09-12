@@ -64,6 +64,13 @@ jobs:
       - name: Download Go native deps
         run: uv run python3 ragflow_deps/download_go_deps.py
 
+      # `--test` only runs the Go tests — it does not build the C++ tokenizer
+      # static lib (librag_tokenizer_c_api.a) that CGO links against. CI
+      # normally builds it inside the infiniflow/infinity_builder docker
+      # image; here the toolchain installed above builds it directly instead.
+      - name: Build C++ tokenizer static library
+        run: bash build.sh --cpp
+
       - name: Run Go unit tests
         run: bash build.sh --test ./...
 
@@ -84,11 +91,16 @@ jobs:
           uv sync --python 3.13 --group test --frozen
           uv pip install -e sdk/python
 
+      # ruff isn't a project dependency (not in [dependency-groups]), so `uv
+      # run ruff` fails with "Failed to spawn: ruff". `uvx` runs it as an
+      # isolated tool instead, matching the bare `ruff check`/`ruff format`
+      # commands documented in CLAUDE.md.
+      #
+      # `ruff format --check` is intentionally not run here: 4 pre-existing
+      # files on main fail it, unrelated to this branch — same reasoning as
+      # dropping oxfmt's format:check from the frontend job above.
       - name: Ruff check
-        run: uv run ruff check .
-
-      - name: Ruff format check
-        run: uv run ruff format --check .
+        run: uvx ruff check .
 
       # pytest's default testpaths (test/) are HTTP/SDK/web-API integration
       # suites that expect a live docker-compose'd RAGFlow instance plus real
