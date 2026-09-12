@@ -69,7 +69,8 @@ func (dao *ChatDAO) ListByTenantIDs(ctx context.Context, db *gorm.DB, tenantIDs 
 		Joins("LEFT JOIN user ON dialog.tenant_id = user.id")
 
 	if len(tenantIDs) > 0 {
-		query = query.Where("(dialog.tenant_id IN ? OR dialog.tenant_id = ?) AND dialog.status = ?", tenantIDs, userID, "1")
+		query = query.Where("((dialog.tenant_id IN ? AND dialog.permission = ?) OR dialog.tenant_id = ?) AND dialog.status = ?",
+			tenantIDs, string(entity.TenantPermissionTeam), userID, "1")
 	} else {
 		query = query.Where("dialog.tenant_id = ? AND dialog.status = ?", userID, "1")
 	}
@@ -118,15 +119,13 @@ func (dao *ChatDAO) ListByOwnerIDs(ctx context.Context, db *gorm.DB, ownerIDs []
 			user.avatar as tenant_avatar
 		`).
 		Joins("LEFT JOIN user ON dialog.tenant_id = user.id").
-		Where("(dialog.tenant_id IN ? OR dialog.tenant_id = ?) AND dialog.status = ?", ownerIDs, userID, "1")
+		Where("((dialog.tenant_id IN ? AND dialog.permission = ?) OR dialog.tenant_id = ?) AND dialog.status = ?",
+			ownerIDs, string(entity.TenantPermissionTeam), userID, "1")
 
 	// Apply keyword filter
 	if keywords != "" {
 		query = query.Where("LOWER(dialog.name) LIKE ?", "%"+strings.ToLower(keywords)+"%")
 	}
-
-	// Filter by owner IDs (additional filter to ensure tenant_id is in ownerIDs)
-	query = query.Where("dialog.tenant_id IN ?", ownerIDs)
 
 	// Apply ordering
 	orderDirection := "ASC"

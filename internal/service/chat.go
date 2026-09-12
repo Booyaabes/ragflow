@@ -85,10 +85,16 @@ func (s *ChatService) ListChats(ctx context.Context, userID, status, keywords st
 	var err error
 
 	if len(ownerIDs) == 0 {
+		var joinedTenantIDs []string
+		joinedTenantIDs, err = s.userTenantDAO.GetTenantIDsByUserID(ctx, dao.DB, userID)
+		if err != nil {
+			return nil, err
+		}
+
 		chats, total, err = s.chatDAO.ListByTenantIDs(
 			ctx,
 			dao.DB,
-			nil,
+			joinedTenantIDs,
 			userID,
 			page,
 			pageSize,
@@ -513,7 +519,7 @@ func filterCreateChatPersistedFields(req map[string]interface{}) {
 		"name": {}, "description": {}, "icon": {}, "language": {}, "llm_id": {}, "tenant_llm_id": {},
 		"llm_setting": {}, "prompt_type": {}, "prompt_config": {}, "meta_data_filter": {},
 		"similarity_threshold": {}, "vector_similarity_weight": {}, "top_n": {}, "rerank_candidates_count": {}, "top_k": {},
-		"do_refer": {}, "rerank_id": {}, "tenant_rerank_id": {}, "kb_ids": {}, "status": {},
+		"do_refer": {}, "rerank_id": {}, "tenant_rerank_id": {}, "kb_ids": {}, "status": {}, "permission": {},
 	}
 	for key := range req {
 		if _, ok := persisted[key]; !ok {
@@ -567,12 +573,16 @@ func buildCreateChatEntity(req map[string]interface{}, tenantID string) *entity.
 		TenantRerankID:         stringPtrIfNotEmpty(tenantRerankID),
 		KBIDs:                  kbIDsJSON,
 		Status:                 &statusValue,
+		Permission:             stringFromValue(req["permission"]),
 	}
 	if chat.PromptType == "" {
 		chat.PromptType = "simple"
 	}
 	if chat.DoRefer == "" {
 		chat.DoRefer = "1"
+	}
+	if chat.Permission == "" {
+		chat.Permission = string(entity.TenantPermissionMe)
 	}
 	if language := stringFromValue(req["language"]); language != "" {
 		chat.Language = &language
@@ -791,7 +801,7 @@ func (s *ChatService) getOwnedValidChat(ctx context.Context, userID, chatID stri
 	if err != nil {
 		return nil, errors.New("no authorization")
 	}
-	if chat.TenantID != userID {
+	if chat.TenantID != userID && !HasChatTeamPermission(ctx, chat, userID, s.tenantDAO) {
 		return nil, errors.New("no authorization")
 	}
 	return chat, nil
@@ -818,6 +828,7 @@ var chatPersistedFields = map[string]struct{}{
 	"tenant_rerank_id":         {},
 	"kb_ids":                   {},
 	"status":                   {},
+	"permission":               {},
 }
 
 var chatReadonlyFields = map[string]struct{}{
@@ -1177,6 +1188,7 @@ func (s *ChatService) buildRESTChatResponse(ctx context.Context, chat *entity.Ch
 		"dataset_ids":              datasetIDs,
 		"kb_names":                 kbNames,
 		"status":                   chat.Status,
+		"permission":               chat.Permission,
 		"create_time":              chat.CreateTime,
 		"create_date":              chat.CreateDate,
 		"update_time":              chat.UpdateTime,
@@ -1297,38 +1309,16 @@ type GetChatResponse struct {
 
 // GetChat gets chat detail by ID with permission check
 func (s *ChatService) GetChat(ctx context.Context, userID string, chatID string) (*GetChatResponse, error) {
-	// Step 1: Get user tenants (same as Python UserTenantService.query(user_id=current_user.id))
-	tenants, err := s.userTenantDAO.GetByUserID(ctx, dao.DB, userID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get user tenants: %w", err)
-	}
-
-	// Step 2: Check if user has permission to access this chat
-	// Python: for tenant in tenants: if DialogService.query(tenant_id=tenant.tenant_id, id=chat_id, status=StatusEnum.VALID.value): break
-	hasPermission := false
-	for _, tenant := range tenants {
-		chats, err := s.chatDAO.QueryByTenantIDAndID(ctx, dao.DB, tenant.TenantID, chatID, "1")
-		if err != nil {
-			continue // Try next tenant
-		}
-		if len(chats) > 0 {
-			hasPermission = true
-			break
-		}
-	}
-
-	if !hasPermission {
-		return nil, fmt.Errorf("no authorization")
-	}
-
-	// Step 3: Get chat detail (same as Python DialogService.get_by_id(chat_id))
-	chat, err := s.chatDAO.GetByID(ctx, dao.DB, chatID)
+	chat, err := s.chatDAO.GetByIDAndStatus(ctx, dao.DB, chatID, string(entity.StatusValid))
 	if err != nil {
 		return nil, fmt.Errorf("chat not found")
 	}
 
-	// Step 4: Build response with kb_names (same as Python _build_chat_response)
-	// Resolve kb_ids to kb_names
+	if !HasChatTeamPermission(ctx, chat, userID, s.tenantDAO) {
+		return nil, fmt.Errorf("no authorization")
+	}
+
+	// Build response with kb_names (same as Python _build_chat_response)
 	kbNames, datasetIDs := s.getDatasetNamesAndIDs(ctx, chat.KBIDs)
 
 	return &GetChatResponse{

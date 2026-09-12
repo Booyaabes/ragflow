@@ -48,6 +48,7 @@ type Chat struct {
 	TenantRerankID         *string   `gorm:"column:tenant_rerank_id;size:32;index" json:"tenant_rerank_id,omitempty"`
 	KBIDs                  JSONSlice `gorm:"column:kb_ids;type:longtext;not null" json:"kb_ids"`
 	Status                 *string   `gorm:"column:status;size:1;index" json:"status,omitempty"`
+	Permission             string    `gorm:"column:permission;size:16;not null;default:me;index" json:"permission"`
 	BaseModel
 }
 
