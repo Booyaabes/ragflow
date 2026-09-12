@@ -62,6 +62,7 @@ export function useChatSettingSchema() {
       name: z.string().min(1, { message: t('assistantNameMessage') }),
       icon: z.string(),
       description: z.string().optional(),
+      permission: z.string().optional(),
       dataset_ids: z.array(z.string()).min(0, {
         message: t('knowledgeBasesMessage'),
       }),

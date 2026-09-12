@@ -2397,6 +2397,20 @@ def _load_chat_api_module(monkeypatch):
     user_svc_mod.UserTenantService = SimpleNamespace(query=lambda **_k: [])
     monkeypatch.setitem(sys.modules, "api.db.services.user_service", user_svc_mod)
 
+    check_team_permission_mod = ModuleType("api.common.check_team_permission")
+
+    def _stub_check_dialog_team_permission(dialog, other):
+        data = dialog.to_dict() if hasattr(dialog, "to_dict") else dict(dialog)
+        if data.get("tenant_id") == other:
+            return True
+        if data.get("permission") != "team":
+            return False
+        joined = user_svc_mod.TenantService.get_joined_tenants_by_user_id(other)
+        return any(tenant["tenant_id"] == data.get("tenant_id") for tenant in joined)
+
+    check_team_permission_mod.check_dialog_team_permission = _stub_check_dialog_team_permission
+    monkeypatch.setitem(sys.modules, "api.common.check_team_permission", check_team_permission_mod)
+
     api_utils_mod = ModuleType("api.utils.api_utils")
     api_utils_mod.check_duplicate_ids = lambda ids, _kind: (ids, [])
     api_utils_mod.get_data_error_result = lambda message="Error", code=_RetCode.DATA_ERROR: {"code": code, "message": message}

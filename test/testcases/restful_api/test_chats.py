@@ -802,6 +802,20 @@ def _load_chat_routes_unit_module(monkeypatch):
     user_service_mod.UserTenantService = _StubUserTenantService
     monkeypatch.setitem(sys.modules, "api.db.services.user_service", user_service_mod)
 
+    check_team_permission_mod = ModuleType("api.common.check_team_permission")
+
+    def _stub_check_dialog_team_permission(dialog, other):
+        data = dialog.to_dict() if hasattr(dialog, "to_dict") else dict(dialog)
+        if data.get("tenant_id") == other:
+            return True
+        if data.get("permission") != "team":
+            return False
+        joined = _StubTenantService.get_joined_tenants_by_user_id(other)
+        return any(tenant["tenant_id"] == data.get("tenant_id") for tenant in joined)
+
+    check_team_permission_mod.check_dialog_team_permission = _stub_check_dialog_team_permission
+    monkeypatch.setitem(sys.modules, "api.common.check_team_permission", check_team_permission_mod)
+
     chunk_feedback_service_mod = ModuleType("api.db.services.chunk_feedback_service")
     chunk_feedback_service_mod.ChunkFeedbackService = type(
         "ChunkFeedbackService",
@@ -1256,7 +1270,7 @@ def test_chat_create_uses_direct_chat_fields_unit(monkeypatch):
 
 
 @pytest.mark.p2
-def test_list_chats_passes_empty_owner_ids_when_omitted_unit(monkeypatch):
+def test_list_chats_passes_joined_tenant_ids_when_owner_ids_omitted_unit(monkeypatch):
     module = _load_chat_routes_unit_module(monkeypatch)
     captured = {}
     monkeypatch.setattr(
@@ -1285,7 +1299,10 @@ def test_list_chats_passes_empty_owner_ids_when_omitted_unit(monkeypatch):
     monkeypatch.setattr(module.DialogService, "get_by_tenant_ids", _get_by_tenant_ids)
     res = _run(module.list_chats.__wrapped__())
     assert res["code"] == 0
-    assert captured["owner_ids"] == []
+    # Without an explicit owner_ids filter, the default listing still needs the
+    # caller's joined tenant IDs so DialogService.get_by_tenant_ids can surface
+    # team-shared chats (permission="team") alongside the caller's own chats.
+    assert set(captured["owner_ids"]) == {"tenant-1", "team-tenant-2"}
 
 
 @pytest.mark.p2

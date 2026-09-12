@@ -16,10 +16,25 @@
 
 
 from api.db import TenantPermission
-from api.db.db_models import File, Knowledgebase
+from api.db.db_models import Dialog, File, Knowledgebase
 from api.db.services.file_service import FileService
 from api.db.services.knowledgebase_service import KnowledgebaseService
 from api.db.services.user_service import TenantService
+
+
+def check_dialog_team_permission(dialog: dict | Dialog, other: str) -> bool:
+    dialog = dialog.to_dict() if isinstance(dialog, Dialog) else dialog
+
+    dialog_tenant_id = dialog["tenant_id"]
+
+    if dialog_tenant_id == other:
+        return True
+
+    if dialog["permission"] != TenantPermission.TEAM:
+        return False
+
+    joined_tenants = TenantService.get_joined_tenants_by_user_id(other)
+    return any(tenant["tenant_id"] == dialog_tenant_id for tenant in joined_tenants)
 
 
 def check_kb_team_permission(kb: dict | Knowledgebase, other: str) -> bool:
