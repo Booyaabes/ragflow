@@ -1,10 +1,8 @@
 name: docker-ghcr
 
 # Builds the production Docker image (root Dockerfile) and pushes it to this
-# repo's GitHub Container Registry. Runs on stock ubuntu-latest — unlike
-# release.yml, which builds the same image but only on Infiniflow's
-# self-hosted ragflow-release runners and pushes to Docker Hub
-# (infiniflow/ragflow), not GHCR.
+# repo's GitHub Container Registry — unlike release-python.yml, which builds
+# the same image but pushes it to Docker Hub (infiniflow/ragflow), not GHCR.
 #
 # Not wired to pull_request: the image is multi-GB and pushing on every PR
 # would be wasteful, and PR builds should not have write access to the

@@ -13,6 +13,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+import copy
 import json
 import logging
 import re
@@ -21,16 +22,18 @@ import time
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 
-from rag.nlp import rag_tokenizer, query
 import numpy as np
-from common.doc_store.doc_store_base import MatchDenseExpr, FusionExpr, OrderByExpr, DocStoreConnection
-from common.string_utils import remove_redundant_spaces
-from common.float_utils import get_float
-from common.constants import PAGERANK_FLD, TAG_FLD
-from common.tag_feature_utils import parse_tag_features
-from common import settings
 
+from common import settings
+from common.constants import PAGERANK_FLD, TAG_FLD
+from common.doc_store.doc_store_base import DocStoreConnection, FusionExpr, MatchDenseExpr, OrderByExpr, field_scalar
+from common.float_utils import get_float
 from common.misc_utils import thread_pool_exec
+from common.string_utils import remove_redundant_spaces
+from common.tag_feature_utils import parse_tag_features
+from rag.nlp import query, rag_tokenizer
+
+logger = logging.getLogger(__name__)
 
 
 def build_fusion_expr(topn: int, vector_similarity_weight: float = 0.3) -> FusionExpr:
@@ -45,6 +48,44 @@ def build_fusion_expr(topn: int, vector_similarity_weight: float = 0.3) -> Fusio
 
 def index_name(uid):
     return f"ragflow_{uid}"
+
+
+def is_kb_scoped_chunk(chunk: dict | None) -> bool:
+    """True for compilation/graph rows keyed to the KB, not a source document.
+
+    Wiki persist stamps ``doc_id = kb_id``. Those rows must not be treated as
+    leftover chunks from a deleted ``document`` row. A missing ``doc_id`` is
+    not enough on its own: only an explicit compilation marker (``compile_kwd``)
+    or the KB-id sentinel bypasses deleted-document pruning. Otherwise stale
+    ordinary chunks without ``doc_id`` would stay retrievable after their
+    source document is deleted.
+    """
+    if not isinstance(chunk, dict):
+        return False
+    doc_id = field_scalar(chunk.get("doc_id"))
+    kb_id = field_scalar(chunk.get("kb_id"))
+    if kb_id and doc_id == kb_id:
+        return True
+    if doc_id:
+        return False
+    return bool(field_scalar(chunk.get("compile_kwd")))
+
+
+def _scope_values(value) -> frozenset:
+    if isinstance(value, (list, tuple, set)):
+        return frozenset(item for item in value if item is not None)
+    if value is None:
+        return frozenset()
+    return frozenset((value,))
+
+
+def _parent_matches_children(parent: dict, children: list[dict]) -> bool:
+    child_scopes = {(_scope_values(child.get("doc_id")), _scope_values(child.get("kb_id"))) for child in children}
+    if len(child_scopes) != 1:
+        return False
+
+    ((child_doc_ids, child_kb_ids),) = child_scopes
+    return bool(child_doc_ids and child_kb_ids) and (_scope_values(parent.get("doc_id")) == child_doc_ids and _scope_values(parent.get("kb_id")) == child_kb_ids)
 
 
 class Dealer:
@@ -124,12 +165,39 @@ class Dealer:
         # is removed but the vector record is not fully cleaned up. We filter those
         # chunks here so chat/retrieval does not surface content from deleted docs.
         # Keep this as a fallback, not as the primary delete mechanism.
-        chunk_doc_ids = [chunk.get("doc_id") for chunk in sres.field.values() if chunk and chunk.get("doc_id")]
-        if not chunk_doc_ids:
+        fields = sres.field or {}
+        aligned_ids = [chunk_id for chunk_id in sres.ids if fields.get(chunk_id)]
+        if len(aligned_ids) != len(sres.ids):
+            fields = {chunk_id: fields[chunk_id] for chunk_id in aligned_ids}
+            highlight = sres.highlight
+            if highlight:
+                highlight = {chunk_id: highlight[chunk_id] for chunk_id in aligned_ids if chunk_id in highlight}
+            sres = self.SearchResult(
+                total=len(aligned_ids),
+                ids=aligned_ids,
+                query_vector=sres.query_vector,
+                field=fields,
+                highlight=highlight,
+                aggregation=sres.aggregation,
+                keywords=sres.keywords,
+                group_docs=sres.group_docs,
+            )
+
+        chunk_doc_ids = []
+        unscoped_missing_doc_id = False
+        for chunk in fields.values():
+            if not chunk or is_kb_scoped_chunk(chunk):
+                continue
+            doc_id = field_scalar(chunk.get("doc_id"))
+            if doc_id:
+                chunk_doc_ids.append(doc_id)
+            else:
+                unscoped_missing_doc_id = True
+        if not chunk_doc_ids and not unscoped_missing_doc_id:
             return sres
 
-        existing_doc_ids = await self._existing_doc_ids(chunk_doc_ids)
-        if len(existing_doc_ids) == len(set(chunk_doc_ids)):
+        existing_doc_ids = await self._existing_doc_ids(chunk_doc_ids) if chunk_doc_ids else set()
+        if chunk_doc_ids and not unscoped_missing_doc_id and len(existing_doc_ids) == len(set(chunk_doc_ids)):
             return sres
 
         filtered_ids = []
@@ -138,8 +206,17 @@ class Dealer:
         removed = 0
 
         for chunk_id in sres.ids:
-            chunk = sres.field.get(chunk_id)
-            if not chunk or chunk.get("doc_id") not in existing_doc_ids:
+            chunk = fields.get(chunk_id)
+            if not chunk:
+                removed += 1
+                continue
+            if is_kb_scoped_chunk(chunk):
+                filtered_ids.append(chunk_id)
+                filtered_field[chunk_id] = chunk
+                if sres.highlight and chunk_id in sres.highlight:
+                    filtered_highlight[chunk_id] = sres.highlight[chunk_id]
+                continue
+            if field_scalar(chunk.get("doc_id")) not in existing_doc_ids:
                 removed += 1
                 continue
 
@@ -229,7 +306,7 @@ class Dealer:
                 orderBy.desc("create_timestamp_flt")
             res = self.dataStore.search(src, [], filters, [], orderBy, offset, limit, idx_names, kb_ids)
             total = self.dataStore.get_total(res)
-            logging.debug("Dealer.search TOTAL: {}".format(total))
+            logging.debug(f"Dealer.search TOTAL: {total}")
         else:
             highlightFields = []
             matchText, keywords = self.qryr.question(qst, min_match=(0.3 if min_match else 0))
@@ -237,9 +314,10 @@ class Dealer:
                 matchExprs = [matchText] if matchText else []
                 res = await thread_pool_exec(self.dataStore.search, src, highlightFields, filters, matchExprs, orderBy, offset, limit, idx_names, kb_ids, rank_feature=rank_feature)
                 total = self.dataStore.get_total(res)
-                logging.debug("Dealer.search TOTAL: {}".format(total))
+                logging.debug(f"Dealer.search TOTAL: {total}")
             else:
-                matchDense = await self.get_vector(qst, emb_mdl, top_k=knn_top_k, num_candidates=knn_num_candidates, similarity=req.get("similarity", 0.1))
+                dense_template = await self.get_vector(qst, emb_mdl, top_k=knn_top_k, num_candidates=knn_num_candidates, similarity=req.get("similarity", 0.1))
+                matchDense = copy.deepcopy(dense_template)
                 q_vec = matchDense.embedding_data
                 # ES path no longer fetches chunk vectors here. The clean
                 # cosine score is recovered later via a second KNN-only call
@@ -247,7 +325,7 @@ class Dealer:
                 # citations (see Dealer.fetch_chunk_vectors). OceanBase
                 # still relies on local rerank against chunk vectors, so
                 # keep pulling them for that backend.
-                if settings.DOC_ENGINE_OCEANBASE or settings.DOC_ENGINE_SERENEDB:
+                if settings.DOC_ENGINE_OCEANBASE or settings.DOC_ENGINE_SERENEDB or settings.DOC_ENGINE_VASTBASE:
                     src.append(f"q_{len(q_vec)}_vec")
 
                 if settings.DOC_ENGINE_INFINITY:
@@ -267,15 +345,33 @@ class Dealer:
 
                 res = await thread_pool_exec(self.dataStore.search, src, highlightFields, filters, matchExprs, orderBy, offset, limit, idx_names, kb_ids, rank_feature=rank_feature)
                 total = self.dataStore.get_total(res)
-                logging.debug("Dealer.search TOTAL: {}".format(total))
+                logging.debug(f"Dealer.search TOTAL: {total}")
 
-                # If result is empty, try again with lower min_match
+                # If result is empty, try again with lower min_match or, for
+                # dense-only queries, a lower vector threshold.
                 if total == 0:
-                    if filters.get("doc_id"):
-                        res = await thread_pool_exec(self.dataStore.search, src, [], filters, [], orderBy, offset, limit, idx_names, kb_ids)
-                        total = self.dataStore.get_total(res)
+                    if not matchText:
+                        if req.get("allow_dense_fallback", True):
+                            matchDense = copy.deepcopy(dense_template)
+                            matchDense.extra_options["similarity"] = 0.17
+                            logging.debug("Dealer.search dense-only fallback after empty initial search")
+                            res = await thread_pool_exec(
+                                self.dataStore.search,
+                                src,
+                                highlightFields,
+                                filters,
+                                [matchDense],
+                                orderBy,
+                                offset,
+                                limit,
+                                idx_names,
+                                kb_ids,
+                                rank_feature=rank_feature,
+                            )
+                            total = self.dataStore.get_total(res)
                     else:
                         matchText, _ = self.qryr.question(qst, min_match=(0.1 if min_match else 0))
+                        matchDense = copy.deepcopy(dense_template)
                         matchDense.extra_options["similarity"] = 0.17
                         res = await thread_pool_exec(
                             self.dataStore.search,
@@ -291,7 +387,26 @@ class Dealer:
                             rank_feature=rank_feature,
                         )
                         total = self.dataStore.get_total(res)
-                    logging.debug("Dealer.search 2 TOTAL: {}".format(total))
+                        # Zero-only by design: any lexical hit keeps the existing hybrid candidate semantics.
+                        if total == 0 and matchText and req.get("allow_dense_fallback", True):
+                            matchDense = copy.deepcopy(dense_template)
+                            matchDense.extra_options["similarity"] = 0.17
+                            logging.debug("Dealer.search dense-only fallback after empty hybrid retries")
+                            res = await thread_pool_exec(
+                                self.dataStore.search,
+                                src,
+                                [],
+                                filters,
+                                [matchDense],
+                                orderBy,
+                                offset,
+                                limit,
+                                idx_names,
+                                kb_ids,
+                                rank_feature=rank_feature,
+                            )
+                            total = self.dataStore.get_total(res)
+                    logging.debug(f"Dealer.search 2 TOTAL: {total}")
 
             for k in keywords:
                 kwds.add(k)
@@ -349,7 +464,7 @@ class Dealer:
                 continue
             idx.append(i)
             pieces_.append(t)
-        logging.debug("{} => {}".format(answer, pieces_))
+        logging.debug(f"{answer} => {pieces_}")
         if not pieces_:
             return answer, set([])
 
@@ -357,18 +472,18 @@ class Dealer:
         for i in range(len(chunk_v)):
             if len(ans_v[0]) != len(chunk_v[i]):
                 chunk_v[i] = [0.0] * len(ans_v[0])
-                logging.warning("The dimension of query and chunk do not match: {} vs. {}".format(len(ans_v[0]), len(chunk_v[i])))
+                logging.warning(f"The dimension of query and chunk do not match: {len(ans_v[0])} vs. {len(chunk_v[i])}")
 
-        assert len(ans_v[0]) == len(chunk_v[0]), "The dimension of query and chunk do not match: {} vs. {}".format(len(ans_v[0]), len(chunk_v[0]))
+        assert len(ans_v[0]) == len(chunk_v[0]), f"The dimension of query and chunk do not match: {len(ans_v[0])} vs. {len(chunk_v[0])}"
 
         chunks_tks = [rag_tokenizer.tokenize(self.qryr.rmWWW(ck)).split() for ck in chunks]
         cites = {}
         thr = 0.63
         while thr > 0.3 and len(cites.keys()) == 0 and pieces_ and chunks_tks:
             for i, a in enumerate(pieces_):
-                sim, tksim, vtsim = self.qryr.hybrid_similarity(ans_v[i], chunk_v, rag_tokenizer.tokenize(self.qryr.rmWWW(pieces_[i])).split(), chunks_tks, tkweight, vtweight)
+                sim, tksim, vtsim = self.qryr.hybrid_similarity(ans_v[i], chunk_v, rag_tokenizer.tokenize(self.qryr.rmWWW(a)).split(), chunks_tks, tkweight, vtweight)
                 mx = np.max(sim) * 0.99
-                logging.debug("{} SIM: {}".format(pieces_[i], mx))
+                logging.debug(f"{a} SIM: {mx}")
                 if mx < thr:
                     continue
                 cites[idx[i]] = list(set([str(ii) for ii in range(len(chunk_v)) if sim[ii] > mx]))[:4]
@@ -619,6 +734,7 @@ class Dealer:
         rerank_candidates_count=64,
         knn_top_k=1024,  # Advanced knn parameter
         knn_num_candidates=2048,  # Advanced knn parameter
+        allow_dense_fallback=True,
     ):
         """
         Pagination is neither efficient nor reliable for this retrieval when rerank is enabled because the system must:
@@ -653,6 +769,7 @@ class Dealer:
             "vector_similarity_weight": vector_similarity_weight,
             "knn_top_k": knn_top_k,
             "knn_num_candidates": knn_num_candidates,
+            "allow_dense_fallback": allow_dense_fallback,
         }
         if isinstance(must_not, dict) and must_not:
             req["must_not"] = must_not
@@ -698,8 +815,8 @@ class Dealer:
                 sim = [s if s is not None else 0.0 for s in sim]
                 tsim = sim
                 vsim = sim
-            elif settings.DOC_ENGINE_OCEANBASE or settings.DOC_ENGINE_SERENEDB:
-                # OceanBase still returns chunk vectors in the result; use
+            elif settings.DOC_ENGINE_OCEANBASE or settings.DOC_ENGINE_SERENEDB or settings.DOC_ENGINE_VASTBASE:
+                # OceanBase/Vastbase return chunk vectors in the result; use
                 # the historical local rerank that depends on them.
                 sim, tsim, vsim = self.rerank(
                     sres,
@@ -850,6 +967,9 @@ class Dealer:
 
         orderBy = OrderByExpr()
         if sort_by_position:
+            # Same reading order as the chunk list: the position columns tie for
+            # rows that carry no position data, which is what this column fixes.
+            orderBy.asc("chunk_order_int")
             orderBy.asc("page_num_int")
             orderBy.asc("position_int")
             orderBy.asc("top_int")
@@ -925,7 +1045,11 @@ class Dealer:
             doc_id2kb_id[ck["doc_id"]] = ck["kb_id"]
         doc_id = sorted(ranks.items(), key=lambda x: x[1] * -1.0)[0][0]
         kb_ids = [doc_id2kb_id[doc_id]]
-        es_res = self.dataStore.search(["content_with_weight"], [], {"doc_id": doc_id, "toc_kwd": "toc"}, [], OrderByExpr(), 0, 128, idx_nms, kb_ids)
+        # A document parsed in several page ranges carries one TOC row per task;
+        # read them in range order so the concatenated TOC stays ordered.
+        orderBy = OrderByExpr()
+        orderBy.asc("chunk_order_int")
+        es_res = self.dataStore.search(["content_with_weight"], [], {"doc_id": doc_id, "toc_kwd": "toc"}, [], orderBy, 0, 128, idx_nms, kb_ids)
         toc = []
         dict_chunks = self.dataStore.get_fields(es_res, ["content_with_weight"])
         for _, doc in dict_chunks.items():
@@ -1000,6 +1124,14 @@ class Dealer:
             if chunk is None:
                 logging.warning(
                     "Parent chunk '%s' not found in the index; falling back to %d child chunk(s).",
+                    id,
+                    len(cks),
+                )
+                chunks.extend(cks)
+                continue
+            if not _parent_matches_children(chunk, cks):
+                logger.warning(
+                    "Parent chunk '%s' metadata does not match its child scope; falling back to %d child chunk(s).",
                     id,
                     len(cks),
                 )
