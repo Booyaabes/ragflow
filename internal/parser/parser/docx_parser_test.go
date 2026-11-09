@@ -1,0 +1,240 @@
+//go:build cgo
+
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
+package parser
+
+import (
+	"encoding/base64"
+	"strings"
+	"testing"
+
+	"ragflow/internal/entity"
+)
+
+func TestBuildDOCXJSONSections_Paragraphs(t *testing.T) {
+	ir := `{"sections":[{"title":"","elements":[
+		{"type":"paragraph","content":[{"type":"text","text":"Hello world"}],"style":"Normal"}
+	]}]}`
+	sections := buildDOCXJSONSections(ir, nil)
+	if len(sections) != 1 {
+		t.Fatalf("got %d sections, want 1", len(sections))
+	}
+	item := sections[0]
+	if got, ok := item["text"].(string); !ok || got != "Hello world" {
+		t.Errorf("text = %q, want %q", got, "Hello world")
+	}
+	if got, ok := item["doc_type_kwd"].(string); !ok || got != "text" {
+		t.Errorf("doc_type_kwd = %q, want %q", got, "text")
+	}
+}
+
+func TestBuildDOCXJSONSections_Headings(t *testing.T) {
+	ir := `{"sections":[{"title":"","elements":[
+		{"type":"heading","level":1,"content":[{"type":"text","text":"Chapter 1"}]}
+	]}]}`
+	sections := buildDOCXJSONSections(ir, nil)
+	if len(sections) != 1 {
+		t.Fatalf("got %d sections, want 1", len(sections))
+	}
+	item := sections[0]
+	if got, ok := item["text"].(string); !ok || got != "Chapter 1" {
+		t.Errorf("text = %q, want %q", got, "Chapter 1")
+	}
+	if got, ok := item["doc_type_kwd"].(string); !ok || got != "text" {
+		t.Errorf("doc_type_kwd = %q, want %q", got, "text")
+	}
+	if got, ok := item["layout"].(string); !ok || got != "heading" {
+		t.Errorf("layout = %q, want %q", got, "heading")
+	}
+}
+
+func TestBuildDOCXJSONSections_Images(t *testing.T) {
+	imageData := officeTestPNG(t, 21)
+	b64 := base64.StdEncoding.EncodeToString(imageData)
+	ir := `{"sections":[{"title":"","elements":[
+		{"type":"image","data":"` + b64 + `"}
+	]}]}`
+	sink, cache := officeMediaTestSink(t, officeMediaFormatDOCX)
+	sections := buildDOCXJSONSections(ir, sink)
+	if sink.err != nil {
+		t.Fatalf("sink error: %v", sink.err)
+	}
+	if len(sections) != 1 {
+		t.Fatalf("got %d sections, want 1", len(sections))
+	}
+	item := sections[0]
+	if got, ok := item["text"].(string); !ok || got != "" {
+		t.Errorf("text = %q, want empty", got)
+	}
+	ref := requireOfficeMediaRef(t, item)
+	if ref.Format != officeMediaFormatDOCX || ref.MIME != "image/png" {
+		t.Errorf("media_ref = %+v, want docx image/png", ref)
+	}
+	if len(cache.puts) != 1 || string(cache.puts[0].data) != string(imageData) {
+		t.Fatalf("cache writes = %+v, want the image bytes", cache.puts)
+	}
+	if got, ok := item["doc_type_kwd"].(string); !ok || got != "image" {
+		t.Errorf("doc_type_kwd = %q, want %q", got, "image")
+	}
+}
+
+func TestBuildDOCXJSONSections_Tables(t *testing.T) {
+	ir := `{"sections":[{"title":"","elements":[
+		{"type":"table","rows":[
+			{"cells":[{"content":[{"type":"paragraph","content":[{"type":"text","text":"A1"}]}]},{"content":[{"type":"paragraph","content":[{"type":"text","text":"B1"}]}]}]},
+			{"cells":[{"content":[{"type":"paragraph","content":[{"type":"text","text":"A2"}]}]},{"content":[{"type":"paragraph","content":[{"type":"text","text":"B2"}]}]}]}
+		]}
+	]}]}`
+	sections := buildDOCXJSONSections(ir, nil)
+	if len(sections) != 1 {
+		t.Fatalf("got %d sections, want 1", len(sections))
+	}
+	item := sections[0]
+	td, ok := item["table"].(*entity.TableData)
+	if !ok || td == nil {
+		t.Fatal("table field missing or not *entity.TableData")
+	}
+	var all strings.Builder
+	for _, row := range td.CellTexts() {
+		for _, c := range row {
+			all.WriteString(c)
+		}
+	}
+	s := all.String()
+	if !strings.Contains(s, "A1") || !strings.Contains(s, "B1") ||
+		!strings.Contains(s, "A2") || !strings.Contains(s, "B2") {
+		t.Errorf("table rows = %#v, missing cell content", td.CellTexts())
+	}
+	if len(td.CellTexts()) != 2 {
+		t.Errorf("table rows = %#v, want 2 rows", td.CellTexts())
+	}
+	if got, ok := item["doc_type_kwd"].(string); !ok || got != "table" {
+		t.Errorf("doc_type_kwd = %q, want %q", got, "table")
+	}
+}
+
+func TestBuildDOCXJSONSections_MixedContent(t *testing.T) {
+	ir := `{"sections":[{"title":"","elements":[
+		{"type":"paragraph","content":[{"type":"text","text":"First para"}]},
+		{"type":"image","data":"` + officeTestImageB64(t, 22) + `"},
+		{"type":"table","rows":[{"cells":[{"content":[{"type":"paragraph","content":[{"type":"text","text":"cell"}]}]}]}]},
+		{"type":"heading","level":2,"content":[{"type":"text","text":"Sub title"}]}
+	]}]}`
+	sink, _ := officeMediaTestSink(t, officeMediaFormatDOCX)
+	sections := buildDOCXJSONSections(ir, sink)
+	if sink.err != nil {
+		t.Fatalf("sink error: %v", sink.err)
+	}
+	if len(sections) != 4 {
+		t.Fatalf("got %d sections, want 4", len(sections))
+	}
+	// paragraph first
+	if got, _ := sections[0]["doc_type_kwd"].(string); got != "text" {
+		t.Errorf("item[0].doc_type_kwd = %q, want %q", got, "text")
+	}
+	// image second
+	if got, _ := sections[1]["doc_type_kwd"].(string); got != "image" {
+		t.Errorf("item[1].doc_type_kwd = %q, want %q", got, "image")
+	}
+	requireOfficeMediaRef(t, sections[1])
+	// table third
+	if got, _ := sections[2]["doc_type_kwd"].(string); got != "table" {
+		t.Errorf("item[2].doc_type_kwd = %q, want %q", got, "table")
+	}
+	// heading fourth
+	if got, _ := sections[3]["doc_type_kwd"].(string); got != "text" {
+		t.Errorf("item[3].doc_type_kwd = %q, want %q", got, "text")
+	}
+	if got, _ := sections[3]["layout"].(string); got != "heading" {
+		t.Errorf("item[3].layout = %q, want %q", got, "heading")
+	}
+}
+
+func TestBuildDOCXJSONSections_List(t *testing.T) {
+	ir := `{"sections":[{"title":"","elements":[
+		{"type":"list","ordered":false,"items":[
+			{"content":[{"type":"paragraph","content":[{"type":"text","text":"Item 1"}]}]},
+			{"content":[{"type":"paragraph","content":[{"type":"text","text":"Item 2"}]}]},
+			{"content":[{"type":"paragraph","content":[{"type":"text","text":"Item 3"}]}]}
+		],"level":0}
+	]}]}`
+	sections := buildDOCXJSONSections(ir, nil)
+	if len(sections) != 3 {
+		t.Fatalf("got %d sections, want 3 (each list item should be a section)", len(sections))
+	}
+	for i, want := range []string{"Item 1", "Item 2", "Item 3"} {
+		if got, _ := sections[i]["text"].(string); got != want {
+			t.Errorf("section[%d].text = %q, want %q", i, got, want)
+		}
+		if got, ok := sections[i]["doc_type_kwd"].(string); !ok || got != "text" {
+			t.Errorf("section[%d].doc_type_kwd = %q, want %q", i, got, "text")
+		}
+	}
+}
+
+func TestBuildDOCXJSONSections_TextBox(t *testing.T) {
+	ir := `{"sections":[{"title":"","elements":[
+		{"type":"text_box","content":[{"type":"paragraph","content":[{"type":"text","text":"Boxed paragraph"}]}],"width_emu":null}
+	]}]}`
+	sections := buildDOCXJSONSections(ir, nil)
+	if len(sections) != 1 {
+		t.Fatalf("got %d sections, want 1 (text_box content should become a section)", len(sections))
+	}
+	if got, _ := sections[0]["text"].(string); got != "Boxed paragraph" {
+		t.Errorf("text = %q, want %q", got, "Boxed paragraph")
+	}
+	if got, ok := sections[0]["doc_type_kwd"].(string); !ok || got != "text" {
+		t.Errorf("doc_type_kwd = %q, want %q", got, "text")
+	}
+}
+
+func TestBuildDOCXJSONSections_MixedWithList(t *testing.T) {
+	ir := `{"sections":[{"title":"","elements":[
+		{"type":"paragraph","content":[{"type":"text","text":"Preamble"}],"style":"Normal"},
+		{"type":"list","ordered":false,"items":[
+			{"content":[{"type":"paragraph","content":[{"type":"text","text":"Bullet A"}]}]},
+			{"content":[{"type":"paragraph","content":[{"type":"text","text":"Bullet B"}]}]}
+		],"level":0},
+		{"type":"paragraph","content":[{"type":"text","text":"Trailer"}],"style":"Normal"}
+	]}]}`
+	sections := buildDOCXJSONSections(ir, nil)
+	if len(sections) != 4 {
+		t.Fatalf("got %d sections, want 4 (para + 2 list items + para)", len(sections))
+	}
+	wants := []string{"Preamble", "Bullet A", "Bullet B", "Trailer"}
+	for i, want := range wants {
+		if got, _ := sections[i]["text"].(string); got != want {
+			t.Errorf("section[%d].text = %q, want %q", i, got, want)
+		}
+	}
+}
+
+func TestBuildDOCXJSONSections_EmptySkipped(t *testing.T) {
+	ir := `{"sections":[{"title":"","elements":[
+		{"type":"paragraph","content":[{"type":"text","text":""}]},
+		{"type":"paragraph","content":[{"type":"text","text":"Only this matters"}]},
+		{"type":"table","rows":[]}
+	]}]}`
+	sections := buildDOCXJSONSections(ir, nil)
+	if len(sections) != 1 {
+		t.Fatalf("got %d sections, want 1 (only non-empty paragraph)", len(sections))
+	}
+	if got, _ := sections[0]["text"].(string); got != "Only this matters" {
+		t.Errorf("text = %q, want %q", got, "Only this matters")
+	}
+}

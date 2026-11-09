@@ -1,0 +1,671 @@
+package file
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"errors"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"ragflow/internal/common"
+	"strings"
+	"testing"
+	"time"
+	"unicode/utf8"
+
+	"ragflow/internal/dao"
+	"ragflow/internal/permission"
+	"ragflow/internal/storage"
+	"ragflow/internal/utility"
+)
+
+// fakeStorage mocks storage.Storage for testing DownloadAgentFile.
+type fakeStorage struct {
+	lastBucket string
+	lastFnm    string
+	blob       []byte
+	err        error
+	exists     bool
+	getCalls   int
+}
+
+// sptr returns a pointer to the given string.
+func sptr(s string) *string { return &s }
+
+func testFileService() *FileService {
+	return &FileService{
+		fileDAO:          dao.NewFileDAO(),
+		file2DocumentDAO: dao.NewFile2DocumentDAO(),
+		documentService:  nil,
+	}
+}
+
+func TestDeploymentUploadMaxBytes(t *testing.T) {
+	t.Setenv("MAX_MULTIPART_CONTENT_LENGTH", "")
+	t.Setenv("MAX_CONTENT_LENGTH", "")
+	if got := DeploymentUploadMaxBytes(); got != defaultDeploymentUploadMaxBytes {
+		t.Fatalf("default limit = %d, want %d", got, defaultDeploymentUploadMaxBytes)
+	}
+
+	t.Setenv("MAX_MULTIPART_CONTENT_LENGTH", "12345")
+	if got := DeploymentUploadMaxBytes(); got != 12345 {
+		t.Fatalf("configured limit = %d, want 12345", got)
+	}
+
+	t.Setenv("MAX_MULTIPART_CONTENT_LENGTH", "invalid")
+	if got := DeploymentUploadMaxBytes(); got != defaultDeploymentUploadMaxBytes {
+		t.Fatalf("invalid limit = %d, want default %d", got, defaultDeploymentUploadMaxBytes)
+	}
+
+	t.Setenv("MAX_MULTIPART_CONTENT_LENGTH", "")
+	t.Setenv("MAX_CONTENT_LENGTH", "54321")
+	if got := DeploymentUploadMaxBytes(); got != 54321 {
+		t.Fatalf("legacy configured limit = %d, want 54321", got)
+	}
+}
+
+func TestReadDeploymentUploadDataLimit(t *testing.T) {
+	data, err := readDeploymentUploadData(strings.NewReader("hello"), 5)
+	if err != nil {
+		t.Fatalf("readDeploymentUploadData exact limit: %v", err)
+	}
+	if string(data) != "hello" {
+		t.Fatalf("data = %q, want hello", string(data))
+	}
+
+	_, err = readDeploymentUploadData(strings.NewReader("hello!"), 5)
+	if err == nil || !strings.Contains(err.Error(), "deployment upload limit of 5 bytes") {
+		t.Fatalf("error = %v, want deployment upload limit", err)
+	}
+}
+
+func (f *fakeStorage) Type() string { return "fake_storage" }
+
+func (f *fakeStorage) Health(ctx context.Context) bool {
+	return true
+}
+
+func (f *fakeStorage) Put(ctx context.Context, bucket, fnm string, binary []byte, tenantID ...string) error {
+	f.lastBucket = bucket
+	f.lastFnm = fnm
+	f.blob = binary
+	f.exists = true
+	return f.err
+}
+
+func (f *fakeStorage) Get(ctx context.Context, bucket, fnm string, tenantID ...string) ([]byte, error) {
+	f.getCalls++
+	f.lastBucket = bucket
+	f.lastFnm = fnm
+	return f.blob, f.err
+}
+
+func (f *fakeStorage) Remove(ctx context.Context, bucket, fnm string, tenantID ...string) error {
+	panic("not implemented in fakeStorage")
+}
+
+func (f *fakeStorage) ObjExist(ctx context.Context, bucket, fnm string, tenantID ...string) bool {
+	return f.exists && f.lastBucket == bucket && f.lastFnm == fnm
+}
+
+func (f *fakeStorage) GetPresignedURL(ctx context.Context, bucket, fnm string, expires time.Duration, tenantID ...string) (string, error) {
+	panic("not implemented in fakeStorage")
+}
+
+func (f *fakeStorage) BucketExists(ctx context.Context, bucket string) bool {
+	panic("not implemented in fakeStorage")
+}
+
+func (f *fakeStorage) ListObjects(ctx context.Context, bucket string, tenantID ...string) ([]string, error) {
+	panic("not implemented in fakeStorage")
+}
+
+func (f *fakeStorage) RemoveBucket(ctx context.Context, bucket string) error {
+	panic("not implemented in fakeStorage")
+}
+
+func (f *fakeStorage) RemoveEmptyBucket(ctx context.Context, bucket string) error {
+	panic("not implemented in fakeStorage")
+}
+func (f *fakeStorage) ObjectExists(ctx context.Context, bucket, fnm string) (bool, error) {
+	return f.ObjExist(ctx, bucket, fnm), nil
+}
+func (f *fakeStorage) BucketExistsWithError(ctx context.Context, bucket string) (bool, error) {
+	panic("not implemented in fakeStorage")
+}
+
+func (f *fakeStorage) Copy(ctx context.Context, srcBucket, srcPath, destBucket, destPath string) bool {
+	panic("not implemented in fakeStorage")
+}
+
+func (f *fakeStorage) Move(ctx context.Context, srcBucket, srcPath, destBucket, destPath string) bool {
+	panic("not implemented in fakeStorage")
+}
+
+func (f *fakeStorage) Close() error { return nil }
+
+func TestFileService_GetFileContents_NotAccessible(t *testing.T) {
+	memory := storage.NewMemoryStorage()
+	ctx := t.Context()
+	if err := memory.Put(ctx, "other-user-downloads", "loc-1", []byte("secret")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	factory := storage.GetStorageFactory()
+	originalStorage := factory.GetStorage()
+	factory.SetStorage(memory)
+	t.Cleanup(func() { factory.SetStorage(originalStorage) })
+
+	svc := testFileService()
+	texts, images, err := svc.GetFileContents(permission.WithIdentity(t.Context(), "user-1", ""), []map[string]interface{}{{
+		"id":         "loc-1",
+		"name":       "secret.txt",
+		"mime_type":  "text/plain",
+		"created_by": "other-user",
+	}})
+	if err == nil {
+		t.Fatal("expected authorization error")
+	}
+	if err.Error() != "no authorization" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(texts) != 0 || len(images) != 0 {
+		t.Fatalf("expected no content, got texts=%v images=%v", texts, images)
+	}
+}
+
+func TestFileService_GetFileContents_Accessible(t *testing.T) {
+	memory := storage.NewMemoryStorage()
+	ctx := t.Context()
+	if err := memory.Put(ctx, "user-1-downloads", "loc-1", []byte("allowed content")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	factory := storage.GetStorageFactory()
+	originalStorage := factory.GetStorage()
+	factory.SetStorage(memory)
+	t.Cleanup(func() { factory.SetStorage(originalStorage) })
+
+	svc := testFileService()
+	texts, images, err := svc.GetFileContents(permission.WithIdentity(t.Context(), "user-1", ""), []map[string]interface{}{{
+		"id":         "loc-1",
+		"name":       "doc.txt",
+		"mime_type":  "text/plain",
+		"created_by": "user-1",
+	}})
+	if err != nil {
+		t.Fatalf("GetFileContents failed: %v", err)
+	}
+	if len(images) != 0 {
+		t.Fatalf("expected no images, got %v", images)
+	}
+	want := "\n -----------------\nFile: doc.txt\nContent as following: \nallowed content"
+	if len(texts) != 1 || texts[0] != want {
+		t.Fatalf("texts = %v, want %q", texts, want)
+	}
+}
+
+// Regression for chat image attachments: visual file dicts must come back
+// as mime-preserving base64 data URIs. The Go multimodal conversion layer
+// (common.ConvertLastUserMsgToMultimodal → parseDataURIOrB64) rejects raw
+// binary blobs, which silently dropped the image before the LLM call.
+func TestFileService_GetFileContents_ImageAttachmentAsDataURI(t *testing.T) {
+	memory := storage.NewMemoryStorage()
+	if err := memory.Put(t.Context(), "user-1-downloads", "img-1", []byte("jpeg-bytes")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	factory := storage.GetStorageFactory()
+	originalStorage := factory.GetStorage()
+	factory.SetStorage(memory)
+	t.Cleanup(func() { factory.SetStorage(originalStorage) })
+
+	svc := testFileService()
+	texts, images, err := svc.GetFileContents(permission.WithIdentity(t.Context(), "user-1", ""), []map[string]interface{}{{
+		"id":         "img-1",
+		"name":       "25336bcdd3126d32a522db5e9c9fcaf3.jpeg",
+		"mime_type":  "image/jpeg",
+		"created_by": "user-1",
+	}})
+	if err != nil {
+		t.Fatalf("GetFileContents failed: %v", err)
+	}
+	if len(texts) != 0 {
+		t.Fatalf("expected no texts for image attachment, got %v", texts)
+	}
+	if len(images) != 1 {
+		t.Fatalf("expected 1 image, got %v", images)
+	}
+	want := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString([]byte("jpeg-bytes"))
+	if images[0] != want {
+		t.Fatalf("image = %q, want data URI %q", images[0], want)
+	}
+}
+
+// Video attachments are accepted but unparsable: GetFileContents reports a
+// fixed notice as the file's text (so the model sees why there is no content)
+// instead of inlining the container as a bogus image or failing the batch.
+// A mixed batch keeps the valid attachments alongside the notice.
+func TestFileService_GetFileContents_VideoAttachmentReportsNotice(t *testing.T) {
+	memory := storage.NewMemoryStorage()
+	ctx := t.Context()
+	if err := memory.Put(ctx, "user-1-downloads", "vid-1", []byte("mp4-bytes")); err != nil {
+		t.Fatalf("put video: %v", err)
+	}
+	if err := memory.Put(ctx, "user-1-downloads", "img-1", []byte("jpeg-bytes")); err != nil {
+		t.Fatalf("put image: %v", err)
+	}
+	factory := storage.GetStorageFactory()
+	originalStorage := factory.GetStorage()
+	factory.SetStorage(memory)
+	t.Cleanup(func() { factory.SetStorage(originalStorage) })
+
+	svc := testFileService()
+	ctx = permission.WithIdentity(ctx, "user-1", "")
+	texts, images, err := svc.GetFileContents(ctx, []map[string]interface{}{
+		{"id": "vid-1", "name": "clip.mp4", "mime_type": "video/mp4", "created_by": "user-1"},
+		{"id": "img-1", "name": "photo.jpeg", "mime_type": "image/jpeg", "created_by": "user-1"},
+	})
+	if err != nil {
+		t.Fatalf("GetFileContents failed: %v", err)
+	}
+	if len(texts) != 1 || !strings.Contains(texts[0], "clip.mp4") || !strings.Contains(texts[0], "video content is not supported") {
+		t.Fatalf("video notice = %v, want one text entry naming the file as unsupported", texts)
+	}
+	if len(images) != 1 {
+		t.Fatalf("expected the valid image to survive alongside the notice, got %v", images)
+	}
+}
+
+func TestFileService_ParseAgentUploads_TextAndImageInRequestOrder(t *testing.T) {
+	ctx := permission.WithIdentity(t.Context(), "user-1", "")
+	memory := storage.NewMemoryStorage()
+	if err := memory.Put(ctx, "user-1-downloads", "text-id", []byte("uploaded text")); err != nil {
+		t.Fatalf("put text: %v", err)
+	}
+	if err := memory.Put(ctx, "user-1-downloads", "image-id", []byte("png")); err != nil {
+		t.Fatalf("put image: %v", err)
+	}
+	factory := storage.GetStorageFactory()
+	originalStorage := factory.GetStorage()
+	factory.SetStorage(memory)
+	t.Cleanup(func() { factory.SetStorage(originalStorage) })
+
+	contents, err := testFileService().ParseAgentUploads(ctx, []map[string]interface{}{
+		{"id": "text-id", "name": "notes.txt", "mime_type": "text/plain", "created_by": "user-1"},
+		{"id": "image-id", "name": "photo.bin", "mime_type": "image/png", "created_by": "user-1"},
+	}, "Plain Text")
+	if err != nil {
+		t.Fatalf("ParseAgentUploads: %v", err)
+	}
+	if len(contents) != 2 {
+		t.Fatalf("contents length = %d, want 2", len(contents))
+	}
+	if !strings.Contains(contents[0], "File: notes.txt") || !strings.Contains(contents[0], "uploaded text") {
+		t.Fatalf("unexpected text content: %q", contents[0])
+	}
+	if contents[1] != "data:image/png;base64,cG5n" {
+		t.Fatalf("unexpected image content: %q", contents[1])
+	}
+}
+
+func TestFileService_ParseAgentUploads_RejectsVideoWithImageMime(t *testing.T) {
+	ctx := permission.WithIdentity(t.Context(), "user-1", "")
+	memory := storage.NewMemoryStorage()
+	if err := memory.Put(ctx, "user-1-downloads", "video-id", []byte("mp4-bytes")); err != nil {
+		t.Fatalf("put video: %v", err)
+	}
+	factory := storage.GetStorageFactory()
+	originalStorage := factory.GetStorage()
+	factory.SetStorage(memory)
+	t.Cleanup(func() { factory.SetStorage(originalStorage) })
+
+	_, err := testFileService().ParseAgentUploads(ctx, []map[string]interface{}{
+		{"id": "video-id", "name": "clip.mp4", "mime_type": "image/png", "created_by": "user-1"},
+	}, "")
+	if err == nil || !strings.Contains(err.Error(), "video content is not supported") {
+		t.Fatalf("error = %v, want video rejection even with an image MIME type", err)
+	}
+}
+
+func TestFileService_ParseAgentUploads_RejectsForeignOwner(t *testing.T) {
+	ctx := permission.WithIdentity(t.Context(), "user-1", "")
+	memory := storage.NewMemoryStorage()
+	factory := storage.GetStorageFactory()
+	originalStorage := factory.GetStorage()
+	factory.SetStorage(memory)
+	t.Cleanup(func() { factory.SetStorage(originalStorage) })
+
+	_, err := testFileService().ParseAgentUploads(ctx, []map[string]interface{}{
+		{"id": "file-id", "name": "secret.txt", "mime_type": "text/plain", "created_by": "user-2"},
+	}, "")
+	if err == nil || !strings.Contains(err.Error(), "created_by does not match") {
+		t.Fatalf("error = %v, want created_by mismatch", err)
+	}
+}
+
+func TestFileService_ParseAgentUploads_MissingObjectFails(t *testing.T) {
+	ctx := permission.WithIdentity(t.Context(), "user-1", "")
+	memory := storage.NewMemoryStorage()
+	factory := storage.GetStorageFactory()
+	originalStorage := factory.GetStorage()
+	factory.SetStorage(memory)
+	t.Cleanup(func() { factory.SetStorage(originalStorage) })
+
+	_, err := testFileService().ParseAgentUploads(ctx, []map[string]interface{}{
+		{"id": "missing", "name": "missing.txt", "mime_type": "text/plain", "created_by": "user-1"},
+	}, "")
+	if err == nil || !strings.Contains(err.Error(), "read upload") {
+		t.Fatalf("error = %v, want storage read failure", err)
+	}
+}
+
+func TestFileService_DownloadAgentFile_Success(t *testing.T) {
+	// Setup mock storage
+	expectedBlob := []byte("fake file content")
+	mockStorage := &fakeStorage{
+		blob: expectedBlob,
+		err:  nil,
+	}
+
+	factory := storage.GetStorageFactory()
+	originalStorage := factory.GetStorage()
+	factory.SetStorage(mockStorage)
+	t.Cleanup(func() {
+		factory.SetStorage(originalStorage)
+	})
+
+	svc := testFileService()
+	userID := "tenant123"
+	location := "file-abc.txt"
+
+	ctx := permission.WithIdentity(t.Context(), userID, "")
+	blob, err := svc.DownloadAgentFile(ctx, location)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if mockStorage.lastBucket != "tenant123-downloads" {
+		t.Errorf("expected bucket 'tenant123-downloads', got %q", mockStorage.lastBucket)
+	}
+	if mockStorage.lastFnm != location {
+		t.Errorf("expected fnm %q, got %q", location, mockStorage.lastFnm)
+	}
+	if !bytes.Equal(blob, expectedBlob) {
+		t.Errorf("expected blob %v, got %v", expectedBlob, blob)
+	}
+}
+
+func TestFileService_DownloadAgentFile_Error(t *testing.T) {
+	// Setup mock storage
+	expectedErr := errors.New("not found")
+	mockStorage := &fakeStorage{
+		blob: nil,
+		err:  expectedErr,
+	}
+
+	factory := storage.GetStorageFactory()
+	originalStorage := factory.GetStorage()
+	factory.SetStorage(mockStorage)
+	t.Cleanup(func() {
+		factory.SetStorage(originalStorage)
+	})
+
+	svc := testFileService()
+	userID := "tenant123"
+	location := "file-abc.txt"
+
+	ctx := permission.WithIdentity(t.Context(), userID, "")
+	blob, err := svc.DownloadAgentFile(ctx, location)
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if !errors.Is(err, expectedErr) {
+		t.Errorf("expected error %v, got %v", expectedErr, err)
+	}
+	if blob != nil {
+		t.Errorf("expected nil blob, got %v", blob)
+	}
+}
+
+func TestFileService_UploadFromURL_PDFAddsExtensionAndStoresToDownloads(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		_, _ = w.Write([]byte("%PDF-1.7 fake pdf"))
+	}))
+	defer server.Close()
+
+	origAssert := common.AssertURLSafeWithContext
+	origPinned := utility.PinnedHTTPClient
+	common.AssertURLSafeWithContext = func(_ context.Context, rawURL string) (string, string, error) {
+		return "127.0.0.1", "127.0.0.1", nil
+	}
+	utility.PinnedHTTPClient = func(hostname, resolvedIP string, timeout time.Duration) *http.Client {
+		return server.Client()
+	}
+	t.Cleanup(func() {
+		common.AssertURLSafeWithContext = origAssert
+		utility.PinnedHTTPClient = origPinned
+	})
+
+	mockStorage := &fakeStorage{}
+	factory := storage.GetStorageFactory()
+	originalStorage := factory.GetStorage()
+	factory.SetStorage(mockStorage)
+	t.Cleanup(func() { factory.SetStorage(originalStorage) })
+
+	ctx := permission.WithIdentity(t.Context(), "user123", "")
+	svc := testFileService()
+	resp, err := svc.UploadFromURL(ctx, server.URL+"/report")
+	if err != nil {
+		t.Fatalf("UploadFromURL failed: %v", err)
+	}
+
+	if mockStorage.lastBucket != "user123-downloads" {
+		t.Fatalf("bucket = %q", mockStorage.lastBucket)
+	}
+	if resp["name"] != "report.pdf" {
+		t.Fatalf("name = %#v, want report.pdf", resp["name"])
+	}
+	if resp["mime_type"] != "application/pdf" {
+		t.Fatalf("mime_type = %#v", resp["mime_type"])
+	}
+	if resp["id"] != mockStorage.lastFnm {
+		t.Fatalf("id = %#v, stored key = %q", resp["id"], mockStorage.lastFnm)
+	}
+}
+
+func TestFileService_UploadFromURL_HTMLNormalizesReadableContent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<html><head><script>bad()</script></head><body><div>Hello</div><p>World</p></body></html>`))
+	}))
+	defer server.Close()
+
+	origAssert := common.AssertURLSafeWithContext
+	origPinned := utility.PinnedHTTPClient
+	common.AssertURLSafeWithContext = func(_ context.Context, rawURL string) (string, string, error) {
+		return "127.0.0.1", "127.0.0.1", nil
+	}
+	utility.PinnedHTTPClient = func(hostname, resolvedIP string, timeout time.Duration) *http.Client {
+		return server.Client()
+	}
+	t.Cleanup(func() {
+		common.AssertURLSafeWithContext = origAssert
+		utility.PinnedHTTPClient = origPinned
+	})
+
+	mockStorage := &fakeStorage{}
+	factory := storage.GetStorageFactory()
+	originalStorage := factory.GetStorage()
+	factory.SetStorage(mockStorage)
+	t.Cleanup(func() { factory.SetStorage(originalStorage) })
+
+	ctx := permission.WithIdentity(t.Context(), "user123", "")
+	svc := testFileService()
+	resp, err := svc.UploadFromURL(ctx, server.URL+"/page")
+	if err != nil {
+		t.Fatalf("UploadFromURL failed: %v", err)
+	}
+
+	stored := string(mockStorage.blob)
+	if strings.Contains(strings.ToLower(stored), "<html") || strings.Contains(strings.ToLower(stored), "<script") {
+		t.Fatalf("stored html was not normalized: %q", stored)
+	}
+	if !strings.Contains(stored, "Hello") || !strings.Contains(stored, "World") {
+		t.Fatalf("stored normalized text missing content: %q", stored)
+	}
+	if resp["mime_type"] != "text/html" {
+		t.Fatalf("mime_type = %#v", resp["mime_type"])
+	}
+}
+
+func TestFileService_UploadFromURL_ShortensLongNamesWithinTheLimit(t *testing.T) {
+	// The leading "a" puts the 255-byte boundary inside a 3-byte character.
+	longName := "a" + strings.Repeat("报", 100)
+	cases := []struct {
+		name        string
+		path        string
+		contentType string
+		body        string
+		wantName    string
+		wantExt     string
+	}{
+		{
+			name:        "pdf without extension",
+			path:        longName,
+			contentType: "application/pdf",
+			body:        "%PDF-1.7 fake pdf",
+			wantName:    "a" + strings.Repeat("报", 83) + ".pdf",
+			wantExt:     "pdf",
+		},
+		{
+			name:        "docx keeps extension",
+			path:        longName + ".docx",
+			contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+			body:        "PK\x03\x04 fake docx",
+			wantName:    "a" + strings.Repeat("报", 83) + ".docx",
+			wantExt:     "docx",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", c.contentType)
+				_, _ = w.Write([]byte(c.body))
+			}))
+			defer server.Close()
+
+			origAssert := common.AssertURLSafeWithContext
+			origPinned := utility.PinnedHTTPClient
+			common.AssertURLSafeWithContext = func(_ context.Context, rawURL string) (string, string, error) {
+				return "127.0.0.1", "127.0.0.1", nil
+			}
+			utility.PinnedHTTPClient = func(hostname, resolvedIP string, timeout time.Duration) *http.Client {
+				return server.Client()
+			}
+			t.Cleanup(func() {
+				common.AssertURLSafeWithContext = origAssert
+				utility.PinnedHTTPClient = origPinned
+			})
+
+			factory := storage.GetStorageFactory()
+			originalStorage := factory.GetStorage()
+			factory.SetStorage(&fakeStorage{})
+			t.Cleanup(func() { factory.SetStorage(originalStorage) })
+
+			ctx := permission.WithIdentity(t.Context(), "user123", "")
+			resp, err := testFileService().UploadFromURL(ctx, server.URL+"/"+url.PathEscape(c.path))
+			if err != nil {
+				t.Fatalf("UploadFromURL failed: %v", err)
+			}
+			name, _ := resp["name"].(string)
+			if name != c.wantName || !utf8.ValidString(name) {
+				t.Fatalf("name = %q, want %q", name, c.wantName)
+			}
+			if resp["extension"] != c.wantExt {
+				t.Fatalf("extension = %#v, want %q", resp["extension"], c.wantExt)
+			}
+		})
+	}
+}
+
+func TestNormalizeUploadInfoContent_PDFTakesPrecedenceOverHTML(t *testing.T) {
+	filename, contentType, data := utility.NormalizeUploadInfoContent(
+		"report",
+		"text/html",
+		[]byte("%PDF-1.7 fake pdf"),
+	)
+	if filename != "report.pdf" {
+		t.Fatalf("filename = %q, want report.pdf", filename)
+	}
+	if contentType != "application/pdf" {
+		t.Fatalf("contentType = %q, want application/pdf", contentType)
+	}
+	if !bytes.Equal(data, []byte("%PDF-1.7 fake pdf")) {
+		t.Fatalf("pdf bytes were unexpectedly transformed: %q", string(data))
+	}
+}
+
+func TestReadUploadInfoData_RejectsOversizedInput(t *testing.T) {
+	reader := io.LimitReader(zeroReader{}, maxRemoteFileSize+1)
+	_, err := readUploadInfoData(reader)
+	if err == nil {
+		t.Fatal("expected oversized input to be rejected")
+	}
+	if !strings.Contains(err.Error(), "file size exceeds") {
+		t.Fatalf("err = %v, want size limit message", err)
+	}
+}
+
+func TestUploadInfosRejectsNameOverLimitAfterNormalization(t *testing.T) {
+	t.Setenv(common.EnvMaxFileNumPerUser, "")
+	store := &fakeStorage{}
+	factory := storage.GetStorageFactory()
+	original := factory.GetStorage()
+	factory.SetStorage(store)
+	t.Cleanup(func() { factory.SetStorage(original) })
+
+	ctx := permission.WithIdentity(t.Context(), "user-1", "")
+	filename := strings.Repeat("a", common.NameLimit255)
+	fh := makeUploadInfoHeader(t, filename, []byte("%PDF-1.7"))
+	if _, err := testFileService().UploadInfos(ctx, []*multipart.FileHeader{fh}); err == nil || !strings.Contains(err.Error(), "maximum length") {
+		t.Fatalf("UploadInfos err = %v, want maximum length error", err)
+	}
+}
+
+func makeUploadInfoHeader(t *testing.T, filename string, content []byte) *multipart.FileHeader {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		t.Fatalf("create form file: %v", err)
+	}
+	if _, err := part.Write(content); err != nil {
+		t.Fatalf("write form file: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	if err := req.ParseMultipartForm(int64(len(content) + 1024)); err != nil {
+		t.Fatalf("parse multipart form: %v", err)
+	}
+	headers := req.MultipartForm.File["file"]
+	if len(headers) != 1 {
+		t.Fatalf("multipart file headers = %d, want 1", len(headers))
+	}
+	return headers[0]
+}
+
+// zeroReader is an io.Reader that returns an infinite stream of zero bytes.
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
+}

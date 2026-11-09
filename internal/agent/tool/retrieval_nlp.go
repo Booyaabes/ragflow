@@ -1,0 +1,663 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
+// retrieval_nlp.go — NLPRetrievalAdapter wiring.
+//
+// The agent tool layer (tool/retrieval_service.go) declares a
+// minimal RetrievalService interface. Until this file landed, the
+// only registered implementation was the stub that returns
+// ErrRetrievalServiceMissing. NLPRetrievalAdapter bridges the
+// agent-side interface to the production nlp.RetrievalService —
+// the same service that powers chat / dataset search / chunk
+// retrieval across the rest of the codebase.
+//
+// Translation rules:
+//
+//   tool.RetrievalRequest.Query      → nlp.RetrievalRequest.Question
+//   tool.RetrievalRequest.DatasetIDs → nlp.RetrievalRequest.KbIDs
+//   tool.RetrievalRequest.TopN       → nlp.RetrievalRequest.PageSize
+//   tool.RetrievalRequest.TopK       → nlp.RetrievalRequest.KNNTopK
+//                                       (fallback KNNTopK=TopN*4 so rerank
+//                                        has headroom)
+//   tool.RetrievalRequest.KeywordsSimilarityWeight
+//                                    → nlp.RetrievalRequest.VectorSimilarityWeight
+//                                       as 1-keyword weight
+//   resolved knowledge-base model    → nlp.RetrievalRequest.EmbeddingModel
+//   tool.RetrievalRequest.RerankID   → nlp.RetrievalRequest.RerankModel
+//   tool.RetrievalRequest.UseKG      → ErrGraphRAGNotSupported (out of
+//                                       scope for the Go Agent tool)
+//
+// Chunk shape translation: nlp's Chunks are []map[string]any with
+// keys chunk_id, doc_id, docnm_kwd, content_with_weight,
+// content_ltks, similarity, term_similarity, vector_similarity. The
+// tool side wants a flat RetrievalChunk with the fields needed for both
+// display and the frontend reference strip. We pick the most user-facing fields:
+//   - ID         ← chunk_id
+//   - Content    ← content_with_weight (fallback to content_ltks)
+//   - DocumentID ← doc_id
+//   - DocumentName ← docnm_kwd
+//   - DatasetID  ← kb_id
+//   - ImageID    ← image_id/img_id
+//   - Positions  ← positions/position_int
+//   - Score      ← similarity (fallback to avg of term+vector)
+//
+// Defensive defaults: missing or wrong-typed chunk fields become
+// empty strings / 0.0 rather than panicking — a single malformed
+// chunk from the doc engine shouldn't take down the whole
+// retrieval call.
+
+package tool
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"strings"
+
+	"ragflow/internal/agent/runtime"
+	"ragflow/internal/common"
+	"ragflow/internal/dao"
+	"ragflow/internal/dao/transaction"
+	"ragflow/internal/engine"
+	"ragflow/internal/entity"
+	modelModule "ragflow/internal/entity/models"
+	"ragflow/internal/permission"
+	permissionresponse "ragflow/internal/permission/response"
+	"ragflow/internal/service/nlp"
+
+	"go.uber.org/zap"
+	"gorm.io/gorm"
+)
+
+var retrievalUserPrefixPattern = regexp.MustCompile(`(?i)^user[:：\s]*`)
+
+// NLPRetrievalAdapter wraps *nlp.RetrievalService behind the
+// agent-tool RetrievalService interface. The adapter is safe to
+// share across goroutines — the wrapped service is stateless
+// beyond its docEngine + documentDAO handles, both of which the
+// nlp package treats as concurrent-safe.
+type NLPRetrievalAdapter struct {
+	svc               *nlp.RetrievalService
+	kbDAO             knowledgebaseLookup
+	modelConstructors RetrievalModelConstructors
+	enhancer          retrievalEnhancer
+}
+
+// RetrievalModelConstructors constructs typed models for retrieval without
+// exposing provider drivers or API credentials to the agent-tool package.
+type RetrievalModelConstructors struct {
+	Embedding func(ctx context.Context, tenantID, modelRef string) (*modelModule.EmbeddingModel, error)
+	Chat      func(ctx context.Context, tenantID, modelRef string) (*modelModule.ChatModel, error)
+	Rerank    func(ctx context.Context, tenantID, modelRef string) (*modelModule.RerankModel, error)
+}
+
+type knowledgebaseLookup interface {
+	GetByIDs(ctx context.Context, sqlDB *gorm.DB, ids []string) ([]*entity.Knowledgebase, error)
+	GetByName(ctx context.Context, sqlDB *gorm.DB, name, tenantID string) (*entity.Knowledgebase, error)
+}
+
+// retrievalEnhancer exposes the service-layer query and result enhancements
+// without making agent/tool import the parent internal/service package.
+type retrievalEnhancer interface {
+	CrossLanguages(
+		ctx context.Context,
+		tenantID, query string,
+		languages []string,
+	) (string, error)
+	FilterDocuments(
+		ctx context.Context,
+		filter map[string]any,
+		query string,
+		chatModel *modelModule.ChatModel,
+		baseDocIDs []string,
+		kbIDs []string,
+	) ([]string, error)
+	LabelQuestion(
+		ctx context.Context,
+		question string,
+		kbs []*entity.Knowledgebase,
+	) map[string]float64
+	RetrieveByChildren(
+		ctx context.Context,
+		chunks []map[string]any,
+		tenantIDs []string,
+	) []map[string]any
+}
+
+// NewNLPRetrievalAdapter wraps an already-constructed
+// *nlp.RetrievalService.
+func NewNLPRetrievalAdapter(
+	svc *nlp.RetrievalService,
+	constructors RetrievalModelConstructors,
+	enhancer retrievalEnhancer,
+) *NLPRetrievalAdapter {
+	return &NLPRetrievalAdapter{
+		svc:               svc,
+		kbDAO:             dao.NewKnowledgebaseDAO(),
+		modelConstructors: constructors,
+		enhancer:          enhancer,
+	}
+}
+
+// NewNLPRetrievalAdapterFromDeps is the convenience constructor
+// for the common boot path:
+//
+// The boot path supplies typed model constructors and a service enhancement
+// bridge so the adapter can build a complete hybrid-retrieval request.
+func NewNLPRetrievalAdapterFromDeps(
+	docEngine engine.DocEngine,
+	documentDAO *dao.DocumentDAO,
+	constructors RetrievalModelConstructors,
+	enhancer retrievalEnhancer,
+) *NLPRetrievalAdapter {
+	return &NLPRetrievalAdapter{
+		svc:               nlp.NewRetrievalService(docEngine, documentDAO),
+		kbDAO:             dao.NewKnowledgebaseDAO(),
+		modelConstructors: constructors,
+		enhancer:          enhancer,
+	}
+}
+
+// Search implements RetrievalService. The translation rules live
+// at the top of this file.
+func (a *NLPRetrievalAdapter) Search(ctx context.Context, db *gorm.DB, req RetrievalRequest) ([]RetrievalChunk, error) {
+	if a == nil || a.svc == nil {
+		return nil, ErrRetrievalServiceMissing
+	}
+	if req.UseKG {
+		// Keep direct adapter callers consistent with RetrievalTool.
+		return nil, ErrGraphRAGNotSupported
+	}
+	if req.Query == "" {
+		return nil, nil
+	}
+	topN := req.TopN
+	if topN <= 0 {
+		topN = 8
+	}
+
+	datasets, err := a.resolveDatasets(ctx, db, req)
+	if err != nil {
+		return nil, err
+	}
+	if len(datasets.tenantIDs) != 1 {
+		return nil, fmt.Errorf("retrieval: datasets span multiple tenants")
+	}
+	// Dataset authorization must use the caller identity established by the
+	// agent run, not req.UserID, which is a configurable per-user memory filter.
+	userID := permission.UserIDFromContext(ctx)
+	if state, stateErr := runtime.GetStateFromContext(ctx); stateErr == nil && state != nil {
+		runtimeUserID, _ := state.GetSysString("user_id")
+		if runtimeUserID = strings.TrimSpace(runtimeUserID); runtimeUserID != "" {
+			if userID != "" && userID != runtimeUserID {
+				return nil, permission.ErrIdentityMismatch
+			}
+			userID = runtimeUserID
+		}
+	}
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return nil, permission.ErrUnauthenticated
+	}
+	tenantID := canvasTenantID(ctx)
+	contextTenantID := permission.TenantIDFromContext(ctx)
+	if contextTenantID != "" && tenantID != "" && contextTenantID != tenantID {
+		return nil, permission.ErrIdentityMismatch
+	}
+	if permission.UserIDFromContext(ctx) == "" || contextTenantID == "" {
+		if contextTenantID == "" {
+			contextTenantID = tenantID
+		}
+		ctx = permission.WithIdentity(ctx, userID, contextTenantID)
+	}
+	checker := permission.NewDatabaseChecker(db)
+	if err := CheckCanvasDependencies(ctx, db, permission.ResourceKindDataset, datasets.kbIDs); err != nil {
+		_, permissionErr := permissionresponse.Normalize(err)
+		return nil, permissionErr
+	}
+	for _, datasetID := range datasets.kbIDs {
+		if err := checker.CheckResource(ctx, permission.ResourceRef{
+			Kind: permission.ResourceKindDataset, ID: datasetID,
+		}, permission.OperationUse); err != nil {
+			_, permissionErr := permissionresponse.Normalize(err)
+			return nil, permissionErr
+		}
+	}
+	if err := validateEmbeddingModels(ctx, db, datasets.kbs); err != nil {
+		return nil, err
+	}
+	embeddingModel, err := a.resolveEmbeddingModel(ctx, datasets.kbs[0])
+	if err != nil {
+		return nil, err
+	}
+
+	chatModel, err := a.resolveChatModel(ctx, req, datasets.kbs[0].TenantID)
+	if err != nil {
+		return nil, err
+	}
+	query := req.Query
+	docIDs := compactStrings(req.DocScope)
+	if len(req.MetaDataFilter) > 0 {
+		if a.enhancer == nil {
+			return nil, fmt.Errorf("retrieval: metadata filter service is not configured")
+		}
+		docIDs, err = a.enhancer.FilterDocuments(
+			ctx, req.MetaDataFilter, query, chatModel, docIDs, datasets.kbIDs,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("retrieval: filter documents: %w", err)
+		}
+	}
+	if len(req.CrossLanguages) > 0 {
+		if a.enhancer == nil {
+			return nil, fmt.Errorf("retrieval: cross-language service is not configured")
+		}
+		translated, translateErr := a.enhancer.CrossLanguages(
+			ctx, datasets.kbs[0].TenantID, query, req.CrossLanguages,
+		)
+		if translateErr != nil {
+			common.Warn("agent retrieval: cross-language query failed; using original query", zap.Error(translateErr))
+		} else if strings.TrimSpace(translated) != "" {
+			query = translated
+		}
+	}
+	query = retrievalUserPrefixPattern.ReplaceAllString(query, "")
+	vectorOnly := req.KeywordsSimilarityWeight != nil && *req.KeywordsSimilarityWeight < 0.01
+	rankFeature := resolveRankFeature(ctx, req.RankFeature, a.enhancer, query, datasets.kbs, vectorOnly)
+	rerankModel, err := a.resolveRerankModel(ctx, req, datasets.kbs[0].TenantID)
+	if err != nil {
+		return nil, err
+	}
+	preparedReq := req
+	preparedReq.Query = query
+	preparedReq.DocScope = docIDs
+	preparedReq.DatasetIDs = append([]string(nil), datasets.kbIDs...)
+	nlpReq := nlpRequestFromRetrieval(preparedReq, datasets.tenantIDs, topN, embeddingModel, preparedReq.ExcludeCompiled)
+	nlpReq.Language = entity.KnowledgebasesLanguage(datasets.kbs)
+	nlpReq.RerankModel = rerankModel
+	nlpReq.RankFeature = &rankFeature
+
+	res, err := a.svc.Retrieval(ctx, nlpReq)
+	if err != nil {
+		return nil, err
+	}
+	if res == nil || len(res.Chunks) == 0 {
+		return []RetrievalChunk{}, nil
+	}
+	rawChunks := res.Chunks
+	if a.enhancer != nil {
+		rawChunks = a.enhancer.RetrieveByChildren(ctx, rawChunks, datasets.tenantIDs)
+	}
+	out := make([]RetrievalChunk, 0, len(rawChunks))
+	for _, raw := range rawChunks {
+		out = append(out, translateChunk(raw))
+	}
+	return out, nil
+}
+
+// resolveRankFeature resolves the rank features handed to the nlp layer, which
+// takes them as *map and distinguishes "unset" from "empty". The result is never
+// nil: a nil map leaves that pointer unset and the nlp layer substitutes its
+// {pagerank_fea: 10} default.
+func resolveRankFeature(
+	ctx context.Context,
+	requested *map[string]float64,
+	enhancer retrievalEnhancer,
+	query string,
+	kbs []*entity.Knowledgebase,
+	vectorOnly bool,
+) map[string]float64 {
+	// A caller-supplied feature (computed by RAGTools from its own KB objects) is
+	// authoritative: nil means "said nothing, label it", an empty map means
+	// "there are none" and must not turn into a label lookup.
+	if requested != nil {
+		return cloneRankFeature(*requested)
+	}
+	// Only the engine-side clause needs a text leg, so a dense-only request is not
+	// labelled. The features still reach the similarity - with no scored bool, the
+	// nlp layer applies them locally - so a caller-supplied feature keeps its
+	// effect in vector-only mode and only the enhancer fallback is skipped.
+	if enhancer == nil || vectorOnly {
+		return map[string]float64{}
+	}
+	if labels := enhancer.LabelQuestion(ctx, query, kbs); labels != nil {
+		return cloneRankFeature(labels)
+	}
+	return map[string]float64{}
+}
+
+// cloneRankFeature detaches the request's map from the caller's.
+func cloneRankFeature(features map[string]float64) map[string]float64 {
+	clone := make(map[string]float64, len(features))
+	for field, weight := range features {
+		clone[field] = weight
+	}
+	return clone
+}
+
+func nlpRequestFromRetrieval(
+	req RetrievalRequest,
+	tenantIDs []string,
+	topN int,
+	embeddingModel *modelModule.EmbeddingModel,
+	excludeCompiled bool,
+) *nlp.RetrievalRequest {
+	nlpReq := &nlp.RetrievalRequest{
+		Question:           req.Query,
+		TenantIDs:          append([]string(nil), tenantIDs...),
+		KbIDs:              append([]string(nil), req.DatasetIDs...),
+		DocIDs:             append([]string(nil), compactStrings(req.DocScope)...),
+		Page:               1,
+		PageSize:           topN,
+		EmbeddingModel:     embeddingModel,
+		Aggs:               boolPtr(false),
+		Highlight:          boolPtr(false),
+		AllowDenseFallback: req.AllowDenseFallback,
+		VectorOnly:         req.KeywordsSimilarityWeight != nil && *req.KeywordsSimilarityWeight < 0.01,
+	}
+	if excludeCompiled {
+		// Python hybrid_search excludes compiled products from plain retrieval
+		// via must_not={"exists":"compile_kwd"} (search.py:171). Compiled rows
+		// carry the compile_kwd field; the nlp backend merges req.Filter into
+		// the doc-store term filter, so a must_not.exists excludes them.
+		nlpReq.Filter = map[string]interface{}{
+			"must_not": map[string]interface{}{"exists": "compile_kwd"},
+		}
+	}
+	if req.RerankCandidatesCount != 0 {
+		nlpReq.RerankCandidatesCount = &req.RerankCandidatesCount
+	}
+	if req.TopK > 0 {
+		nlpReq.KNNTopK = &req.TopK
+	} else if topN > 0 {
+		rerankBudget := topN * 4
+		nlpReq.KNNTopK = &rerankBudget
+	}
+	if req.SimilarityThreshold != nil {
+		nlpReq.SimilarityThreshold = req.SimilarityThreshold
+	}
+	if req.KeywordsSimilarityWeight != nil {
+		// KeywordsSimilarityWeight is the user-facing keyword weight. The NPL
+		// backend takes the complementary vector weight. Near-total keyword
+		// weighting also disables the dense leg entirely, as its zero-weight
+		// KNN filter would otherwise still constrain the candidate set.
+		vectorSimilarityWeight := 1 - *req.KeywordsSimilarityWeight
+		nlpReq.VectorSimilarityWeight = &vectorSimilarityWeight
+		if *req.KeywordsSimilarityWeight > 0.99 {
+			nlpReq.EmbeddingModel = nil
+		}
+	}
+	// Restrict to ordinary document text chunks with the SAME filter grep_chunks
+	// applies: available_int=1 (must_not available_int<1 semantics so chunks
+	// whose available_int is absent still pass) and must_not exists compile_kwd
+	// to exclude knowledge-compiled products. Setting available_int explicitly
+	// here matches grep exactly (both go through buildBoolQueryFromCondition).
+	if req.OnlyOriginalText {
+		nlpReq.Filter = map[string]interface{}{
+			"available_int": 1,
+			"must_not":      map[string]interface{}{"exists": "compile_kwd"},
+		}
+	}
+	return nlpReq
+}
+
+type resolvedDatasets struct {
+	kbs       []*entity.Knowledgebase
+	kbIDs     []string
+	tenantIDs []string
+}
+
+func (a *NLPRetrievalAdapter) resolveDatasets(
+	ctx context.Context,
+	db *gorm.DB,
+	req RetrievalRequest,
+) (*resolvedDatasets, error) {
+	seen := map[string]struct{}{}
+	tenantIDs := make([]string, 0, 1)
+	appendTenantID := func(tenantID string) {
+		tenantID = strings.TrimSpace(tenantID)
+		if tenantID == "" {
+			return
+		}
+		if _, ok := seen[tenantID]; ok {
+			return
+		}
+		seen[tenantID] = struct{}{}
+		tenantIDs = append(tenantIDs, tenantID)
+	}
+
+	datasetIDs := compactStrings(req.DatasetIDs)
+	if len(datasetIDs) == 0 {
+		return nil, fmt.Errorf("retrieval: dataset_ids is required")
+	}
+	if a == nil || a.kbDAO == nil {
+		return nil, fmt.Errorf("retrieval: knowledge base lookup is not configured")
+	}
+
+	foundKBs, err := a.kbDAO.GetByIDs(ctx, db, datasetIDs)
+	if err != nil {
+		return nil, fmt.Errorf("retrieval: resolve dataset tenants: %w", err)
+	}
+	kbsByID := make(map[string]*entity.Knowledgebase, len(foundKBs))
+	for _, kb := range foundKBs {
+		if kb != nil {
+			kbsByID[kb.ID] = kb
+		}
+	}
+	kbs := make([]*entity.Knowledgebase, 0, len(datasetIDs))
+	resolvedKBIDs := make([]string, 0, len(datasetIDs))
+	for _, datasetID := range datasetIDs {
+		kb := kbsByID[datasetID]
+		if kb == nil && strings.TrimSpace(req.TenantID) != "" {
+			kb, err = a.kbDAO.GetByName(ctx, db, datasetID, req.TenantID)
+			if err != nil && err != gorm.ErrRecordNotFound {
+				return nil, fmt.Errorf("retrieval: resolve dataset %q by name: %w", datasetID, err)
+			}
+		}
+		if kb == nil {
+			return nil, fmt.Errorf("retrieval: dataset %q was not found", datasetID)
+		}
+		kbs = append(kbs, kb)
+		resolvedKBIDs = append(resolvedKBIDs, kb.ID)
+	}
+	for _, kb := range kbs {
+		if kb == nil {
+			continue
+		}
+		appendTenantID(kb.TenantID)
+	}
+	if len(tenantIDs) == 0 {
+		return nil, fmt.Errorf("retrieval: no valid knowledge bases found for dataset_ids %v", datasetIDs)
+	}
+	return &resolvedDatasets{kbs: kbs, kbIDs: resolvedKBIDs, tenantIDs: tenantIDs}, nil
+}
+
+func validateEmbeddingModels(ctx context.Context, db *gorm.DB, kbs []*entity.Knowledgebase) error {
+	if len(kbs) == 0 {
+		return fmt.Errorf("retrieval: no datasets selected")
+	}
+	for _, kb := range kbs {
+		if kb == nil {
+			return fmt.Errorf("retrieval: dataset record is nil")
+		}
+	}
+	embdNames := transaction.NewEmbeddingBaseNameResolver(dao.NewKnowledgebaseDAO().EmbeddingBaseName)
+	firstKey := knowledgebaseEmbeddingKey(ctx, db, kbs[0], embdNames)
+	for _, kb := range kbs[1:] {
+		if knowledgebaseEmbeddingKey(ctx, db, kb, embdNames) != firstKey {
+			return fmt.Errorf("retrieval: datasets use different embedding models")
+		}
+	}
+	return nil
+}
+
+// knowledgebaseEmbeddingKey groups datasets by their resolved base embedding
+// model name (e.g. "BAAI/bge-m3"), matching the chat/dataset-search
+// validation, so datasets pointing at the same model through different
+// provider instances or storage forms (tenant_model id vs legacy composite
+// name) retrieve together.
+func knowledgebaseEmbeddingKey(ctx context.Context, db *gorm.DB, kb *entity.Knowledgebase, names *transaction.EmbeddingBaseNameResolver) string {
+	if strings.TrimSpace(kb.EmbdID) == "" && (kb.TenantEmbdID == nil || strings.TrimSpace(*kb.TenantEmbdID) == "") {
+		return "default:" + strings.TrimSpace(kb.TenantID)
+	}
+	return "embedding:" + names.Resolve(ctx, db, kb)
+}
+
+func (a *NLPRetrievalAdapter) resolveEmbeddingModel(
+	ctx context.Context,
+	kb *entity.Knowledgebase,
+) (*modelModule.EmbeddingModel, error) {
+	if a == nil || a.modelConstructors.Embedding == nil {
+		return nil, fmt.Errorf("retrieval: embedding model constructor is not configured")
+	}
+	modelRef := kb.EmbdID
+	if kb.TenantEmbdID != nil && strings.TrimSpace(*kb.TenantEmbdID) != "" {
+		modelRef = *kb.TenantEmbdID
+	}
+	model, err := a.modelConstructors.Embedding(ctx, kb.TenantID, modelRef)
+	if err != nil {
+		return nil, fmt.Errorf("retrieval: resolve embedding model for dataset %s: %w", kb.ID, err)
+	}
+	return model, nil
+}
+
+func (a *NLPRetrievalAdapter) resolveChatModel(
+	ctx context.Context,
+	req RetrievalRequest,
+	tenantID string,
+) (*modelModule.ChatModel, error) {
+	method, _ := req.MetaDataFilter["method"].(string)
+	needsChatModel := method == "auto" || method == "semi_auto"
+	if !needsChatModel {
+		return nil, nil
+	}
+	if a == nil || a.modelConstructors.Chat == nil {
+		return nil, fmt.Errorf("retrieval: chat model constructor is not configured")
+	}
+	model, err := a.modelConstructors.Chat(ctx, tenantID, "")
+	if err != nil {
+		return nil, fmt.Errorf("retrieval: resolve default chat model: %w", err)
+	}
+	return model, nil
+}
+
+func (a *NLPRetrievalAdapter) resolveRerankModel(
+	ctx context.Context,
+	req RetrievalRequest,
+	tenantID string,
+) (*modelModule.RerankModel, error) {
+	if req.RerankID == "" {
+		return nil, nil
+	}
+	if a == nil || a.modelConstructors.Rerank == nil {
+		return nil, fmt.Errorf("retrieval: rerank model constructor is not configured")
+	}
+	model, err := a.modelConstructors.Rerank(ctx, tenantID, req.RerankID)
+	if err != nil {
+		return nil, fmt.Errorf("retrieval: resolve rerank model: %w", err)
+	}
+	return model, nil
+}
+
+// translateChunk converts one nlp chunk map into a RetrievalChunk.
+// Tolerates missing fields (returns zero values) and wrong types
+// (returns zero values) so a single bad chunk from the doc engine
+// can't break the whole result list.
+func translateChunk(raw map[string]any) RetrievalChunk {
+	return RetrievalChunk{
+		ID:               StringFromMap(raw, "chunk_id"),
+		Content:          contentFromMap(raw),
+		DocumentID:       StringFromMap(raw, "doc_id"),
+		DocumentName:     StringFromMap(raw, "docnm_kwd"),
+		DatasetID:        StringFromMap(raw, "kb_id"),
+		ImageID:          FirstStringFromMap(raw, "image_id", "img_id"),
+		DocType:          FirstStringFromMap(raw, "doc_type_kwd", "doc_type"),
+		URL:              FirstStringFromMap(raw, "url", "document_url", "doc_url"),
+		Positions:        firstValueFromMap(raw, "positions", "position_int"),
+		MomID:            StringFromMap(raw, "mom_id"),
+		ChunkIndex:       IntFromMap(raw, "chunk_order_int"),
+		PageNum:          IntFromMap(raw, "page_num_int"),
+		Score:            scoreFromMap(raw),
+		TermSimilarity:   scoreValueFromMap(raw, "term_similarity"),
+		VectorSimilarity: scoreValueFromMap(raw, "vector_similarity"),
+	}
+}
+
+// IntFromMap, StringFromMap, FirstStringFromMap and NumberFromMap are
+// re-exported from internal/agent/runtime (single owner) so the canvas tool
+// package keeps its helper names without owning a second copy.
+func IntFromMap(raw map[string]any, key string) int { return runtime.IntFromMap(raw, key) }
+func StringFromMap(raw map[string]any, key string) string {
+	return runtime.StringFromMap(raw, key)
+}
+func FirstStringFromMap(raw map[string]any, keys ...string) string {
+	return runtime.FirstStringFromMap(raw, keys...)
+}
+
+func firstValueFromMap(raw map[string]any, keys ...string) any {
+	for _, key := range keys {
+		if value, ok := raw[key]; ok && value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+// contentFromMap picks the most user-facing content field. nlp
+// chunks carry content_with_weight (the highlightable string) and
+// content_ltks (the tokenised form). content_with_weight is what
+// the model sees in Python; we use it here too. Empty / missing →
+// fall back to content_ltks; both empty → empty string.
+func contentFromMap(raw map[string]any) string {
+	if v := StringFromMap(raw, "content_with_weight"); v != "" {
+		return v
+	}
+	return StringFromMap(raw, "content_ltks")
+}
+
+// scoreFromMap returns the chunk's similarity score. nlp populates
+// three fields — similarity (combined), term_similarity (BM25),
+// vector_similarity (cosine). We prefer similarity; if absent or
+// zero, average the two sub-scores. Wrong-type values → fall through
+// to sub-scores; missing sub-scores → 0.
+func scoreFromMap(raw map[string]any) float64 {
+	if f, ok := NumberFromMap(raw, "similarity"); ok {
+		return f
+	}
+	term, termOK := NumberFromMap(raw, "term_similarity")
+	vec, vecOK := NumberFromMap(raw, "vector_similarity")
+	if termOK && vecOK {
+		return (term + vec) / 2
+	}
+	if termOK {
+		return term
+	}
+	if vecOK {
+		return vec
+	}
+	return 0
+}
+
+func scoreValueFromMap(raw map[string]any, key string) float64 {
+	value, _ := NumberFromMap(raw, key)
+	return value
+}
+
+func NumberFromMap(raw map[string]any, key string) (float64, bool) {
+	return runtime.NumberFromMap(raw, key)
+}
+
+func boolPtr(b bool) *bool { return &b }

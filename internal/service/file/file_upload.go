@@ -1,0 +1,362 @@
+package file
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"ragflow/internal/common"
+	"ragflow/internal/dao"
+	"ragflow/internal/entity"
+	"ragflow/internal/permission"
+	"ragflow/internal/storage"
+	"ragflow/internal/utility"
+	"strings"
+	"time"
+
+	"gorm.io/gorm"
+)
+
+const defaultDeploymentUploadMaxBytes int64 = common.DefaultMaxMultipartRequestBodyBytes
+
+func DeploymentUploadMaxBytes() int64 {
+	return common.GetMaxMultipartRequestBodyBytes()
+}
+
+// UploadFile uploads files to a folder
+func (s *FileService) UploadFile(ctx context.Context, parentID string, files []*multipart.FileHeader, maxBytes int64) ([]map[string]interface{}, error) {
+	userID := permission.UserIDFromContext(ctx)
+	if userID == "" {
+		return nil, permission.ErrUnauthenticated
+	}
+	tenantID := permission.TenantIDFromContext(ctx)
+	if tenantID == "" {
+		tenantID = userID
+	}
+	if err := permission.NewDatabaseChecker(dao.DB).CheckFeature(ctx, "file", permission.ActionWrite); err != nil {
+		return nil, err
+	}
+	if parentID == "" {
+		rootFolder, err := s.fileDAO.GetRootFolder(ctx, dao.DB, tenantID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get root folder: %w", err)
+		}
+		parentID = rootFolder.ID
+	}
+
+	parentFolder, err := s.fileDAO.GetByID(ctx, dao.DB, parentID)
+	if err != nil || parentFolder == nil || parentFolder.Type != FileTypeFolder {
+		return nil, fmt.Errorf("can't find this folder")
+	}
+	if parentFolder.TenantID != tenantID {
+		return nil, permission.ErrResourceNotFound
+	}
+	if err := checkFileAccess(ctx, parentFolder, permission.OperationCreate); err != nil {
+		return nil, err
+	}
+
+	maxFileNumPerUser := common.GetEnv(common.EnvMaxFileNumPerUser)
+	if maxFileNumPerUser != "" {
+		var maxNum int64
+		if _, err = fmt.Sscanf(maxFileNumPerUser, "%d", &maxNum); err == nil && maxNum > 0 {
+			var docCount int64
+			docCount, err = s.GetDocCount(ctx, tenantID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get document count: %w", err)
+			}
+			if docCount >= maxNum {
+				return nil, fmt.Errorf("exceed the maximum file number of a free user")
+			}
+		}
+	}
+
+	storageImpl := storage.GetStorageFactory().GetStorage()
+	if storageImpl == nil {
+		return nil, fmt.Errorf("storage not initialized")
+	}
+
+	var result []map[string]interface{}
+
+	for _, fileHeader := range files {
+		filename := fileHeader.Filename
+		if filename == "" {
+			return nil, fmt.Errorf("no file selected")
+		}
+
+		if maxBytes > 0 && fileHeader.Size > maxBytes {
+			return nil, fmt.Errorf("file %s exceeds deployment upload limit of %d bytes", filename, maxBytes)
+		}
+
+		fileType := utility.FilenameType(filename)
+
+		fileObjNames := s.parseFilePath(filename)
+
+		var idList []string
+		idList, err = s.fileDAO.GetIDListByID(ctx, dao.DB, parentID, fileObjNames, 1, []string{parentID})
+		if err != nil {
+			return nil, fmt.Errorf("failed to get file ID list: %w", err)
+		}
+
+		var lastFolder *entity.File
+		if len(fileObjNames) != len(idList)-1 {
+			lastID := idList[len(idList)-1]
+			lastFolder, err = s.fileDAO.GetByID(ctx, dao.DB, lastID)
+			if err != nil {
+				return nil, fmt.Errorf("folder not found")
+			}
+			var createdFolder *entity.File
+			createdFolder, err = s.createFolderRecursive(ctx, lastFolder, fileObjNames, len(idList), tenantID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create folder: %w", err)
+			}
+			lastFolder = createdFolder
+		} else {
+			lastID := idList[len(idList)-2]
+			lastFolder, err = s.fileDAO.GetByID(ctx, dao.DB, lastID)
+			if err != nil {
+				return nil, fmt.Errorf("folder not found")
+			}
+		}
+
+		baseName := fileObjNames[len(fileObjNames)-1]
+		uniqueName, err := s.getUniqueFilename(ctx, baseName, lastFolder.ID, tenantID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get unique filename: %w", err)
+		}
+
+		var location string
+		for attempt := 0; ; attempt++ {
+			location = utility.StorageObjectName(uniqueName, attempt, utility.StorageKeyMaxBytes)
+			if !storageImpl.ObjExist(ctx, lastFolder.ID, location) {
+				break
+			}
+		}
+
+		var src multipart.File
+		src, err = fileHeader.Open()
+		if err != nil {
+			return nil, fmt.Errorf("failed to open uploaded file: %w", err)
+		}
+
+		var data []byte
+		data, err = readDeploymentUploadData(src, maxBytes)
+		src.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read file data: %w", err)
+		}
+
+		if err = storageImpl.Put(ctx, lastFolder.ID, location, data); err != nil {
+			return nil, fmt.Errorf("failed to store file: %w", err)
+		}
+
+		fileRecord := &entity.File{
+			ID:         common.GenerateToken(),
+			ParentID:   lastFolder.ID,
+			UserID:     userID,
+			TenantID:   tenantID,
+			CreatedBy:  userID,
+			Name:       uniqueName,
+			Location:   &location,
+			Size:       int64(len(data)),
+			Type:       string(fileType),
+			SourceType: "",
+		}
+
+		if err = dao.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := s.fileDAO.Insert(ctx, tx, fileRecord); err != nil {
+				return err
+			}
+			return permission.NewDatabaseChecker(tx).GrantResourceOwner(ctx, permission.ResourceRef{Kind: permission.ResourceKindFile, ID: fileRecord.ID})
+		}); err != nil {
+			_ = storageImpl.Remove(ctx, lastFolder.ID, location)
+			return nil, fmt.Errorf("failed to insert file record: %w", err)
+		}
+
+		result = append(result, s.toFileResponse(fileRecord))
+	}
+
+	return result, nil
+}
+
+func readDeploymentUploadData(r io.Reader, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		return io.ReadAll(r)
+	}
+	limited := &io.LimitedReader{R: r, N: maxBytes + 1}
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("file size exceeds deployment upload limit of %d bytes", maxBytes)
+	}
+	return data, nil
+}
+
+// UploadInfos mirrors Python's upload_info file branch: store raw bytes in the
+// per-user downloads bucket and return lightweight upload descriptors instead
+// of creating full File rows in the file-management tree.
+func (s *FileService) UploadInfos(ctx context.Context, files []*multipart.FileHeader) ([]map[string]interface{}, error) {
+	storageImpl := storage.GetStorageFactory().GetStorage()
+	if storageImpl == nil {
+		return nil, fmt.Errorf("storage not initialized")
+	}
+
+	results := make([]map[string]interface{}, 0, len(files))
+	for _, fileHeader := range files {
+		filename := fileHeader.Filename
+		if err := s.checkUploadInfoHealth(ctx, filename); err != nil {
+			return nil, err
+		}
+		src, err := fileHeader.Open()
+		if err != nil {
+			return nil, fmt.Errorf("failed to open uploaded file: %w", err)
+		}
+		data, readErr := readUploadInfoData(src)
+		src.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("failed to read file data: %w", readErr)
+		}
+
+		contentType := fileHeader.Header.Get("Content-Type")
+		if contentType == "" {
+			contentType = http.DetectContentType(data)
+		}
+		filename, contentType, data = utility.NormalizeUploadInfoContent(filename, contentType, data)
+		if err := validateUploadInfoFilename(filename); err != nil {
+			return nil, err
+		}
+		resp, err := s.storeUploadInfoBlob(ctx, storageImpl, filename, contentType, data)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, resp)
+	}
+	return results, nil
+}
+
+func readUploadInfoData(r io.Reader) ([]byte, error) {
+	limited := &io.LimitedReader{R: r, N: maxRemoteFileSize + 1}
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxRemoteFileSize {
+		return nil, fmt.Errorf("file size exceeds %d bytes", maxRemoteFileSize)
+	}
+	return data, nil
+}
+
+func (s *FileService) parseFilePath(filename string) []string {
+	filename = strings.TrimPrefix(filename, "/")
+	parts := strings.Split(filename, "/")
+	var result []string
+	for _, part := range parts {
+		if part != "" {
+			result = append(result, part)
+		}
+	}
+	return result
+}
+
+// toUploadInfoResponse converts a newly-uploaded file record to the shape
+// Python's upload_info endpoint returns.
+func (s *FileService) toUploadInfoResponse(file *entity.File, mimeType string) map[string]interface{} {
+	ext := ""
+	if idx := strings.LastIndex(file.Name, "."); idx >= 0 {
+		ext = strings.ToLower(file.Name[idx+1:])
+	}
+	return map[string]interface{}{
+		"id":          file.ID,
+		"name":        file.Name,
+		"size":        file.Size,
+		"extension":   ext,
+		"mime_type":   mimeType,
+		"created_by":  file.CreatedBy,
+		"created_at":  float64(time.Now().UnixMilli()) / 1000.0,
+		"preview_url": nil,
+	}
+}
+
+func (s *FileService) checkUploadInfoHealth(ctx context.Context, filename string) error {
+	userID := permission.UserIDFromContext(ctx)
+	if filename == "" {
+		return fmt.Errorf("No file selected!")
+	}
+	maxFileNumPerUser := common.GetEnv(common.EnvMaxFileNumPerUser)
+	if maxFileNumPerUser != "" {
+		var maxNum int64
+		if _, err := fmt.Sscanf(maxFileNumPerUser, "%d", &maxNum); err == nil && maxNum > 0 {
+			var docCount int64
+			docCount, err = dao.NewDocumentDAO().CountByUserID(ctx, dao.DB, userID)
+			if err != nil {
+				return fmt.Errorf("failed to get document count: %w", err)
+			}
+			if docCount >= maxNum {
+				return fmt.Errorf("exceed the maximum file number of a free user")
+			}
+		}
+	}
+	if err := validateUploadInfoFilename(filename); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateUploadInfoFilename enforces the stored name limit after any
+// content-derived extension has been added.
+func validateUploadInfoFilename(filename string) error {
+	if err := common.ValidateNameRunes(filename, common.NameLimit255); err != nil {
+		return fmt.Errorf("exceed the maximum length of file name")
+	}
+	return nil
+}
+
+func (s *FileService) storeUploadInfoBlob(ctx context.Context, storageImpl storage.Storage, filename, contentType string, data []byte) (map[string]interface{}, error) {
+	userID := permission.UserIDFromContext(ctx)
+	location := common.GenerateUUID()
+	bucket := fmt.Sprintf("%s-downloads", userID)
+	if err := storageImpl.Put(ctx, bucket, location, data); err != nil {
+		return nil, fmt.Errorf("failed to store file: %w", err)
+	}
+	ext := ""
+	if idx := strings.LastIndex(filename, "."); idx >= 0 {
+		ext = strings.ToLower(filename[idx+1:])
+	}
+	return map[string]interface{}{
+		"id":          location,
+		"name":        filename,
+		"size":        int64(len(data)),
+		"extension":   ext,
+		"mime_type":   contentType,
+		"created_by":  userID,
+		"created_at":  float64(time.Now().UnixMilli()) / 1000.0,
+		"preview_url": nil,
+	}, nil
+}
+
+// UploadDocumentInfos is the document-level wrapper that stores uploaded blobs
+// without creating Document rows, then returns the file metadata including
+// size/mime-type/extension.
+func (s *FileService) UploadDocumentInfos(ctx context.Context, files []*multipart.FileHeader) ([]map[string]interface{}, common.ErrorCode, error) {
+	data, err := s.UploadInfos(ctx, files)
+	if err != nil {
+		return nil, common.CodeDataError, err
+	}
+	return data, common.CodeSuccess, nil
+}
+
+// UploadDocumentInfoByURL fetches a remote URL, stores the content without
+// creating a Document row, then returns file metadata.
+func (s *FileService) UploadDocumentInfoByURL(ctx context.Context, rawURL string) (map[string]interface{}, common.ErrorCode, error) {
+	userID := permission.UserIDFromContext(ctx)
+	if userID == "" {
+		return nil, common.CodeUnauthorized, permission.ErrUnauthenticated
+	}
+	data, err := s.UploadFromURL(ctx, rawURL)
+	if err != nil {
+		return nil, common.CodeDataError, err
+	}
+	return data, common.CodeSuccess, nil
+}

@@ -18,7 +18,6 @@ import {
   IAgentLogMessage,
   IAgentLogResponse,
 } from '@/interfaces/database/agent';
-import { IReferenceObject } from '@/interfaces/database/chat';
 import { formatDate } from '@/utils/date';
 import React, { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -50,6 +49,11 @@ const getEndOfToday = (): Date => {
 const AgentLogPage: React.FC = () => {
   const { t } = useTranslation();
   const { navigateToAgents, navigateToAgent } = useNavigatePage();
+  // Zero-arg wrapper: passing navigateToAgents straight to onClick would feed
+  // the click event into its canvasCategory parameter.
+  const handleBackToAgents = useCallback(() => {
+    navigateToAgents();
+  }, [navigateToAgents]);
   const { flowDetail: agentDetail } = useFetchDataOnMount();
   const { id: canvasId } = useParams();
   const init = {
@@ -80,9 +84,7 @@ const AgentLogPage: React.FC = () => {
       dataIndex: 'title',
       key: 'title',
       render: (_text: string, record: IAgentLogResponse) => (
-        <span>
-          {record?.message?.length ? record?.message[0]?.content : ''}
-        </span>
+        <span>{record.name}</span>
       ),
     },
     {
@@ -220,21 +222,9 @@ const AgentLogPage: React.FC = () => {
   };
 
   const handleReset = () => {
-    const resetParams = { ...init, page_size: pagination.pageSize };
-    const sameParams =
-      searchParams.keywords === resetParams.keywords &&
-      searchParams.from_date.getTime() === resetParams.from_date.getTime() &&
-      searchParams.to_date.getTime() === resetParams.to_date.getTime() &&
-      searchParams.orderby === resetParams.orderby &&
-      searchParams.desc === resetParams.desc &&
-      searchParams.page === resetParams.page &&
-      searchParams.page_size === resetParams.page_size;
-    setSearchParams(resetParams);
+    setSearchParams({ ...init, page_size: pagination.pageSize });
     setKeywords(init.keywords);
     setCurrentDate({ from: init.from_date, to: init.to_date });
-    setSortConfig({ orderby: init.orderby, desc: init.desc });
-    setPagination((pre) => ({ ...pre, current: 1 }));
-    if (sameParams) refetch();
   };
 
   const [openModal, setOpenModal] = useState(false);
@@ -264,7 +254,7 @@ const AgentLogPage: React.FC = () => {
         <Breadcrumb>
           <BreadcrumbList>
             <BreadcrumbItem>
-              <BreadcrumbLink onClick={navigateToAgents}>
+              <BreadcrumbLink onClick={handleBackToAgents}>
                 {t('flow.agent')}
               </BreadcrumbLink>
             </BreadcrumbItem>
@@ -422,7 +412,6 @@ const AgentLogPage: React.FC = () => {
       <AgentLogDetailModal
         isOpen={openModal}
         message={modalData?.message as IAgentLogMessage[]}
-        reference={modalData?.reference as unknown as IReferenceObject}
         onClose={() => setOpenModal(false)}
       />
     </div>

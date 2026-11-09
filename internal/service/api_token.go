@@ -1,0 +1,157 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
+package service
+
+import (
+	"context"
+
+	"ragflow/internal/common"
+	"ragflow/internal/dao"
+	"ragflow/internal/entity"
+	"ragflow/internal/permission"
+	"ragflow/internal/service/billing"
+	"time"
+)
+
+// APIKeyResponse key response
+type APIKeyResponse struct {
+	UserID     string     `json:"user_id"`
+	TenantID   string     `json:"tenant_id"`
+	Token      string     `json:"token"`
+	DialogID   *string    `json:"dialog_id,omitempty"`
+	Source     *string    `json:"source,omitempty"`
+	Beta       *string    `json:"beta,omitempty"`
+	CreateTime *int64     `json:"create_time,omitempty"`
+	CreateDate *time.Time `json:"create_date,omitempty"`
+	UpdateTime *int64     `json:"update_time,omitempty"`
+	UpdateDate *time.Time `json:"update_date,omitempty"`
+}
+
+// ListAPIKeys list all API keys for a tenant
+func (s *SystemService) ListAPIKeys(ctx context.Context) ([]*APIKeyResponse, error) {
+	tenantID, err := requireCurrentTenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	APITokenDAO := dao.NewAPITokenDAO()
+	keys, err := APITokenDAO.GetByTenantID(ctx, dao.DB, tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	responses := make([]*APIKeyResponse, len(keys))
+	for i, key := range keys {
+		beta := key.Beta
+		if beta == nil || *beta == "" {
+			generatedBeta := common.GenerateBetaAPIToken()
+			if err = dao.DB.WithContext(ctx).Model(&entity.APIToken{}).
+				Where("tenant_id = ? AND token = ?", tenantID, key.Token).
+				Updates(map[string]interface{}{
+					"beta": generatedBeta,
+				}).Error; err != nil {
+				return nil, err
+			}
+			beta = &generatedBeta
+			key.Beta = beta
+		}
+
+		responses[i] = &APIKeyResponse{
+			UserID:     apiTokenUserID(key.UserID),
+			TenantID:   key.TenantID,
+			Token:      key.Token,
+			DialogID:   key.DialogID,
+			Source:     key.Source,
+			Beta:       beta,
+			CreateTime: key.CreateTime,
+			CreateDate: key.CreateDate,
+			UpdateTime: key.UpdateTime,
+			UpdateDate: key.UpdateDate,
+		}
+	}
+
+	return responses, nil
+}
+
+// CreateAPIKeyRequest create key request
+type CreateAPIKeyRequest struct {
+	Name string `json:"name" form:"name"`
+}
+
+// CreateAPIKey creates a new API key for a tenant
+func (s *SystemService) CreateAPIKey(ctx context.Context, req *CreateAPIKeyRequest) (*APIKeyResponse, error) {
+	userID := permission.UserIDFromContext(ctx)
+	tenantID, err := requireCurrentTenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	APITokenDAO := dao.NewAPITokenDAO()
+
+	// Generate key and beta values
+	// key: "ragflow-" + secrets.token_urlsafe(32)
+	APIToken := common.GenerateAPIToken()
+	// beta: generate_confirmation_token().replace("ragflow-", "")[:32]
+	betaAPIKey := common.GenerateBetaAPIToken()
+
+	APIKeyData := &entity.APIToken{
+		TenantID: tenantID,
+		UserID:   &userID,
+		Token:    APIToken,
+		Beta:     &betaAPIKey,
+	}
+
+	if err := APITokenDAO.Create(ctx, dao.DB, APIKeyData); err != nil {
+		return nil, err
+	}
+	if billingService := billing.Get(); billingService != nil && billingService.Enabled() {
+		billingService.SyncAPITokenAccess(ctx, tenantID, APIToken, betaAPIKey)
+	}
+
+	return &APIKeyResponse{
+		UserID:     userID,
+		TenantID:   APIKeyData.TenantID,
+		Token:      APIKeyData.Token,
+		DialogID:   APIKeyData.DialogID,
+		Source:     APIKeyData.Source,
+		Beta:       APIKeyData.Beta,
+		CreateTime: APIKeyData.CreateTime,
+		CreateDate: APIKeyData.CreateDate,
+		UpdateTime: APIKeyData.UpdateTime,
+		UpdateDate: APIKeyData.UpdateDate,
+	}, nil
+}
+
+func apiTokenUserID(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func (s *SystemService) DeleteAPIKey(ctx context.Context, key string) error {
+	tenantID, err := requireCurrentTenantID(ctx)
+	if err != nil {
+		return err
+	}
+	APITokenDAO := dao.NewAPITokenDAO()
+	_, err = APITokenDAO.DeleteByTenantIDAndToken(ctx, dao.DB, tenantID, key)
+	if err == nil {
+		if billingService := billing.Get(); billingService != nil && billingService.Enabled() {
+			billingService.DeleteRateLimitKeys(ctx, key)
+		}
+	}
+	return err
+}

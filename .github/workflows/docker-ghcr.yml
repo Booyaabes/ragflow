@@ -1,8 +1,8 @@
 name: docker-ghcr
 
 # Builds the production Docker image (root Dockerfile) and pushes it to this
-# repo's GitHub Container Registry — unlike release-python.yml, which builds
-# the same image but pushes it to Docker Hub (infiniflow/ragflow), not GHCR.
+# repo's GitHub Container Registry — unlike release.yml, which builds the same
+# image but pushes it to Docker Hub (infiniflow/ragflow), not GHCR.
 #
 # Not wired to pull_request: the image is multi-GB and pushing on every PR
 # would be wasteful, and PR builds should not have write access to the
@@ -30,10 +30,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The image bundles ML models/NLTK data/TeXLive pulled in from
-      # infiniflow/ragflow_deps:latest-python and is several GB — ubuntu-latest's
-      # ~14GB free disk is tight. Clear preinstalled toolchains we don't use
-      # (Android SDK, .NET, Haskell, GHC) before building.
+      # The build compiles the Go server against native static libs and pulls
+      # runtime resources from infiniflow/ragflow_deps:latest; the build cache
+      # and image are several GB and ubuntu-latest's ~14GB free disk is tight.
+      # Clear preinstalled toolchains we don't use (Android SDK, .NET, Haskell)
+      # before building.
       - name: Free disk space
         uses: jlumbroso/free-disk-space@v1.3.1
         with:
@@ -79,7 +80,10 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # The Dockerfile's default Go proxy (goproxy.cn) is flaky from
+          # GitHub-hosted runners; release.yml overrides it the same way.
           build-args: |
             NEED_MIRROR=0
+            GOPROXY=https://proxy.golang.org,direct
           cache-from: type=gha
           cache-to: type=gha,mode=max

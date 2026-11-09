@@ -1,0 +1,784 @@
+package util
+
+import (
+	"bytes"
+	"encoding/base64"
+	"image"
+	"image/color"
+	"image/png"
+	"math"
+	pdf "ragflow/internal/deepdoc/parser/pdf/type"
+	"testing"
+)
+
+// makeTestPageImage creates a solid-color RGBA PNG and returns the encoded bytes.
+func makeTestPageImage(w, h int, c color.Color) image.Image {
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.Set(x, y, c)
+		}
+	}
+	return img
+}
+
+func decodePNG(t *testing.T, data []byte) image.Image {
+	t.Helper()
+	img, err := png.Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("decode png: %v", err)
+	}
+	return img
+}
+
+func TestFastCropReturnsPlaceholderForInvertedBounds(t *testing.T) {
+	src := makeTestPageImage(100, 100, color.RGBA{255, 0, 0, 255})
+	for _, bounds := range [][4]int{
+		{80, 10, 20, 90},
+		{10, 80, 90, 20},
+	} {
+		got := FastCrop(src, bounds[0], bounds[1], bounds[2], bounds[3]).Bounds()
+		if got != image.Rect(0, 0, 1, 1) {
+			t.Errorf("FastCrop(%v) bounds = %v, want 1x1 placeholder", bounds, got)
+		}
+	}
+}
+
+func TestCropSectionImage_SinglePage(t *testing.T) {
+	pageImages := map[int]image.Image{
+		0: makeTestPageImage(200, 300, color.RGBA{255, 0, 0, 255}),
+	}
+	posTag := FormatPositionTag(0, 10, 100, 20, 150)
+	b64 := CropSectionImage(posTag, pageImages, 1)
+
+	if b64 == "" {
+		t.Fatal("expected non-empty base64 image")
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		t.Fatalf("base64 decode: %v", err)
+	}
+	img := decodePNG(t, decoded)
+
+	bounds := img.Bounds()
+	if bounds.Dx() != 90 {
+		t.Errorf("width: got %d, want 90", bounds.Dx())
+	}
+	if bounds.Dy() != 276 {
+		t.Errorf("height: got %d, want 276", bounds.Dy())
+	}
+}
+
+func TestCropSectionImage_EmptyImages(t *testing.T) {
+	posTag := FormatPositionTag(0, 10, 100, 20, 150)
+
+	if b64 := CropSectionImage(posTag, nil, 1); b64 != "" {
+		t.Error("nil pageImages should return empty string")
+	}
+	if b64 := CropSectionImage(posTag, map[int]image.Image{}, 1); b64 != "" {
+		t.Error("empty pageImages should return empty string")
+	}
+}
+
+func TestCropSectionImage_OutOfBounds(t *testing.T) {
+	pageImages := map[int]image.Image{
+		0: makeTestPageImage(200, 300, color.RGBA{255, 0, 0, 255}),
+	}
+	posTag := FormatPositionTag(5, 10, 100, 20, 150)
+	if b64 := CropSectionImage(posTag, pageImages, 1); b64 != "" {
+		t.Error("out-of-bounds page should return empty string")
+	}
+}
+
+func TestCropSectionImage_InvalidTag(t *testing.T) {
+	pageImages := map[int]image.Image{
+		0: makeTestPageImage(200, 300, color.RGBA{255, 0, 0, 255}),
+	}
+	if b64 := CropSectionImage("invalid", pageImages, 1); b64 != "" {
+		t.Error("invalid position tag should return empty string")
+	}
+	if b64 := CropSectionImage("", pageImages, 1); b64 != "" {
+		t.Error("empty position tag should return empty string")
+	}
+}
+
+func TestCropSectionImage_NegativeCoordNotDropped(t *testing.T) {
+	// Regression: a content box extending slightly above the page top
+	// (top=-3.0) must still produce a cropped image instead of being dropped
+	// with "cropSectionImage: empty position list". This is the exact tag that
+	// previously triggered the warning.
+	pageImages := map[int]image.Image{
+		49: makeTestPageImage(600, 800, color.RGBA{255, 0, 0, 255}),
+	}
+	posTag := FormatPositionTag(49, 45.0, 549.7, -3.0, 737.9) // -> "@@50\t45.0\t549.7\t-3.0\t737.9##"
+	b64 := CropSectionImage(posTag, pageImages, 1)
+	if b64 == "" {
+		t.Fatal("negative-coord tag must produce an image, not be dropped")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		t.Fatalf("base64 decode: %v", err)
+	}
+	img := decodePNG(t, decoded)
+	if img.Bounds().Dx() <= 0 || img.Bounds().Dy() <= 0 {
+		t.Errorf("decoded image is degenerate: %v", img.Bounds())
+	}
+}
+
+func TestCropMediaSectionPositionsHasNoContextBands(t *testing.T) {
+	// Media previews must be clean position-only crops (Python cropout):
+	// no 120pt context bands, no putalpha(128) edge dimming. A solid-red
+	// page stays solid red top to bottom.
+	pageImages := map[int]image.Image{
+		0: makeTestPageImage(200, 800, color.RGBA{255, 0, 0, 255}),
+	}
+	positions := []pdf.Position{{PageNumbers: []int{0}, Left: 20, Right: 120, Top: 300, Bottom: 400}}
+	b64 := CropMediaSectionPositions(positions, pageImages, 1)
+	if b64 == "" {
+		t.Fatal("expected non-empty result")
+	}
+	decoded, _ := base64.StdEncoding.DecodeString(b64)
+	img := decodePNG(t, decoded)
+	bounds := img.Bounds()
+	// Body is 100px tall; measureSectionRasterPlan adds one 6px stitch gap.
+	if bounds.Dx() != 100 || bounds.Dy() != 106 {
+		t.Fatalf("media crop bounds = %v, want 100x106 (body only, no context)", bounds)
+	}
+	for _, y := range []int{0, bounds.Dy() - 7} {
+		r, g, b, _ := img.At(0, y).RGBA()
+		if uint8(r>>8) < 200 || uint8(g>>8) != 0 || uint8(b>>8) != 0 {
+			t.Errorf("row %d = (%d,%d,%d), want undimmed red; edge overlay leaked into media crop", y, uint8(r>>8), uint8(g>>8), uint8(b>>8))
+		}
+	}
+}
+
+func TestCropMediaSectionPositionsSpansPages(t *testing.T) {
+	// A figure spanning two pages stitches body-only segments in page
+	// order: no context bands, no dimming, first page on top.
+	pageImages := map[int]image.Image{
+		0: makeTestPageImage(200, 400, color.RGBA{255, 0, 0, 255}),
+		1: makeTestPageImage(200, 400, color.RGBA{0, 0, 255, 255}),
+	}
+	positions := []pdf.Position{{PageNumbers: []int{0, 1}, Left: 20, Right: 120, Top: 300, Bottom: 100}}
+	b64 := CropMediaSectionPositions(positions, pageImages, 1)
+	if b64 == "" {
+		t.Fatal("expected non-empty result")
+	}
+	decoded, _ := base64.StdEncoding.DecodeString(b64)
+	img := decodePNG(t, decoded)
+	// Spanning convention: Top is local to the first page, Bottom local
+	// to the last. Page 0 contributes rows [300,400], page 1 rows [0,100],
+	// plus two 6px stitch gaps: 100 + 100 + 12.
+	if bounds := img.Bounds(); bounds.Dx() != 100 || bounds.Dy() != 212 {
+		t.Fatalf("spanning media crop bounds = %v, want 100x212", bounds)
+	}
+	if r, _, _, _ := img.At(0, 0).RGBA(); uint8(r>>8) < 200 {
+		t.Error("top rows should be page-0 red, got dimmed or wrong content")
+	}
+	if _, _, b, _ := img.At(0, 150).RGBA(); uint8(b>>8) < 200 {
+		t.Error("bottom rows should be page-1 blue, got dimmed or wrong content")
+	}
+}
+
+func TestCropSectionImage_ContextPadding(t *testing.T) {
+	pageImages := map[int]image.Image{
+		0: makeTestPageImage(200, 800, color.RGBA{255, 0, 0, 255}),
+	}
+	posTag := FormatPositionTag(0, 20, 120, 300, 400)
+	b64 := CropSectionImage(posTag, pageImages, 1)
+	if b64 == "" {
+		t.Fatal("expected non-empty result")
+	}
+	decoded, _ := base64.StdEncoding.DecodeString(b64)
+	img := decodePNG(t, decoded)
+	bounds := img.Bounds()
+	if bounds.Dy() != 346 {
+		t.Errorf("height with context: got %d, want 346", bounds.Dy())
+	}
+}
+
+func TestCropSectionImage_ZoomScaling(t *testing.T) {
+	pageImages := map[int]image.Image{
+		0: makeTestPageImage(400, 600, color.RGBA{255, 0, 0, 255}),
+	}
+	posTag := FormatPositionTag(0, 10, 100, 20, 150)
+	b64 := CropSectionImage(posTag, pageImages, 2)
+	if b64 == "" {
+		t.Fatal("expected non-empty result")
+	}
+	decoded, _ := base64.StdEncoding.DecodeString(b64)
+	img := decodePNG(t, decoded)
+	bounds := img.Bounds()
+	if bounds.Dx() != 180 {
+		t.Errorf("width at zoom 2: got %d, want 180", bounds.Dx())
+	}
+}
+
+func TestCropTextSectionPositionsKeepsContinuousRows(t *testing.T) {
+	page := image.NewRGBA(image.Rect(0, 0, 100, 100))
+	for y := 0; y < 100; y++ {
+		for x := 0; x < 100; x++ {
+			page.SetRGBA(x, y, color.RGBA{uint8(x), uint8(y), 0, 255})
+		}
+	}
+	for _, tc := range []struct {
+		name      string
+		firstEnd  float64
+		secondTop float64
+	}{
+		{name: "touching slices", firstEnd: 45, secondTop: 45},
+		{name: "overlapping boxes", firstEnd: 60, secondTop: 40},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			positions := []pdf.Position{
+				{PageNumbers: []int{0}, Left: 10, Right: 90, Top: 0, Bottom: tc.firstEnd},
+				{PageNumbers: []int{0}, Left: 10, Right: 90, Top: tc.secondTop, Bottom: 100},
+			}
+			got, err := DecodeBase64PNG(CropTextSectionPositions(positions, map[int]image.Image{0: page}, 1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The empty top context occupies a 1px placeholder plus a 6px gap.
+			// Every source row must follow intact, without internal gaps or repeats.
+			for y := 0; y < 100; y++ {
+				want := color.RGBA{10, uint8(y), 0, 255}
+				if pixel := color.RGBAModel.Convert(got.At(0, 7+y)); pixel != want {
+					t.Fatalf("source row %d: got %v, want %v", y, pixel, want)
+				}
+			}
+		})
+	}
+}
+
+func TestCropTextSectionPositionsKeepsSeparateRegions(t *testing.T) {
+	red := color.RGBA{255, 0, 0, 255}
+	blue := color.RGBA{0, 0, 255, 255}
+	page := makeTestPageImage(100, 100, red).(*image.RGBA)
+	for y := 0; y < 100; y++ {
+		for x := 50; x < 100; x++ {
+			page.SetRGBA(x, y, blue)
+		}
+	}
+	for _, tc := range []struct {
+		name      string
+		second    pdf.Position
+		wantColor color.RGBA
+	}{
+		{name: "vertical gap", second: pdf.Position{PageNumbers: []int{0}, Left: 10, Right: 40, Top: 60, Bottom: 100}, wantColor: red},
+		{name: "different column", second: pdf.Position{PageNumbers: []int{0}, Left: 50, Right: 80, Top: 40, Bottom: 100}, wantColor: blue},
+		{name: "different page", second: pdf.Position{PageNumbers: []int{1}, Left: 10, Right: 40, Top: 40, Bottom: 100}, wantColor: blue},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			positions := []pdf.Position{
+				{PageNumbers: []int{0}, Left: 10, Right: 40, Top: 0, Bottom: 40},
+				tc.second,
+			}
+			got, err := DecodeBase64PNG(CropTextSectionPositions(positions, map[int]image.Image{
+				0: page, 1: makeTestPageImage(100, 100, blue),
+			}, 1))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pixel := color.RGBAModel.Convert(got.At(0, 47)); pixel != (color.RGBA{245, 245, 245, 255}) {
+				t.Fatalf("separate regions lost their gap: %v", pixel)
+			}
+			if pixel := color.RGBAModel.Convert(got.At(0, 53)); pixel != tc.wantColor {
+				t.Fatalf("second region: got %v, want %v", pixel, tc.wantColor)
+			}
+		})
+	}
+}
+
+type accessCountingImage struct {
+	bounds image.Rectangle
+	reads  int
+}
+
+func (i *accessCountingImage) ColorModel() color.Model { return color.RGBAModel }
+func (i *accessCountingImage) Bounds() image.Rectangle { return i.bounds }
+func (i *accessCountingImage) At(int, int) color.Color {
+	i.reads++
+	return color.RGBA{A: 255}
+}
+
+func TestCropSectionPositionsRasterLimitedRejectsOversizedStitchBeforeCopy(t *testing.T) {
+	page := &accessCountingImage{bounds: image.Rect(0, 0, 400, 400)}
+	positions := []pdf.Position{
+		{PageNumbers: []int{0}, Left: 10, Right: 30, Top: 150, Bottom: 170},
+		{PageNumbers: []int{0}, Left: 10, Right: 30, Top: 150, Bottom: 170},
+		{PageNumbers: []int{0}, Left: 10, Right: 30, Top: 150, Bottom: 170},
+	}
+
+	got := CropSectionPositionsRasterLimited(positions, map[int]image.Image{0: page}, 1, 5_000)
+	if got != nil {
+		t.Fatalf("limited crop = %v, want nil when stitched pixels exceed the limit", got.Bounds())
+	}
+	if page.reads != 0 {
+		t.Fatalf("source pixel reads = %d, want 0 before rejecting the oversized stitch", page.reads)
+	}
+}
+
+func TestRotateImageCW(t *testing.T) {
+	// Create a 3x2 image with known colors: (0,0)=red, (1,0)=green, (2,0)=blue,
+	//                                    (0,1)=white, (1,1)=black, (2,1)=gray
+	img := image.NewRGBA(image.Rect(0, 0, 3, 2))
+	r, g, b, w, bl, gr := color.RGBA{255, 0, 0, 255}, color.RGBA{0, 255, 0, 255}, color.RGBA{0, 0, 255, 255}, color.RGBA{255, 255, 255, 255}, color.RGBA{0, 0, 0, 255}, color.RGBA{128, 128, 128, 255}
+	img.Set(0, 0, r)
+	img.Set(1, 0, g)
+	img.Set(2, 0, b)
+	img.Set(0, 1, w)
+	img.Set(1, 1, bl)
+	img.Set(2, 1, gr)
+
+	t.Run("0 degrees", func(t *testing.T) {
+		rot := RotateImageCW(img, 0)
+		if rot == nil {
+			t.Fatal("nil result")
+		}
+		if rot.Bounds().Dx() != 3 || rot.Bounds().Dy() != 2 {
+			t.Errorf("size: got %dx%d, want 3x2", rot.Bounds().Dx(), rot.Bounds().Dy())
+		}
+		if !colorEqual(rot.At(0, 0), r) || !colorEqual(rot.At(2, 1), gr) {
+			t.Error("pixels shifted for 0° rotation")
+		}
+	})
+	t.Run("90 degrees", func(t *testing.T) {
+		rot := RotateImageCW(img, 90)
+		if rot == nil {
+			t.Fatal("nil result")
+		}
+		if rot.Bounds().Dx() != 2 || rot.Bounds().Dy() != 3 {
+			t.Errorf("size: got %dx%d, want 2x3", rot.Bounds().Dx(), rot.Bounds().Dy())
+		}
+		// 90° CW: (0,0) of dst = (h-1-y, x) = (1, 0) = original (0,1)=white
+		if !colorEqual(rot.At(0, 0), w) {
+			t.Error("90° CW top-left should be original (0,1)=white")
+		}
+		// 90° CW: (1, 2) of dst = (h-1-y, x) = (1-1-2=-2...) → wait
+		// (x=1, y=2): dst_x = h-1-y = 2-1-2 = -1? No. h=2, dst_x = 2-1-y = 1-y.
+		// For y=2: dst_x = 1-2 = -1. That's wrong.
+		// Actually 90° CW maps (orig_x, orig_y) → (h-1-orig_y, orig_x).
+		// So original (2,1)=gray → dst (2-1-1=0, 2) = (0,2)
+		if !colorEqual(rot.At(0, 2), gr) {
+			t.Error("90° CW: original (2,1)=gray should be at (0,2)")
+		}
+		// Original (0,0)=red → dst (2-1-0=1, 0) = (1,0)
+		if !colorEqual(rot.At(1, 0), r) {
+			t.Error("90° CW: original (0,0)=red should be at (1,0)")
+		}
+	})
+	t.Run("180 degrees", func(t *testing.T) {
+		rot := RotateImageCW(img, 180)
+		if rot == nil {
+			t.Fatal("nil result")
+		}
+		if rot.Bounds().Dx() != 3 || rot.Bounds().Dy() != 2 {
+			t.Errorf("size: got %dx%d, want 3x2", rot.Bounds().Dx(), rot.Bounds().Dy())
+		}
+		if !colorEqual(rot.At(0, 0), gr) {
+			t.Error("180°: (0,0) should be original (2,1)=gray")
+		}
+		if !colorEqual(rot.At(2, 1), r) {
+			t.Error("180°: (2,1) should be original (0,0)=red")
+		}
+	})
+	t.Run("270 degrees", func(t *testing.T) {
+		rot := RotateImageCW(img, 270)
+		if rot == nil {
+			t.Fatal("nil result")
+		}
+		if rot.Bounds().Dx() != 2 || rot.Bounds().Dy() != 3 {
+			t.Errorf("size: got %dx%d, want 2x3", rot.Bounds().Dx(), rot.Bounds().Dy())
+		}
+	})
+	t.Run("invalid angle", func(t *testing.T) {
+		if RotateImageCW(img, 45) != nil {
+			t.Error("expected nil for invalid angle")
+		}
+	})
+}
+
+func TestMapRotatedPointToOriginal_RoundTrip(t *testing.T) {
+	// Verify that forward (rotateImageCW) → inverse (mapRotatedPointToOriginal)
+	// recovers the original coordinates for all rotation angles.
+	origW, origH := 200, 100
+	for _, angle := range []int{0, 90, 180, 270} {
+		for _, ox := range []float64{0, 50, 199} {
+			for _, oy := range []float64{0, 30, 99} {
+				rx, ry := rotateCoordCW(ox, oy, origW, origH, angle)
+				gotX, gotY := MapRotatedPointToOriginal(rx, ry, angle, origW, origH)
+				if math.Abs(gotX-ox) > 0.01 || math.Abs(gotY-oy) > 0.01 {
+					t.Errorf("angle=%d orig(%.0f,%.0f) → rot(%.0f,%.0f) → got(%.1f,%.1f)",
+						angle, ox, oy, rx, ry, gotX, gotY)
+				}
+			}
+		}
+	}
+}
+
+func TestMapRotatedPointToOriginal(t *testing.T) {
+	// Verify alignment with Python's _map_rotated_point formulas.
+	// Original 200x100; rotW,rotH swap for 90/270.
+	tests := []struct {
+		angle        int
+		rx, ry       float64
+		origW, origH int
+		wantX, wantY float64
+	}{
+		{0, 50, 30, 200, 100, 50, 30},
+		{90, 50, 30, 200, 100, 30, 49},   // rotH=100: forward (100-1-oy,ox)
+		{180, 50, 30, 200, 100, 149, 69}, // (199-50, 99-30)
+		{270, 50, 30, 200, 100, 169, 50}, // rotW=200: inverse (199-30,50)
+	}
+	for _, tt := range tests {
+		gotX, gotY := MapRotatedPointToOriginal(tt.rx, tt.ry, tt.angle, tt.origW, tt.origH)
+		if math.Abs(gotX-tt.wantX) > 0.01 || math.Abs(gotY-tt.wantY) > 0.01 {
+			t.Errorf("angle=%d (%f,%f) got(%f,%f) want(%f,%f)",
+				tt.angle, tt.rx, tt.ry, gotX, gotY, tt.wantX, tt.wantY)
+		}
+	}
+}
+
+func TestMapRotatedRectToOriginal_NormalizesBounds(t *testing.T) {
+	tests := []struct {
+		name           string
+		angle          int
+		wantX0, wantY0 float64
+		wantX1, wantY1 float64
+	}{
+		{name: "zero", angle: 0, wantX0: 10, wantY0: 20, wantX1: 60, wantY1: 80},
+		{name: "ninety", angle: 90, wantX0: 20, wantY0: 39, wantX1: 80, wantY1: 89},
+		{name: "one-eighty", angle: 180, wantX0: 139, wantY0: 19, wantX1: 189, wantY1: 79},
+		{name: "two-seventy", angle: 270, wantX0: 119, wantY0: 10, wantX1: 179, wantY1: 60},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotX0, gotY0, gotX1, gotY1 := MapRotatedRectToOriginal(10, 20, 60, 80, tt.angle, 200, 100)
+			if gotX0 != tt.wantX0 || gotY0 != tt.wantY0 || gotX1 != tt.wantX1 || gotY1 != tt.wantY1 {
+				t.Errorf("got (%.0f,%.0f,%.0f,%.0f), want (%.0f,%.0f,%.0f,%.0f)",
+					gotX0, gotY0, gotX1, gotY1, tt.wantX0, tt.wantY0, tt.wantX1, tt.wantY1)
+			}
+			if gotX0 > gotX1 || gotY0 > gotY1 {
+				t.Fatalf("mapped rectangle is inverted: (%.0f,%.0f,%.0f,%.0f)", gotX0, gotY0, gotX1, gotY1)
+			}
+		})
+	}
+}
+
+func colorEqual(a, b color.Color) bool {
+	ar, ag, ab, aa := a.RGBA()
+	br, bg, bb, ba := b.RGBA()
+	return ar == br && ag == bg && ab == bb && aa == ba
+}
+
+// TestCropSectionImage_MultiPage verifies that a non-positive trailing-page
+// remainder does not become an inverted crop region.
+func TestCropSectionImage_MultiPage(t *testing.T) {
+	// Page 0: tall (2000px), Page 1: short (800px), Page 2: short (800px)
+	// The range stores only its endpoint page numbers. With these page heights,
+	// the remaining crop height is exhausted before the trailing endpoint.
+	pageImages := map[int]image.Image{
+		0: makeTestPageImage(100, 2000, color.RGBA{200, 0, 0, 255}),
+		1: makeTestPageImage(100, 800, color.RGBA{0, 200, 0, 255}),
+		2: makeTestPageImage(100, 800, color.RGBA{0, 0, 200, 255}),
+	}
+	// The position range covers pages 0-2.
+	posTag := "@@1-3\t0.0\t100.0\t0.0\t500.0##"
+	b64 := CropSectionImage(posTag, pageImages, 1)
+	if b64 == "" {
+		t.Fatal("expected non-empty result for multi-page position")
+	}
+	// The first page and context bands should still yield a non-empty crop.
+	decoded, _ := base64.StdEncoding.DecodeString(b64)
+	img := decodePNG(t, decoded)
+	h := img.Bounds().Dy()
+	if h < 500 {
+		t.Errorf("multi-page height too small: got %d, want >= 500", h)
+	}
+	t.Logf("multi-page stitch height: %d", h)
+}
+
+// TestCropSectionImage_LargePageSpan verifies 2-page case was not broken.
+func TestCropSectionImage_LargePageSpan(t *testing.T) {
+	pageImages := map[int]image.Image{
+		0: makeTestPageImage(100, 800, color.RGBA{200, 0, 0, 255}),
+		1: makeTestPageImage(100, 600, color.RGBA{0, 200, 0, 255}),
+	}
+	posTag := "@@1-2\t0.0\t100.0\t0.0\t900.0##"
+	b64 := CropSectionImage(posTag, pageImages, 1)
+	if b64 == "" {
+		t.Fatal("expected non-empty result")
+	}
+	decoded, _ := base64.StdEncoding.DecodeString(b64)
+	img := decodePNG(t, decoded)
+	if img.Bounds().Dy() < 500 {
+		t.Errorf("2-page height too small: %d", img.Bounds().Dy())
+	}
+}
+
+// TestCropSectionByDLA tests that figure sections get cropped using the
+// best-overlapping DLA region instead of the text-box PositionTag.
+func TestCropSectionByDLA(t *testing.T) {
+	// Create a test page image (216 DPI scale = 3x PDF points).
+	// The image is 300x450 px, which is 100x150 in PDF points at scale 3.
+	pageImages := map[int]image.Image{
+		0: makeTestPageImage(300, 450, color.RGBA{255, 0, 0, 255}),
+	}
+
+	// DLA regions in pixel space (216 DPI).
+	// Figure region at (30, 60, 270, 420) — a large area covering most of the image.
+	// Text region at (10, 400, 100, 440) — a small text box near the bottom.
+	dlaRegions := []pdf.DLAPageRegions{{
+		Page: 0,
+		Regions: []pdf.DLARegion{
+			{X0: 10, Y0: 400, X1: 100, Y1: 440, Label: "text"},
+			{X0: 30, Y0: 60, X1: 270, Y1: 420, Label: "figure"},
+			{X0: 5, Y0: 5, X1: 290, Y1: 55, Label: "title"},
+		},
+	}}
+
+	// pdf.Section with a text-box-sized bbox (PDF points, 72 DPI).
+	// In pixel space at scale 3: (60, 1200, 150, 1320) → (20, 400, 50, 440).
+	// This overlaps with the "figure" DLA region.
+	sec := pdf.Section{
+		Positions: []pdf.Position{{
+			PageNumbers: []int{0},
+			Left:        20, Right: 50,
+			Top: 400 / 3.0, Bottom: 440 / 3.0,
+		}},
+		LayoutType: "figure",
+	}
+
+	result := CropSectionByDLA(sec, dlaRegions, pageImages)
+	if result == "" {
+		t.Fatal("expected non-empty result for figure overlapping DLA region")
+	}
+
+	// Decode and verify.
+	decoded, _ := base64.StdEncoding.DecodeString(result)
+	img := decodePNG(t, decoded)
+	// The DLA figure region is (30,60)-(270,420). CropImageRegion now adds a
+	// fixed 30px margin (TSRRegionMarginPx = 10pt * ZM), so the crop is
+	// (0,30)-(300,450) → 300x420. The assertions below only check the crop is
+	// reasonably large, not exact pixels.
+	w, h := img.Bounds().Dx(), img.Bounds().Dy()
+	t.Logf("cropSectionByDLA result: %dx%d", w, h)
+	if w < 200 || h < 300 {
+		t.Errorf("unexpected crop size %dx%d, want >= 200x300 (DLA region based)", w, h)
+	}
+}
+
+// TestCropSectionByDLA_NoMatch falls back to the section bbox crop (matching
+// Python cropout's ii-is-None branch) when no figure/equation DLA region
+// overlaps — it does NOT return "".
+func TestCropSectionByDLA_NoMatch(t *testing.T) {
+	pageImages := map[int]image.Image{
+		0: makeTestPageImage(300, 450, color.RGBA{255, 0, 0, 255}),
+	}
+	dlaRegions := []pdf.DLAPageRegions{{
+		Page: 0,
+		Regions: []pdf.DLARegion{
+			{X0: 10, Y0: 10, X1: 100, Y1: 50, Label: "title"},
+			{X0: 10, Y0: 60, X1: 100, Y1: 100, Label: "text"},
+		},
+	}}
+	// pdf.Section whose bbox doesn't overlap any figure/equation DLA region.
+	// PDF points → pixels at scale 3: (20,20,50,50) → (60,60,150,150) ≈ 90x90.
+	sec := pdf.Section{
+		Positions: []pdf.Position{{
+			PageNumbers: []int{0},
+			Left:        20, Right: 50, Top: 20, Bottom: 50,
+		}},
+		LayoutType: "figure",
+	}
+	result := CropSectionByDLA(sec, dlaRegions, pageImages)
+	if result == "" {
+		t.Fatal("expected bbox fallback crop when no figure/equation DLA region found")
+	}
+	decoded, _ := base64.StdEncoding.DecodeString(result)
+	img := decodePNG(t, decoded)
+	w, h := img.Bounds().Dx(), img.Bounds().Dy()
+	t.Logf("cropSectionByDLA fallback result: %dx%d", w, h)
+	if w < 80 || h < 80 {
+		t.Errorf("unexpected fallback crop size %dx%d, want ~90x90 (bbox based)", w, h)
+	}
+}
+
+// TestCropSectionByDLA_MultiPage verifies that a section spanning two pages is
+// cropped per page and vertically concatenated (matching cropout's multi-page
+// branch), rather than returning only the first page.
+func TestCropSectionByDLA_MultiPage(t *testing.T) {
+	pageImages := map[int]image.Image{
+		0: makeTestPageImage(300, 450, color.RGBA{255, 0, 0, 255}),
+		1: makeTestPageImage(300, 450, color.RGBA{0, 255, 0, 255}),
+	}
+	dlaRegions := []pdf.DLAPageRegions{
+		{Page: 0, Regions: []pdf.DLARegion{{X0: 30, Y0: 60, X1: 270, Y1: 420, Label: "figure"}}},
+		{Page: 1, Regions: []pdf.DLARegion{{X0: 30, Y0: 60, X1: 270, Y1: 420, Label: "figure"}}},
+	}
+	// Section bbox covers both pages (PDF points, 72 DPI).
+	sec := pdf.Section{
+		Positions: []pdf.Position{{
+			PageNumbers: []int{0, 1},
+			Left:        20, Right: 50, Top: 100, Bottom: 200,
+		}},
+		LayoutType: "figure",
+	}
+	result := CropSectionByDLA(sec, dlaRegions, pageImages)
+	if result == "" {
+		t.Fatal("expected non-empty multi-page crop")
+	}
+	decoded, _ := base64.StdEncoding.DecodeString(result)
+	img := decodePNG(t, decoded)
+	h := img.Bounds().Dy()
+	t.Logf("cropSectionByDLA multi-page result: %dx%d", img.Bounds().Dx(), h)
+	// Concatenation of two ~360px tall crops (+ 6px gap) must exceed one page.
+	if h <= 450 {
+		t.Errorf("multi-page crop height %d should exceed a single page (450)", h)
+	}
+}
+
+// TestCropSectionByDLA_EmptyInputs returns empty for edge cases.
+func TestCropSectionByDLA_EmptyInputs(t *testing.T) {
+	// Empty positions.
+	if got := CropSectionByDLA(pdf.Section{}, nil, nil); got != "" {
+		t.Error("expected empty for empty positions")
+	}
+	// Empty page numbers.
+	sec := pdf.Section{Positions: []pdf.Position{{PageNumbers: nil}}}
+	if got := CropSectionByDLA(sec, nil, nil); got != "" {
+		t.Error("expected empty for empty page numbers")
+	}
+}
+func TestCropImageRegion(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 200, 300))
+
+	t.Run("normal crop uses fixed 30px margin", func(t *testing.T) {
+		r := pdf.DLARegion{X0: 10, Y0: 20, X1: 100, Y1: 150}
+		cropped, err := CropImageRegion(img, r)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// Fixed margin = 10 PDF points * ZM(3) = 30px on each side (matches
+		// Python's MARGIN=10, NOT a proportional 3%). Region is 90x130px;
+		// expanded by 30px/side and clamped to the 200x300 image → 130x180.
+		if cropped.Bounds().Dx() != 130 || cropped.Bounds().Dy() != 180 {
+			t.Errorf("size %v, want 130x180 (fixed 30px margin)", cropped.Bounds())
+		}
+	})
+
+	t.Run("margin is fixed, not proportional", func(t *testing.T) {
+		// A small 40x40 region: a 3% margin adds only ~1.2px/side (→ 42x42),
+		// but the fixed 30px margin adds 30px/side (→ 100x100). This locks
+		// parity with Python, which uses a fixed MARGIN=10 points.
+		r := pdf.DLARegion{X0: 50, Y0: 50, X1: 90, Y1: 90}
+		cropped, err := CropImageRegion(img, r)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cropped.Bounds().Dx() != 100 || cropped.Bounds().Dy() != 100 {
+			t.Errorf("size %v, want 100x100 (fixed 30px margin, not 3%%)", cropped.Bounds())
+		}
+	})
+
+	t.Run("x0 >= x1 returns error", func(t *testing.T) {
+		// 3% proportional margin on each side: if the gap is too small after margin expansion, x0 ≥ x1 triggers error.
+		r := pdf.DLARegion{X0: 110, Y0: 20, X1: 50, Y1: 150}
+		_, err := CropImageRegion(img, r)
+		if err == nil {
+			t.Fatal("expected error for x0 >= x1, got nil")
+		}
+	})
+
+	t.Run("y0 >= y1 returns error", func(t *testing.T) {
+		r := pdf.DLARegion{X0: 10, Y0: 150, X1: 100, Y1: 20}
+		_, err := CropImageRegion(img, r)
+		if err == nil {
+			t.Fatal("expected error for y0 >= y1, got nil")
+		}
+	})
+
+	t.Run("region fully outside image bounds", func(t *testing.T) {
+		// Clamped to image bounds → zero-width/height → error.
+		r := pdf.DLARegion{X0: 300, Y0: 400, X1: 500, Y1: 600}
+		_, err := CropImageRegion(img, r)
+		if err == nil {
+			t.Fatal("expected error for region outside image bounds")
+		}
+	})
+}
+
+// TestTSRRegionMarginPx locks the parity contract with Python: the TSR crop
+// margin is a fixed 10 PDF points scaled by ZM (DlaScale=3) = 30px, NOT a
+// proportional percentage. Both CropImageRegion and the cropOff inverse map in
+// table_extract.go read this single constant, so the crop and the coordinate
+// mapping can never drift apart.
+func TestTSRRegionMarginPx(t *testing.T) {
+	const want = 10.0 * pdf.DlaScale // 10 points * ZM(3) = 30px
+	if TSRRegionMarginPx != want {
+		t.Errorf("TSRRegionMarginPx = %v, want %v (10pt * ZM)", TSRRegionMarginPx, want)
+	}
+}
+
+func TestCropMediaSectionPositionsSpansPagesOfMixedHeight(t *testing.T) {
+	// Bottom is local to the last page, so the span adds the height of the
+	// first page, not the last. Each case keeps 100 rows of each page.
+	red, blue := color.RGBA{255, 0, 0, 255}, color.RGBA{0, 0, 255, 255}
+	cases := []struct {
+		name        string
+		first, last int
+		top, bottom float64
+	}{
+		{"tall first page", 800, 600, 700, 100},
+		{"short first page", 600, 800, 500, 100},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pageImages := map[int]image.Image{
+				0: makeTestPageImage(200, tc.first, red),
+				1: makeTestPageImage(200, tc.last, blue),
+			}
+			positions := []pdf.Position{{PageNumbers: []int{0, 1}, Left: 20, Right: 120, Top: tc.top, Bottom: tc.bottom}}
+			b64 := CropMediaSectionPositions(positions, pageImages, 1)
+			if b64 == "" {
+				t.Fatal("expected non-empty result")
+			}
+			decoded, _ := base64.StdEncoding.DecodeString(b64)
+			img := decodePNG(t, decoded)
+			if bounds := img.Bounds(); bounds.Dx() != 100 || bounds.Dy() != 212 {
+				t.Fatalf("spanning media crop bounds = %v, want 100x212", bounds)
+			}
+			if r, _, _, _ := img.At(0, 50).RGBA(); uint8(r>>8) < 200 {
+				t.Error("top rows should be page-0 red")
+			}
+			if _, _, b, _ := img.At(0, 150).RGBA(); uint8(b>>8) < 200 {
+				t.Error("bottom rows should be page-1 blue")
+			}
+		})
+	}
+}
+
+func TestCropSectionByDLA_MultiPageMixedHeight(t *testing.T) {
+	// No DLA regions, so each page falls back to the section bbox. At
+	// scale 3, Top 100 is row 300 of the 450px page 0 and Bottom 50 is
+	// row 150 of the 300px page 1: 150 + 6 + 150 rows.
+	pageImages := map[int]image.Image{
+		0: makeTestPageImage(300, 450, color.RGBA{255, 0, 0, 255}),
+		1: makeTestPageImage(300, 300, color.RGBA{0, 0, 255, 255}),
+	}
+	sec := pdf.Section{
+		Positions:  []pdf.Position{{PageNumbers: []int{0, 1}, Left: 20, Right: 50, Top: 100, Bottom: 50}},
+		LayoutType: "figure",
+	}
+	result := CropSectionByDLA(sec, nil, pageImages)
+	if result == "" {
+		t.Fatal("expected non-empty multi-page crop")
+	}
+	decoded, _ := base64.StdEncoding.DecodeString(result)
+	img := decodePNG(t, decoded)
+	if bounds := img.Bounds(); bounds.Dx() != 90 || bounds.Dy() != 306 {
+		t.Fatalf("DLA multi-page crop bounds = %v, want 90x306", bounds)
+	}
+}

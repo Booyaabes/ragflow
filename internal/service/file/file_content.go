@@ -1,0 +1,304 @@
+package file
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"ragflow/internal/common"
+	"ragflow/internal/dao"
+	"ragflow/internal/entity"
+	"ragflow/internal/parser/parser"
+	"ragflow/internal/parser/tableutil"
+	"ragflow/internal/permission"
+	"ragflow/internal/storage"
+	"ragflow/internal/utility"
+	"strings"
+)
+
+// GetFileContent gets file metadata and checks permission for download
+// Matches Python's file_api_service.get_file_content function
+func (s *FileService) GetFileContent(ctx context.Context, fileID string) (*entity.File, error) {
+	file, err := s.fileDAO.GetByID(ctx, dao.DB, fileID)
+	if err != nil || file == nil {
+		return nil, fmt.Errorf("document not found")
+	}
+	if err := checkFileAccess(ctx, file, permission.OperationRead); err != nil {
+		return nil, err
+	}
+	return file, nil
+}
+
+// GetStorageAddress gets storage address for a file (fallback for when direct blob is empty)
+// Matches Python's File2DocumentService.get_storage_address function
+func (s *FileService) GetStorageAddress(ctx context.Context, fileID string) (*StorageAddress, error) {
+	// Get file2document mapping
+	f2d, err := s.file2DocumentDAO.GetByFileID(ctx, dao.DB, fileID)
+	if err != nil || len(f2d) == 0 {
+		return nil, fmt.Errorf("file2document mapping not found")
+	}
+
+	// Get the file
+	if f2d[0].FileID == nil {
+		return nil, fmt.Errorf("file_id is nil in file2document mapping")
+	}
+	file, err := s.fileDAO.GetByID(ctx, dao.DB, *f2d[0].FileID)
+	if err != nil || file == nil {
+		return nil, fmt.Errorf("file not found")
+	}
+
+	// If source_type is empty or local, return file's parent_id and location
+	if file.SourceType == "" || entity.FileSource(file.SourceType) == entity.FileSourceLocal {
+		if file.Location == nil || *file.Location == "" {
+			return nil, fmt.Errorf("file location is empty")
+		}
+		return &StorageAddress{
+			Bucket: file.ParentID,
+			Name:   *file.Location,
+		}, nil
+	}
+
+	// Otherwise, use document's kb_id and location
+	if f2d[0].DocumentID == nil {
+		return nil, fmt.Errorf("document_id is required")
+	}
+
+	documentDAO := dao.NewDocumentDAO()
+	doc, err := documentDAO.GetByID(ctx, dao.DB, *f2d[0].DocumentID)
+	if err != nil || doc == nil {
+		return nil, fmt.Errorf("document not found")
+	}
+
+	if doc.Location == nil || *doc.Location == "" {
+		return nil, fmt.Errorf("document location is empty")
+	}
+
+	return &StorageAddress{
+		Bucket: doc.KbID,
+		Name:   *doc.Location,
+	}, nil
+}
+
+// DownloadAgentFile downloads an agent-generated file directly from MinIO without querying the database.
+func (s *FileService) DownloadAgentFile(ctx context.Context, location string) ([]byte, error) {
+	userID := permission.UserIDFromContext(ctx)
+	if userID == "" {
+		return nil, permission.ErrUnauthenticated
+	}
+	storageImpl := storage.GetStorageFactory().GetStorage()
+	if storageImpl == nil {
+		return nil, fmt.Errorf("storage not initialized")
+	}
+
+	bucketName := fmt.Sprintf("%s-downloads", userID)
+
+	blob, err := storageImpl.Get(ctx, bucketName, location)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file from storage: %w", err)
+	}
+
+	return blob, nil
+}
+
+// GetFileContents fetches file contents (text + image) from storage
+// for the given file dicts. Images are always returned as MIME-preserving
+// base64 data URIs so the multimodal conversion layer (parseDataURIOrB64)
+// accepts them.
+//
+// File dicts are the descriptors returned by the upload_info endpoint
+// (UploadInfos / storeUploadInfoBlob). They contain:
+//
+//   - "id":         storage location UUID (key in the downloads bucket)
+//   - "created_by": the user ID who owns the downloads bucket
+//   - "name":       the original filename
+//   - "mime_type":  the content type
+//
+// Blobs are stored directly in "{created_by}-downloads/{id}" in object
+// storage WITHOUT a corresponding File entity row in the database.
+// Mirrors Python's FileService.get_files → get_blob(user_id, file_id).
+func (s *FileService) GetFileContents(ctx context.Context, fileDicts []map[string]interface{}) (texts []string, images []string, err error) {
+	uid := permission.UserIDFromContext(ctx)
+	if uid == "" {
+		return nil, nil, permission.ErrUnauthenticated
+	}
+	storageImpl := storage.GetStorageFactory().GetStorage()
+	if storageImpl == nil {
+		return nil, nil, fmt.Errorf("storage not initialized")
+	}
+
+	for _, fd := range fileDicts {
+		id, _ := fd["id"].(string)
+		if id == "" {
+			continue
+		}
+		name, _ := fd["name"].(string)
+		mimeType, _ := fd["mime_type"].(string)
+		createdBy, _ := fd["created_by"].(string)
+		if createdBy == "" {
+			createdBy = uid
+		}
+		// Permission: only the owner can access their uploads bucket.
+		if createdBy != uid {
+			return nil, nil, fmt.Errorf("no authorization")
+		}
+
+		data, derr := storageImpl.Get(ctx, createdBy+"-downloads", id)
+		if derr != nil || len(data) == 0 {
+			continue
+		}
+
+		ft := utility.FilenameType(name)
+		if utility.IsVideoFilename(name) {
+			// Uploads accept video, but no parser implements video analysis.
+			// Report that instead of inlining the container as a bogus image
+			// data URI (the old visual classification) or dumping raw bytes.
+			texts = append(texts, fmt.Sprintf("\n -----------------\nFile: %s\nContent as following: \n(video content is not supported)\n", name))
+			continue
+		}
+		if ft == utility.FileTypeVISUAL {
+			mediaType := strings.ToLower(strings.TrimSpace(strings.Split(mimeType, ";")[0]))
+			if mediaType == "" {
+				ext := utility.GetFileExtension(name)
+				mediaType = utility.GetContentType(ext, string(ft))
+			}
+			images = append(images, "data:"+mediaType+";base64,"+base64.StdEncoding.EncodeToString(data))
+		} else {
+			content := parseFileContent(ctx, name, data)
+			texts = append(texts, fmt.Sprintf("\n -----------------\nFile: %s\nContent as following: \n%s", name, content))
+		}
+	}
+	return texts, images, nil
+}
+
+// ParseAgentUploads resolves descriptors returned by upload_info from the
+// caller's downloads bucket and converts them to sys.files values.
+func (s *FileService) ParseAgentUploads(ctx context.Context, fileDicts []map[string]interface{}, layoutRecognize string) ([]string, error) {
+	userID := permission.UserIDFromContext(ctx)
+	if userID == "" {
+		return nil, permission.ErrUnauthenticated
+	}
+	storageImpl := storage.GetStorageFactory().GetStorage()
+	if storageImpl == nil {
+		return nil, fmt.Errorf("storage not initialized")
+	}
+
+	contents := make([]string, 0, len(fileDicts))
+	for i, fd := range fileDicts {
+		id, _ := fd["id"].(string)
+		name, _ := fd["name"].(string)
+		mimeType, _ := fd["mime_type"].(string)
+		createdBy, _ := fd["created_by"].(string)
+		if id == "" || name == "" || mimeType == "" || createdBy == "" {
+			return nil, fmt.Errorf("file %d: id, name, mime_type, and created_by are required", i)
+		}
+		if createdBy != userID {
+			return nil, fmt.Errorf("file %q: created_by does not match the current user", name)
+		}
+
+		data, err := storageImpl.Get(ctx, createdBy+"-downloads", id)
+		if err != nil {
+			return nil, fmt.Errorf("file %q: read upload: %w", name, err)
+		}
+		if len(data) == 0 {
+			return nil, fmt.Errorf("file %q: upload is empty", name)
+		}
+
+		// Reject video filenames before the MIME-based image branch: a
+		// mislabeled video (e.g. clip.mp4 declaring image/png) would otherwise
+		// be inlined as a bogus image data URI without ever reaching the
+		// parser-level video check.
+		if utility.IsVideoFilename(name) {
+			return nil, fmt.Errorf("file %q: video content is not supported", name)
+		}
+
+		mediaType := strings.ToLower(strings.TrimSpace(strings.Split(mimeType, ";")[0]))
+		if strings.HasPrefix(mediaType, "image/") {
+			contents = append(contents, "data:"+mediaType+";base64,"+base64.StdEncoding.EncodeToString(data))
+			continue
+		}
+
+		content, err := parseAgentUploadContent(ctx, name, data, layoutRecognize)
+		if err != nil {
+			return nil, fmt.Errorf("file %q: parse upload: %w", name, err)
+		}
+		contents = append(contents, content)
+	}
+	return contents, nil
+}
+
+func parseAgentUploadContent(ctx context.Context, filename string, data []byte, layoutRecognize string) (string, error) {
+	content := string(data)
+	fileType := utility.GetFileType(filename)
+	if fileType != utility.FileTypeOTHER {
+		fp, actual, err := parser.GetTextOnlyParser(fileType, data)
+		if err != nil {
+			return "", err
+		}
+		if actual != fileType {
+			common.Warn(fmt.Sprintf("file %q: requested format %s; detected %s; continuing with the %s parser", filename, fileType, actual, actual))
+		}
+		if configurable, ok := fp.(interface{ ConfigureFromSetup(map[string]any) }); ok {
+			configurable.ConfigureFromSetup(map[string]any{"layout_recognize": layoutRecognize})
+		}
+		res := fp.ParseWithResult(ctx, filename, data)
+		if res.Err != nil {
+			return "", res.Err
+		}
+		parsed, err := parseResultText(res)
+		if err != nil {
+			return "", err
+		}
+		content = parsed
+	}
+	return fmt.Sprintf("\n -----------------\nFile: %s\nContent as following: \n%s", filename, content), nil
+}
+
+// parseResultText converts a parser result into the readable text expected by
+// sys.files. Every parser result is structured JSON, so the items are flattened
+// in order, preferring each item's text field and rendering tables; items
+// without either are serialized as a final fallback.
+func parseResultText(res parser.ParseResult) (string, error) {
+	parts := make([]string, 0, len(res.JSON))
+	for _, item := range res.JSON {
+		m := item.ToMap()
+		if text, ok := m["text"].(string); ok {
+			parts = append(parts, text)
+			continue
+		}
+		if td, ok := m["table"].(*entity.TableData); ok && td != nil {
+			parts = append(parts, tableutil.RenderTableHTML(td))
+			continue
+		}
+		raw, err := json.Marshal(m)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, string(raw))
+	}
+	return strings.Join(parts, "\n"), nil
+}
+
+// parseFileContent tries to parse a file's contents using the appropriate parser.
+// Falls back to returning raw text if no parser is available.
+func parseFileContent(ctx context.Context, filename string, data []byte) string {
+	fileType := utility.GetFileType(filename)
+	if fileType == utility.FileTypeOTHER {
+		return string(data)
+	}
+	fp, actual, err := parser.GetTextOnlyParser(fileType, data)
+	if err != nil {
+		return string(data)
+	}
+	if actual != fileType {
+		common.Warn(fmt.Sprintf("file %q: requested format %s; detected %s; continuing with the %s parser", filename, fileType, actual, actual))
+	}
+	res := fp.ParseWithResult(ctx, filename, data)
+	if res.Err != nil {
+		return string(data)
+	}
+	content, err := parseResultText(res)
+	if err != nil {
+		return string(data)
+	}
+	return content
+}

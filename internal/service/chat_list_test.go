@@ -1,0 +1,319 @@
+package service
+
+import (
+	"fmt"
+	"testing"
+
+	"github.com/glebarez/sqlite"
+	"gorm.io/gorm"
+
+	"ragflow/internal/dao"
+	"ragflow/internal/entity"
+)
+
+func setupChatListTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
+		TranslateError: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+
+	if err = db.AutoMigrate(
+		&entity.Chat{},
+		&entity.Tenant{},
+		&entity.User{},
+		&entity.UserTenant{},
+	); err != nil {
+		t.Fatalf("failed to migrate test schema: %v", err)
+	}
+
+	origDB := dao.DB
+	dao.DB = db
+	t.Cleanup(func() { dao.DB = origDB })
+
+	status := string(entity.StatusValid)
+	if err = db.Create(&entity.Tenant{
+		ID:        "user-1",
+		ParserIDs: "naive",
+		Status:    &status,
+	}).Error; err != nil {
+		t.Fatalf("failed to create tenant: %v", err)
+	}
+
+	if err = db.Create(&entity.UserTenant{
+		ID: "user-tenant-1", UserID: "user-1", TenantID: "user-1", Role: "owner",
+		LLMID: "model-a", EmbdID: "embd-a", Status: &status,
+	}).Error; err != nil {
+		t.Fatalf("failed to create owner membership: %v", err)
+	}
+
+	if err = db.Create(&entity.User{
+		ID:       "user-1",
+		Nickname: "tester",
+		Status:   sptr("1"),
+	}).Error; err != nil {
+		t.Fatalf("failed to create user: %v", err)
+	}
+	return db
+}
+
+func createChatListTestChat(t *testing.T, db *gorm.DB, id, tenantID, name string) {
+	t.Helper()
+
+	status := string(entity.StatusValid)
+	chat := &entity.Chat{
+		ID:           id,
+		TenantID:     tenantID,
+		Name:         &name,
+		LLMID:        "model-a",
+		LLMSetting:   entity.JSONMap{},
+		PromptType:   "simple",
+		PromptConfig: entity.JSONMap{},
+		KBIDs:        entity.JSONSlice{},
+		Status:       &status,
+	}
+	if err := db.Create(chat).Error; err != nil {
+		t.Fatalf("failed to create chat: %v", err)
+	}
+}
+
+func TestChatServiceListChatsDefaultReturnsAllWithCorrectTotal(t *testing.T) {
+	db := setupChatListTestDB(t)
+	createChatListTestChat(t, db, "chat-1", "user-1", "list_test_0")
+	createChatListTestChat(t, db, "chat-2", "user-1", "list_test_1")
+	createChatListTestChat(t, db, "chat-3", "user-1", "list_test_2")
+
+	svc := NewChatService()
+	ctx := serviceTestContext(t, "user-1", "user-1")
+	result, err := svc.ListChats(ctx, "1", "", "", "", 0, 0, []dao.OrderTerm{{Column: "create_time", Desc: true}}, nil)
+	if err != nil {
+		t.Fatalf("ListChats failed: %v", err)
+	}
+	if result.Total != 3 {
+		t.Fatalf("expected total=3, got %d", result.Total)
+	}
+	if len(result.Chats) != 3 {
+		t.Fatalf("expected 3 chats, got %d", len(result.Chats))
+	}
+	if result.Chats[0].Nickname != "tester" {
+		t.Fatalf("expected nickname tester, got %q", result.Chats[0].Nickname)
+	}
+}
+
+func TestChatServiceListChatsDoesNotExposeAnotherTenantsChats(t *testing.T) {
+	db := setupChatListTestDB(t)
+
+	if err := db.Create(&entity.User{
+		ID:       "tenant-2",
+		Nickname: "team owner",
+		Email:    "tenant-2@test.com",
+		Status:   sptr("1"),
+	}).Error; err != nil {
+		t.Fatalf("failed to create tenant user: %v", err)
+	}
+	if err := db.Create(&entity.UserTenant{
+		ID:        "rel-1",
+		UserID:    "user-1",
+		TenantID:  "tenant-2",
+		Role:      "normal",
+		InvitedBy: "tenant-2",
+		Status:    sptr("1"),
+	}).Error; err != nil {
+		t.Fatalf("failed to create user tenant relation: %v", err)
+	}
+
+	createChatListTestChat(t, db, "chat-own", "user-1", "own_chat")
+	createChatListTestChat(t, db, "chat-team", "tenant-2", "team_chat")
+
+	svc := NewChatService()
+	ctx := serviceTestContext(t, "user-1", "user-1")
+	result, err := svc.ListChats(ctx, "1", "", "", "", 0, 0, []dao.OrderTerm{{Column: "create_time", Desc: true}}, []string{"tenant-2"})
+	if err != nil {
+		t.Fatalf("ListChats failed: %v", err)
+	}
+	if result.Total != 0 || len(result.Chats) != 0 {
+		t.Fatalf("expected another tenant's chat to be hidden, got total=%d len=%d", result.Total, len(result.Chats))
+	}
+}
+
+func TestChatServiceListChatsKeywordFiltersCorrectly(t *testing.T) {
+	db := setupChatListTestDB(t)
+	createChatListTestChat(t, db, "chat-1", "user-1", "list_keyword_0")
+	createChatListTestChat(t, db, "chat-2", "user-1", "list_keyword_1")
+	createChatListTestChat(t, db, "chat-3", "user-1", "list_other_2")
+
+	svc := NewChatService()
+
+	ctx := serviceTestContext(t, "user-1", "user-1")
+	exactResult, err := svc.ListChats(ctx, "1", "list_keyword_1", "", "", 0, 0, []dao.OrderTerm{{Column: "create_time", Desc: true}}, nil)
+	if err != nil {
+		t.Fatalf("ListChats keyword exact failed: %v", err)
+	}
+	if len(exactResult.Chats) != 1 {
+		t.Fatalf("expected 1 chat for keyword 'list_keyword_1', got %d", len(exactResult.Chats))
+	}
+	if exactResult.Chats[0].Name == nil || *exactResult.Chats[0].Name != "list_keyword_1" {
+		t.Fatalf("expected chat name 'list_keyword_1', got %+v", exactResult.Chats[0].Name)
+	}
+
+	unknownResult, err := svc.ListChats(ctx, "1", "unknown_keyword", "", "", 0, 0, []dao.OrderTerm{{Column: "create_time", Desc: true}}, nil)
+	if err != nil {
+		t.Fatalf("ListChats unknown keyword failed: %v", err)
+	}
+	if len(unknownResult.Chats) != 0 {
+		t.Fatalf("expected 0 chats for unknown keyword, got %d", len(unknownResult.Chats))
+	}
+
+	partialResult, err := svc.ListChats(ctx, "1", "list_keyword", "", "", 0, 0, []dao.OrderTerm{{Column: "create_time", Desc: true}}, nil)
+	if err != nil {
+		t.Fatalf("ListChats partial keyword failed: %v", err)
+	}
+	if len(partialResult.Chats) != 2 {
+		t.Fatalf("expected 2 chats for keyword 'list_keyword', got %d", len(partialResult.Chats))
+	}
+}
+
+func TestChatServiceListChatsPagination(t *testing.T) {
+	db := setupChatListTestDB(t)
+	for i := 0; i < 5; i++ {
+		createChatListTestChat(t, db, "chat-"+string(rune('a'+i)), "user-1", "page_test")
+	}
+
+	svc := NewChatService()
+
+	ctx := serviceTestContext(t, "user-1", "user-1")
+	page1, err := svc.ListChats(ctx, "1", "", "", "", 1, 2, []dao.OrderTerm{{Column: "create_time", Desc: true}}, nil)
+	if err != nil {
+		t.Fatalf("ListChats page 1 failed: %v", err)
+	}
+	if len(page1.Chats) != 2 {
+		t.Fatalf("expected 2 chats on page 1, got %d", len(page1.Chats))
+	}
+	if page1.Total != 5 {
+		t.Fatalf("expected total=5, got %d", page1.Total)
+	}
+
+	page3, err := svc.ListChats(ctx, "1", "", "", "", 3, 2, []dao.OrderTerm{{Column: "create_time", Desc: true}}, nil)
+	if err != nil {
+		t.Fatalf("ListChats page 3 failed: %v", err)
+	}
+	if len(page3.Chats) != 1 {
+		t.Fatalf("expected 1 chat on page 3, got %d", len(page3.Chats))
+	}
+}
+
+func TestChatServiceListChatsExcludesDeletedChats(t *testing.T) {
+	db := setupChatListTestDB(t)
+	createChatListTestChat(t, db, "chat-1", "user-1", "active_chat")
+	createChatListTestChat(t, db, "chat-2", "user-1", "deleted_chat")
+
+	invalidStatus := string(entity.StatusInvalid)
+	db.Model(&entity.Chat{}).Where("id = ?", "chat-2").Update("status", invalidStatus)
+
+	svc := NewChatService()
+	ctx := serviceTestContext(t, "user-1", "user-1")
+	result, err := svc.ListChats(ctx, "1", "", "", "", 0, 0, []dao.OrderTerm{{Column: "create_time", Desc: true}}, nil)
+	if err != nil {
+		t.Fatalf("ListChats failed: %v", err)
+	}
+	if len(result.Chats) != 1 {
+		t.Fatalf("expected 1 active chat, got %d", len(result.Chats))
+	}
+	if result.Chats[0].Name == nil || *result.Chats[0].Name != "active_chat" {
+		t.Fatalf("expected active_chat, got %+v", result.Chats[0].Name)
+	}
+}
+
+func TestChatServiceListChatsExactFilters(t *testing.T) {
+	db := setupChatListTestDB(t)
+	createChatListTestChat(t, db, "chat-1", "user-1", "exact_alpha")
+	createChatListTestChat(t, db, "chat-2", "user-1", "exact_beta")
+
+	svc := NewChatService()
+	ctx := serviceTestContext(t, "user-1", "user-1")
+	terms := []dao.OrderTerm{{Column: "create_time", Desc: true}}
+
+	byID, err := svc.ListChats(ctx, "1", "", "chat-2", "", 0, 0, terms, nil)
+	if err != nil {
+		t.Fatalf("ListChats by id failed: %v", err)
+	}
+	if byID.Total != 1 || len(byID.Chats) != 1 || byID.Chats[0].ID != "chat-2" {
+		t.Fatalf("expected only chat-2 for id filter, got total=%d chats=%+v", byID.Total, byID.Chats)
+	}
+
+	byName, err := svc.ListChats(ctx, "1", "", "", "exact_alpha", 0, 0, terms, nil)
+	if err != nil {
+		t.Fatalf("ListChats by name failed: %v", err)
+	}
+	if byName.Total != 1 || len(byName.Chats) != 1 || byName.Chats[0].ID != "chat-1" {
+		t.Fatalf("expected only chat-1 for name filter, got total=%d chats=%+v", byName.Total, byName.Chats)
+	}
+
+	withOwners, err := svc.ListChats(ctx, "1", "", "chat-2", "", 0, 0, terms, []string{"user-1"})
+	if err != nil {
+		t.Fatalf("ListChats by id with owner_ids failed: %v", err)
+	}
+	if withOwners.Total != 1 || len(withOwners.Chats) != 1 || withOwners.Chats[0].ID != "chat-2" {
+		t.Fatalf("expected only chat-2 for id filter with owner_ids, got total=%d chats=%+v", withOwners.Total, withOwners.Chats)
+	}
+}
+
+// TestChatServiceListChatsPaginatesOwnerBranch covers the owner_ids branch end
+// to end: pagination happens in SQL now, so each page must carry only its own
+// rows while total still reports every matching chat.
+func TestChatServiceListChatsPaginatesOwnerBranch(t *testing.T) {
+	db := setupChatListTestDB(t)
+
+	for i := 1; i <= 5; i++ {
+		name := fmt.Sprintf("owner_page_%d", i)
+		createTime := int64(i * 100)
+		status := string(entity.StatusValid)
+		chat := &entity.Chat{
+			ID:           fmt.Sprintf("chat-%d", i),
+			TenantID:     "user-1",
+			Name:         &name,
+			LLMID:        "model-a",
+			LLMSetting:   entity.JSONMap{},
+			PromptType:   "simple",
+			PromptConfig: entity.JSONMap{},
+			KBIDs:        entity.JSONSlice{},
+			Status:       &status,
+			BaseModel:    entity.BaseModel{CreateTime: &createTime},
+		}
+		if err := db.Create(chat).Error; err != nil {
+			t.Fatalf("failed to create chat %d: %v", i, err)
+		}
+	}
+
+	tests := []struct {
+		name     string
+		page     int
+		pageSize int
+		wantIDs  []string
+	}{
+		{name: "middle page", page: 2, pageSize: 2, wantIDs: []string{"chat-3", "chat-2"}},
+		{name: "unpaginated returns every row", page: 0, pageSize: 0, wantIDs: []string{"chat-5", "chat-4", "chat-3", "chat-2", "chat-1"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := NewChatService().ListChats(serviceTestContext(t, "user-1", "user-1"), "1", "", "", "", tt.page, tt.pageSize, []dao.OrderTerm{{Column: "create_time", Desc: true}}, []string{"user-1"})
+			if err != nil {
+				t.Fatalf("ListChats failed: %v", err)
+			}
+			if result.Total != 5 {
+				t.Fatalf("total = %d, want 5", result.Total)
+			}
+			if len(result.Chats) != len(tt.wantIDs) {
+				t.Fatalf("got %d chats, want %d", len(result.Chats), len(tt.wantIDs))
+			}
+			for i, chat := range result.Chats {
+				if chat.ID != tt.wantIDs[i] {
+					t.Fatalf("chat %d id = %v, want %s", i, chat.ID, tt.wantIDs[i])
+				}
+			}
+		})
+	}
+}

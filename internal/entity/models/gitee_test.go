@@ -1,0 +1,440 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
+package models
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"ragflow/internal/common"
+	"sort"
+	"strings"
+	"testing"
+)
+
+func initProviderManagerWithGiteeForTest(t *testing.T) {
+	t.Helper()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "gitee.json"), readProviderConfig(t, "gitee.json"), 0o600); err != nil {
+		t.Fatalf("write gitee config: %v", err)
+	}
+	if err := InitProviderManager(dir); err != nil {
+		t.Fatalf("InitProviderManager: %v", err)
+	}
+}
+
+func newGiteeForListModelsTest(baseURL string) *GiteeModel {
+	return NewGiteeModel(map[string]string{"default": baseURL}, URLSuffix{Models: "models"})
+}
+
+func newGiteeForChatTest(baseURL string) *GiteeModel {
+	return NewGiteeModel(map[string]string{"default": baseURL}, URLSuffix{Chat: "chat/completions"})
+}
+
+func TestGiteeGetParseFileReturnsSuccessfulTask(t *testing.T) {
+	withSSRFBypass(t)
+	polls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/task/task-123/status" {
+			t.Errorf("request = %s %s, want GET /task/task-123/status", r.Method, r.URL.Path)
+		}
+		polls++
+		status := "in_progress"
+		if polls == 2 {
+			status = "success"
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"task_id": "task-123",
+			"status":  status,
+			"output": map[string]interface{}{
+				"segments": []map[string]interface{}{{"index": 0, "content": "parsed text"}},
+			},
+		})
+	}))
+	defer server.Close()
+
+	model := NewGiteeModel(map[string]string{"default": server.URL}, URLSuffix{})
+	apiKey, taskID := "test-key", "task-123"
+	result, err := model.getParseFile(t.Context(), &server.URL, &apiKey, &taskID, 0, 2)
+	if err != nil {
+		t.Fatalf("getParseFile: %v", err)
+	}
+	if result == nil {
+		t.Fatal("getParseFile result = nil, want successful task")
+	}
+	if result.Status != "success" {
+		t.Fatalf("task status = %q, want success", result.Status)
+	}
+	if polls != 2 {
+		t.Fatalf("poll count = %d, want 2", polls)
+	}
+}
+
+func TestGiteeGetParseFileRejectsFailedAndUnfinishedTasks(t *testing.T) {
+	withSSRFBypass(t)
+	for _, tc := range []struct {
+		name      string
+		status    string
+		wantError string
+	}{
+		{name: "failure", status: "failure", wantError: "Gitee parse task task-123: failure"},
+		{name: "cancelled", status: "cancelled", wantError: "Gitee parse task task-123: cancelled"},
+		{name: "timeout", status: "in_progress", wantError: "timed out waiting for Gitee parse task task-123"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]string{"status": tc.status})
+			}))
+			defer server.Close()
+
+			model := NewGiteeModel(map[string]string{"default": server.URL}, URLSuffix{})
+			apiKey, taskID := "test-key", "task-123"
+			_, err := model.getParseFile(t.Context(), &server.URL, &apiKey, &taskID, 0, 1)
+			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("getParseFile error = %v, want %q", err, tc.wantError)
+			}
+		})
+	}
+}
+
+func TestGiteeParseFileReturnsTaskID(t *testing.T) {
+	withSSRFBypass(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/async/documents/parse":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"task_id": "task-123", "status": "waiting"})
+		case r.Method == http.MethodGet && r.URL.Path == "/task/task-123/status":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"task_id": "task-123", "status": "success"})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	model := NewGiteeModel(map[string]string{"default": server.URL}, URLSuffix{
+		DocumentParse: "async/documents/parse",
+	})
+	apiKey, modelName := "test-key", "MinerU2.5"
+	response, err := model.ParseFile(t.Context(), &modelName, []byte("file content"), nil, &APIConfig{ApiKey: &apiKey}, nil, nil)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if response == nil || response.TaskID != "task-123" {
+		t.Fatalf("ParseFile response = %#v, want task_id task-123", response)
+	}
+}
+
+func TestGiteeShowTaskReadsParsedSegments(t *testing.T) {
+	withSSRFBypass(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/task/task-123" {
+			t.Errorf("request = %s %s, want GET /task/task-123", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"task_id": "task-123",
+			"status":  "success",
+			"output": map[string]interface{}{
+				"segments": []map[string]interface{}{{"index": 1, "content": "parsed text"}},
+			},
+		})
+	}))
+	defer server.Close()
+
+	apiKey := "test-key"
+	model := NewGiteeModel(map[string]string{"default": server.URL}, URLSuffix{Task: "task"})
+	response, err := model.ShowTask(t.Context(), "task-123", &APIConfig{ApiKey: &apiKey})
+	if err != nil {
+		t.Fatalf("ShowTask: %v", err)
+	}
+	if len(response.Segments) != 1 || response.Segments[0].Content != "parsed text" {
+		t.Fatalf("ShowTask segments = %#v, want parsed text", response.Segments)
+	}
+}
+
+func TestGiteeBalanceRejectsMalformedBalanceWithoutPanicking(t *testing.T) {
+	withSSRFBypass(t)
+	cases := []struct {
+		name string
+		body string
+	}{
+		{name: "missing balance", body: `{}`},
+		{name: "null balance", body: `{"balance":null}`},
+		{name: "string balance", body: `{"balance":"10"}`},
+		{name: "object balance", body: `{"balance":{}}`},
+	}
+	apiKey := "test-key"
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer server.Close()
+
+			model := NewGiteeModel(map[string]string{"default": server.URL}, URLSuffix{Balance: "balance"})
+			var callErr error
+			var panicValue any
+			func() {
+				defer func() { panicValue = recover() }()
+				_, callErr = model.Balance(t.Context(), &APIConfig{ApiKey: &apiKey})
+			}()
+			if panicValue != nil {
+				t.Fatalf("Balance panicked for malformed response: %v", panicValue)
+			}
+			if callErr == nil {
+				t.Fatal("Balance error = nil, want malformed response error")
+			}
+		})
+	}
+}
+
+func TestGiteeBalanceParsesNumericBalance(t *testing.T) {
+	withSSRFBypass(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"balance":12.5}`)
+	}))
+	defer server.Close()
+
+	apiKey := "test-key"
+	model := NewGiteeModel(map[string]string{"default": server.URL}, URLSuffix{Balance: "balance"})
+	response, err := model.Balance(t.Context(), &APIConfig{ApiKey: &apiKey})
+	if err != nil {
+		t.Fatalf("Balance: %v", err)
+	}
+	if response["balance"] != 12.5 || response["currency"] != "CNY" {
+		t.Fatalf("Balance response = %#v, want balance 12.5 CNY", response)
+	}
+}
+
+func TestGiteeStreamAcceptsTerminalWithoutDelta(t *testing.T) {
+	withSSRFBypass(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method=%s, want POST", r.Method)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"choices":[{"finish_reason":"stop"}]}`+"\n\n"+
+			`data: [DONE]`+"\n\n")
+	}))
+	defer srv.Close()
+
+	apiKey := "test-key"
+	var sawDone bool
+	err := newGiteeForChatTest(srv.URL).ChatStreamlyWithSender(
+		t.Context(),
+		"gitee-model",
+		[]Message{{Role: "user", Content: "x"}},
+		&APIConfig{ApiKey: &apiKey}, nil, nil,
+		func(content *string, _ *string) error {
+			sawDone = content != nil && *content == "[DONE]"
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	if !sawDone {
+		t.Fatal("expected [DONE] sentinel")
+	}
+}
+
+func deepSeekAliasModelsForTest(t *testing.T) map[string]Model {
+	t.Helper()
+
+	pm := GetProviderManager()
+	if pm == nil {
+		t.Fatal("provider manager is nil")
+	}
+
+	aliasModels := map[string]Model{}
+	for _, model := range pm.AllModels {
+		if !strings.HasPrefix(model.Name, "deepseek-") {
+			continue
+		}
+		for _, alias := range model.Alias {
+			if alias == "" {
+				continue
+			}
+			if existing, ok := aliasModels[alias]; ok {
+				t.Fatalf("duplicate DeepSeek alias %q for %q and %q", alias, existing.Name, model.Name)
+			}
+			aliasModels[alias] = model
+		}
+	}
+	if len(aliasModels) == 0 {
+		t.Fatal("no DeepSeek aliases found in all_models.json")
+	}
+	return aliasModels
+}
+
+func TestGiteeListModelsMapsAllDeepSeekAliasesToModelMetadata(t *testing.T) {
+	withSSRFBypass(t)
+	ctx := t.Context()
+	initProviderManagerWithGiteeForTest(t)
+	aliasModels := deepSeekAliasModelsForTest(t)
+	aliases := make([]string, 0, len(aliasModels))
+	for alias := range aliasModels {
+		aliases = append(aliases, alias)
+	}
+	sort.Strings(aliases)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("method=%s, want GET", r.Method)
+		}
+		if r.URL.Path != "/models" {
+			t.Errorf("path=%s, want /models", r.URL.Path)
+		}
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("Content-Type=%q, want application/json", got)
+		}
+
+		resp := ModelList{
+			Object: "list",
+			Models: make([]ModelListItem, 0, len(aliases)+1),
+		}
+		for _, alias := range aliases {
+			resp.Models = append(resp.Models, ModelListItem{ID: alias})
+		}
+		resp.Models = append(resp.Models, ModelListItem{ID: "unknown-model"})
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	models, err := newGiteeForListModelsTest(srv.URL).ListModels(ctx, &APIConfig{})
+	if err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+	if got, want := len(models), len(aliases)+1; got != want {
+		t.Fatalf("len(models)=%d, want %d", got, want)
+	}
+
+	for i, alias := range aliases {
+		model := models[i]
+		expected := aliasModels[alias]
+		if model.Name != alias {
+			t.Fatalf("models[%d].Name=%q, want %q", i, model.Name, alias)
+		}
+		if (model.MaxOutput == nil) != (expected.MaxOutput == nil) {
+			t.Fatalf("models[%d] alias %q MaxOutput nil=%t, want nil=%t", i, alias, model.MaxOutput == nil, expected.MaxOutput == nil)
+		}
+		if model.MaxOutput != nil && expected.MaxOutput != nil && *model.MaxOutput != *expected.MaxOutput {
+			t.Fatalf("models[%d] alias %q MaxOutput=%d, want %d", i, alias, *model.MaxOutput, *expected.MaxOutput)
+		}
+		expectedModelTypes := normalizeModelTypes(expected.ModelTypes)
+		if strings.Join(model.ModelTypes, ",") != strings.Join(expectedModelTypes, ",") {
+			t.Fatalf("models[%d] alias %q ModelTypes=%v, want %v", i, alias, model.ModelTypes, expectedModelTypes)
+		}
+		if (model.Thinking == nil) != (expected.Thinking == nil) {
+			t.Fatalf("models[%d] alias %q Thinking nil=%t, want nil=%t", i, alias, model.Thinking == nil, expected.Thinking == nil)
+		}
+	}
+
+	unknown := models[len(models)-1]
+	if unknown.Name != "unknown-model" {
+		t.Fatalf("unknown.Name=%q, want unknown-model", unknown.Name)
+	}
+	if unknown.MaxOutput != nil {
+		t.Fatalf("unknown.MaxOutput=%v, want nil", *unknown.MaxOutput)
+	}
+	// Catalog misses fall back to name-based inference, which defaults to
+	// chat — remote entries must never surface type-less.
+	if len(unknown.ModelTypes) != 1 || unknown.ModelTypes[0] != "chat" {
+		t.Fatalf("unknown.ModelTypes=%v, want [chat]", unknown.ModelTypes)
+	}
+}
+
+func TestGiteeListModelsKeepsModelNameAfterAliasMetadataLookup(t *testing.T) {
+	withSSRFBypass(t)
+	ctx := t.Context()
+	initProviderManagerWithGiteeForTest(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"deepseek/deepseek-v4-pro","owned_by":"gitee"}]}`)
+	}))
+	defer srv.Close()
+
+	models, err := newGiteeForListModelsTest(srv.URL).ListModels(ctx, &APIConfig{})
+	if err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+	if len(models) != 1 {
+		t.Fatalf("len(models)=%d, want 1", len(models))
+	}
+	model := models[0]
+	if model.Name != "deepseek/deepseek-v4-pro" {
+		t.Fatalf("Name=%q, want deepseek/deepseek-v4-pro", model.Name)
+	}
+	if model.MaxOutput == nil || *model.MaxOutput != 393216 {
+		t.Fatalf("MaxOutput=%v, want 393216", model.MaxOutput)
+	}
+	if len(model.ModelTypes) != 1 || model.ModelTypes[0] != "chat" {
+		t.Fatalf("ModelTypes=%v, want [chat]", model.ModelTypes)
+	}
+	if model.Thinking == nil {
+		t.Fatal("Thinking=nil, want DeepSeek V4 Pro thinking metadata")
+	}
+}
+
+func TestGiteeListModelsIntegration(t *testing.T) {
+	withSSRFBypass(t)
+	ctx := t.Context()
+	if common.GetEnv(common.EnvGiteeListModelsIntegration) != "1" {
+		t.Skip("set GITEE_LIST_MODELS_INTEGRATION=1 to call the real Gitee models endpoint")
+	}
+
+	initProviderManagerWithGiteeForTest(t)
+
+	baseURL := common.GetEnv(common.EnvGiteeBaseUrl)
+	if baseURL == "" {
+		baseURL = "https://api.moark.ai/v1"
+	}
+	apiConfig := &APIConfig{}
+	if apiKey := common.GetEnv(common.EnvGiteeAPIKey); apiKey != "" {
+		apiConfig.ApiKey = &apiKey
+	}
+
+	models, err := newGiteeForListModelsTest(baseURL).ListModels(ctx, apiConfig)
+	if err != nil {
+		t.Fatalf("real Gitee ListModels: %v", err)
+	}
+	if len(models) == 0 {
+		t.Fatal("real Gitee ListModels returned no models")
+	}
+
+	var matchedDeepSeek int
+	for _, model := range models {
+		if strings.Contains(strings.ToLower(model.Name), "deepseek") && len(model.ModelTypes) > 0 {
+			matchedDeepSeek++
+		}
+	}
+	if matchedDeepSeek == 0 {
+		t.Fatalf("real Gitee ListModels returned %d models but none of the DeepSeek models mapped to all_models metadata: %s", len(models), fmt.Sprint(models))
+	}
+}

@@ -7,17 +7,16 @@ import {
   FormLabel,
   FormMessage,
 } from '@/components/ui/form';
+import { NumberInput } from '@/components/ui/input';
 import {
   useFetchKnowledgeBaseConfiguration,
   useFetchTagListByKnowledgeIds,
 } from '@/hooks/use-knowledge-request';
-import { useIsGoBackend } from '@/utils/backend-variant';
 import { CircleMinus, Plus } from 'lucide-react';
 import { useCallback, useEffect, useMemo } from 'react';
 import { useFieldArray, useFormContext } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
 import { FormListItem } from '../../utils';
-import NumberInput from '@/components/originui/number-input';
 
 const FieldKey = 'tag_feas';
 
@@ -25,25 +24,19 @@ export const TagFeatureItem = () => {
   const { t } = useTranslation();
   const { setKnowledgeIds, list } = useFetchTagListByKnowledgeIds();
   const { data: knowledgeConfiguration } = useFetchKnowledgeBaseConfiguration();
-  const isGoBackend = useIsGoBackend();
   const form = useFormContext();
   const tagKnowledgeIds = useMemo(() => {
     const configuredIds =
       knowledgeConfiguration?.parser_config?.tag_kb_ids ?? [];
-    // The Go ingestion pipeline keeps the tag vocabulary on the dataset's own
+    // The ingestion pipeline keeps the tag vocabulary on the dataset's own
     // chunks and never writes tag-set references into parser_config.tag_kb_ids,
-    // so fall back to aggregating the current dataset's tags through the Go
+    // so fall back to aggregating the current dataset's tags through the
     // aggregation endpoint (GET /datasets/tags/aggregation).
-    if (
-      isGoBackend &&
-      configuredIds.length === 0 &&
-      knowledgeConfiguration?.id
-    ) {
+    if (configuredIds.length === 0 && knowledgeConfiguration?.id) {
       return [knowledgeConfiguration.id];
     }
     return configuredIds;
   }, [
-    isGoBackend,
     knowledgeConfiguration?.id,
     knowledgeConfiguration?.parser_config?.tag_kb_ids,
   ]);
@@ -147,10 +140,6 @@ export const TagFeatureItem = () => {
                               )}
                               max={10}
                               min={1}
-                              hideIcons
-                              integer
-                              className="!h-full !m-0"
-                              inputClassName="!h-full"
                             />
                           </FormControl>
                           <FormMessage />

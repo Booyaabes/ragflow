@@ -1,0 +1,120 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
+package utility
+
+import (
+	"fmt"
+	"ragflow/internal/common"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"go.uber.org/zap"
+)
+
+// ScheduledTask represents a periodic task
+type ScheduledTask struct {
+	Name      string
+	Interval  time.Duration
+	Job       func()
+	stop      chan struct{}
+	mu        sync.Mutex
+	running   bool
+	executing int32 // atomic flag: 0 - not executed, 1 running
+}
+
+// NewScheduledTask creates a new simple task
+func NewScheduledTask(name string, interval time.Duration, job func()) *ScheduledTask {
+	return &ScheduledTask{
+		Name:     name,
+		Interval: interval,
+		Job:      job,
+	}
+}
+
+// Start begins the periodic task
+func (t *ScheduledTask) Start() {
+	t.mu.Lock()
+	if t.running {
+		t.mu.Unlock()
+		return
+	}
+	stop := make(chan struct{})
+	t.stop = stop
+	t.running = true
+	t.mu.Unlock()
+
+	t.runSafely()
+
+	go func(stop <-chan struct{}) {
+		ticker := time.NewTicker(t.Interval)
+		defer ticker.Stop()
+
+		common.Info("Task started", zap.String("name", t.Name))
+
+		for {
+			select {
+			case <-ticker.C:
+				t.runSafely()
+			case <-stop:
+				common.Info("Task stopped", zap.String("name", t.Name))
+				return
+			}
+		}
+	}(stop)
+}
+
+// runSafely executes the job with panic recovery and prevents overlap
+func (t *ScheduledTask) runSafely() {
+	// Attempt to set the flag
+	if !atomic.CompareAndSwapInt32(&t.executing, 0, 1) {
+		common.Warn("Task skipped - previous execution still running", zap.String("name", t.Name))
+		return
+	}
+
+	// Clear atomic flag after execution
+	defer atomic.StoreInt32(&t.executing, 0)
+
+	defer func() {
+		if r := recover(); r != nil {
+			// A periodic job must never take the whole service down: log the panic
+			// and let the next tick run. common.Fatal would call os.Exit(1), which
+			// turns one bad tick into an outage for every tenant on this process.
+			common.Error("Task panicked", fmt.Errorf("panic: %v", r), zap.String("name", t.Name), zap.Any("recover", r))
+		}
+	}()
+
+	t.Job()
+}
+
+// Stop stops the periodic task
+func (t *ScheduledTask) Stop() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if !t.running {
+		return
+	}
+	t.running = false
+	close(t.stop)
+	t.stop = nil
+}
+
+// IsExecuting returns whether the task is currently executing
+func (t *ScheduledTask) IsExecuting() bool {
+	return atomic.LoadInt32(&t.executing) == 1
+}
