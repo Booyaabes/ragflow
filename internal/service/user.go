@@ -1,0 +1,822 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
+package service
+
+import (
+	"context"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/base64"
+	"encoding/hex"
+	"fmt"
+	"hash"
+	"ragflow/internal/common"
+	"ragflow/internal/engine/kvrocks"
+	"ragflow/internal/entity"
+	"ragflow/internal/server"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/pkg/errors"
+
+	"golang.org/x/crypto/pbkdf2"
+	"golang.org/x/crypto/scrypt"
+	"gorm.io/gorm"
+
+	"ragflow/internal/dao"
+	"ragflow/internal/service/billing"
+)
+
+// UserService user service
+type UserService struct {
+	userDAO *dao.UserDAO
+}
+
+// AuthIdentity contains the identity resolved from a user token or API key.
+type AuthIdentity struct {
+	User     *entity.User
+	TenantID string
+	APIToken *entity.APIToken
+}
+
+// NewUserService create user service
+func NewUserService() *UserService {
+	return &UserService{
+		userDAO: dao.NewUserDAO(),
+	}
+}
+
+// RegisterRequest registration request
+type RegisterRequest struct {
+	Email    string `json:"email" binding:"required,email"`
+	Password string `json:"password" binding:"required,min=1"`
+	Nickname string `json:"nickname" binding:"required"`
+}
+
+// LoginRequest login request
+type LoginRequest struct {
+	Username string `json:"username" binding:"required"`
+	Password string `json:"password" binding:"required"`
+}
+
+// EmailLoginRequest email login request
+type EmailLoginRequest struct {
+	Email    string `json:"email" binding:"required,email"`
+	Password string `json:"password" binding:"required"`
+}
+
+// UpdateSettingsRequest update user settings request
+type UpdateSettingsRequest struct {
+	Nickname    *string `json:"nickname,omitempty"`
+	Avatar      *string `json:"avatar,omitempty"`
+	Language    *string `json:"language,omitempty"`
+	ColorSchema *string `json:"color_schema,omitempty"`
+	Timezone    *string `json:"timezone,omitempty"`
+	Password    *string `json:"password,omitempty"`
+	NewPassword *string `json:"new_password,omitempty"`
+}
+
+// ChangePasswordRequest change password request
+type ChangePasswordRequest struct {
+	Password    *string `json:"password,omitempty"`
+	NewPassword *string `json:"new_password,omitempty"`
+}
+
+// UserResponse user response
+type UserResponse struct {
+	ID        string  `json:"id"`
+	Email     string  `json:"email"`
+	Nickname  string  `json:"nickname"`
+	Status    *string `json:"status"`
+	CreatedAt string  `json:"created_at"`
+}
+
+// Register user registration
+func (s *UserService) Register(ctx context.Context, req *RegisterRequest) (*entity.User, common.ErrorCode, error) {
+	cfg := server.GetConfig()
+	if !cfg.EnableRegister() {
+		return nil, common.CodeOperatingError, fmt.Errorf("user registration is disabled")
+	}
+
+	emailRegex := regexp.MustCompile(`^[\w\._-]+@([\w_-]+\.)+[\w-]{2,}$`)
+	if !emailRegex.MatchString(req.Email) {
+		return nil, common.CodeOperatingError, fmt.Errorf("invalid email address: %s", req.Email)
+	}
+	req.Nickname = strings.TrimSpace(req.Nickname)
+	if err := common.ValidateNameRunes(req.Nickname, common.NicknameLimit); err != nil {
+		return nil, common.CodeDataError, err
+	}
+
+	existUser, err := s.userDAO.GetByEmail(ctx, dao.DB, req.Email)
+	if existUser != nil {
+		return nil, common.CodeOperatingError, fmt.Errorf("email: %s has already registered", req.Email)
+	}
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, common.CodeServerError, fmt.Errorf("failed to check existing user: %w", err)
+	}
+
+	decryptedPassword, err := common.DecryptPassword(req.Password)
+	if err != nil {
+		return nil, common.CodeExceptionError, err
+	}
+
+	var hashedPassword string
+	hashedPassword, err = common.GenerateWerkzeugPasswordHash(decryptedPassword)
+	if err != nil {
+		return nil, common.CodeServerError, fmt.Errorf("failed to hash password: %w", err)
+	}
+
+	userID := common.GenerateToken()
+	accessToken := common.GenerateToken()
+	status := "1"
+	loginChannel := "password"
+	isSuperuser := false
+	language := defaultUserLanguage()
+	colorSchema := "Bright"
+	timezone := "UTC+8\tAsia/Shanghai"
+
+	now := time.Now().Truncate(time.Second)
+	user := &entity.User{
+		ID:              userID,
+		AccessToken:     &accessToken,
+		Email:           req.Email,
+		Nickname:        req.Nickname,
+		Password:        &hashedPassword,
+		Status:          &status,
+		Language:        &language,
+		ColorSchema:     &colorSchema,
+		Timezone:        &timezone,
+		IsActive:        "1",
+		IsAuthenticated: "1",
+		IsAnonymous:     "0",
+		LastLoginTime:   &now,
+		LoginChannel:    &loginChannel,
+		IsSuperuser:     &isSuperuser,
+	}
+
+	tenantName := req.Nickname + "'s Kingdom"
+
+	llmID := cfg.GetDefaultChatModel().Name
+	if llmID == "" {
+		llmID = ""
+	}
+	embdID := cfg.GetDefaultEmbeddingModel().Name
+	if embdID == "" {
+		embdID = ""
+	}
+	asrID := cfg.GetDefaultASRModel().Name
+	if asrID == "" {
+		asrID = ""
+	}
+	img2txtID := cfg.GetDefaultVisionModel().Name
+	if img2txtID == "" {
+		img2txtID = ""
+	}
+	rerankID := cfg.GetDefaultRerankModel().Name
+	if rerankID == "" {
+		rerankID = ""
+	}
+	ttsID := cfg.GetDefaultTTSModel().Name
+	if ttsID == "" {
+		ttsID = ""
+	}
+	ocrID := cfg.GetDefaultOCRModel().Name
+	if ocrID == "" {
+		ocrID = ""
+	}
+
+	tenant := &entity.Tenant{
+		ID:        userID,
+		Name:      &tenantName,
+		ParserIDs: "naive:General,qa:Q&A,manual:Manual,table:Table,paper:Research Paper,book:Book,laws:Laws,presentation:Presentation,picture:Picture,one:One,audio:Audio,email:Email,tag:Tag",
+		Status:    &status,
+	}
+	userTenantID := common.GenerateToken()
+	userTenant := &entity.UserTenant{
+		ID:        userTenantID,
+		UserID:    userID,
+		TenantID:  userID,
+		Role:      "owner",
+		InvitedBy: userID,
+		Status:    &status,
+		LLMID:     llmID,
+		EmbdID:    embdID,
+		ASRID:     asrID,
+		Img2TxtID: img2txtID,
+		RerankID:  rerankID,
+		TTSID:     &ttsID,
+		OCRID:     &ocrID,
+	}
+	fileID := common.GenerateToken()
+	file__ := ""
+	rootFile := &entity.File{
+		ID:        fileID,
+		ParentID:  fileID,
+		UserID:    userID,
+		TenantID:  userID,
+		CreatedBy: userID,
+		Name:      "/",
+		Type:      "folder",
+		Location:  &file__,
+		Size:      0,
+	}
+
+	db := dao.GetDB()
+	tenantDAO := dao.NewTenantDAO()
+	if err = db.Transaction(func(tx *gorm.DB) error {
+		if err = tx.Create(user).Error; err != nil {
+			return fmt.Errorf("failed to create user: %w", err)
+		}
+		if err = dao.ApplyDefaultTenantInviteEnabled(ctx, tx, tenant); err != nil {
+			return fmt.Errorf("failed to initialize tenant invitation setting: %w", err)
+		}
+
+		if err = tenantDAO.Create(ctx, tx, tenant); err != nil {
+			return fmt.Errorf("failed to create tenant: %w", err)
+		}
+
+		if err = tx.Create(userTenant).Error; err != nil {
+			return fmt.Errorf("failed to create user tenant relation: %w", err)
+		}
+
+		if err = tx.Create(rootFile).Error; err != nil {
+			return fmt.Errorf("failed to create root folder: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return nil, common.CodeServerError, fmt.Errorf("fail to create transaction: %w", err)
+	}
+	return user, common.CodeSuccess, nil
+}
+
+// Login user login
+func (s *UserService) Login(ctx context.Context, req *LoginRequest) (*entity.User, common.ErrorCode, error) {
+	// Get user by email (using username field as email)
+	user, err := s.userDAO.GetByEmail(ctx, dao.DB, req.Username)
+	if err != nil {
+		return nil, common.CodeAuthenticationError, fmt.Errorf("invalid email or password")
+	}
+
+	// Decrypt password using RSA
+	decryptedPassword, err := common.DecryptPassword(req.Password)
+	if err != nil {
+		return nil, common.CodeServerError, fmt.Errorf("failed to decrypt password: %w", err)
+	}
+
+	// Verify password
+	if user.Password == nil || !s.VerifyPassword(*user.Password, decryptedPassword) {
+		return nil, common.CodeAuthenticationError, fmt.Errorf("invalid username or password")
+	}
+
+	if user.Status == nil || *user.Status != "1" {
+		return nil, common.CodeForbidden, fmt.Errorf("user is disabled")
+	}
+
+	// Generate new access token
+	token := common.GenerateToken()
+	user.AccessToken = &token
+	now := time.Now().Truncate(time.Second)
+	user.LastLoginTime = &now
+	if err := s.userDAO.Update(ctx, dao.DB, user); err != nil {
+		return nil, common.CodeServerError, fmt.Errorf("failed to update user: %w", err)
+	}
+	if billingService := billing.Get(); billingService != nil && billingService.Enabled() {
+		billingService.SyncLoginTokenRateLimit(ctx, user.ID, token)
+	}
+
+	return user, common.CodeSuccess, nil
+}
+
+// LoginByEmail user login by email
+// Returns user on success, or error with specific code:
+// - CodeAuthenticationError (109): Email not registered or password mismatch
+// - CodeServerError (500): Password decryption failure
+// - CodeForbidden (403): Account disabled
+func (s *UserService) LoginByEmail(ctx context.Context, req *EmailLoginRequest) (*entity.User, common.ErrorCode, error) {
+	user, err := s.userDAO.GetByEmail(ctx, dao.DB, req.Email)
+	if err != nil {
+		common.Error("user not found by email", err)
+		return nil, common.CodeAuthenticationError, fmt.Errorf("email: %s is not registered", req.Email)
+	}
+
+	decryptedPassword, err := common.DecryptPassword(req.Password)
+	if err != nil {
+		return nil, common.CodeServerError, fmt.Errorf("fail to crypt password")
+	}
+
+	if user.Password == nil || !s.VerifyPassword(*user.Password, decryptedPassword) {
+		return nil, common.CodeAuthenticationError, fmt.Errorf("email and password do not match")
+	}
+
+	if user.IsActive == "0" {
+		return nil, common.CodeForbidden, fmt.Errorf("this account has been disabled, please contact the administrator")
+	}
+
+	// Generate new access token
+	token := common.GenerateToken()
+	user.AccessToken = &token
+	now := time.Now().Truncate(time.Second)
+	user.LastLoginTime = &now
+
+	if err = s.userDAO.Update(ctx, dao.DB, user); err != nil {
+		return nil, common.CodeServerError, fmt.Errorf("failed to update user: %w", err)
+	}
+	if billingService := billing.Get(); billingService != nil && billingService.Enabled() {
+		billingService.SyncLoginTokenRateLimit(ctx, user.ID, token)
+	}
+
+	return user, common.CodeSuccess, nil
+}
+
+// GetUserByID get user by ID (a 32-char hex UUID string).
+func (s *UserService) GetUserByID(ctx context.Context, id string) (*UserResponse, common.ErrorCode, error) {
+	user, err := s.userDAO.GetByID(ctx, dao.DB, id)
+	if err != nil {
+		return nil, common.CodeNotFound, err
+	}
+
+	return &UserResponse{
+		ID:       user.ID,
+		Email:    user.Email,
+		Nickname: user.Nickname,
+		Status:   user.Status,
+		CreatedAt: func() string {
+			if user.CreateTime != nil {
+				return time.Unix(*user.CreateTime, 0).Format("2006-01-02 15:04:05")
+			}
+			return ""
+		}(),
+	}, common.CodeSuccess, nil
+}
+
+// VerifyPassword verify password
+// Supports both werkzeug pbkdf2 format (pbkdf2:sha256:iterations$salt$hash) and scrypt format
+func (s *UserService) VerifyPassword(hashedPassword, password string) bool {
+	// Check if it's pbkdf2 format (werkzeug)
+	if strings.HasPrefix(hashedPassword, "pbkdf2:") {
+		return s.verifyPBKDF2Password(hashedPassword, password)
+	}
+
+	// Check if it's scrypt format
+	if strings.HasPrefix(hashedPassword, "scrypt:") {
+		return s.verifyScryptPassword(hashedPassword, password)
+	}
+
+	return false
+}
+
+// verifyPBKDF2Password verifies password using PBKDF2 (werkzeug format)
+// Format: pbkdf2:sha256:iterations$salt$hash
+func (s *UserService) verifyPBKDF2Password(hashedPassword, password string) bool {
+	parts := strings.Split(hashedPassword, "$")
+	if len(parts) != 3 {
+		return false
+	}
+
+	// Parse method (e.g., "pbkdf2:sha256:150000")
+	methodParts := strings.Split(parts[0], ":")
+	if len(methodParts) != 3 {
+		return false
+	}
+
+	if methodParts[0] != "pbkdf2" {
+		return false
+	}
+
+	var hashFunc func() hash.Hash
+	switch methodParts[1] {
+	case "sha256":
+		hashFunc = sha256.New
+	case "sha512":
+		hashFunc = sha512.New
+	default:
+		return false
+	}
+
+	iterations, err := strconv.Atoi(methodParts[2])
+	if err != nil {
+		return false
+	}
+
+	salt := parts[1]
+	expectedHash := parts[2]
+
+	// Decode salt from base64
+	saltBytes, err := base64.StdEncoding.DecodeString(salt)
+	if err != nil {
+		// Try hex encoding
+		saltBytes, err = hex.DecodeString(salt)
+		if err != nil {
+			return false
+		}
+	}
+
+	// Generate hash using PBKDF2
+	key := pbkdf2.Key([]byte(password), saltBytes, iterations, 32, hashFunc)
+	computedHash := base64.StdEncoding.EncodeToString(key)
+
+	return computedHash == expectedHash
+}
+
+// verifyScryptPassword verifies password using scrypt format
+// Format: scrypt:n:r:p$base64(salt)$hex(hash)
+// IMPORTANT: werkzeug uses the base64-encoded salt string as UTF-8 bytes, NOT the decoded bytes
+func (s *UserService) verifyScryptPassword(hashedPassword, password string) bool {
+	// Parse hash format: scrypt:n:r:p$base64(salt)$hex(hash)
+	parts := strings.Split(hashedPassword, "$")
+	if len(parts) != 3 {
+		return false
+	}
+
+	params := strings.Split(parts[0], ":")
+	if len(params) != 4 || params[0] != "scrypt" {
+		return false
+	}
+
+	n, err := strconv.ParseUint(params[1], 10, 0)
+	if err != nil {
+		return false
+	}
+	r, err := strconv.ParseUint(params[2], 10, 0)
+	if err != nil {
+		return false
+	}
+	p, err := strconv.ParseUint(params[3], 10, 0)
+	if err != nil {
+		return false
+	}
+
+	saltB64 := parts[1]
+	hashHex := parts[2]
+
+	// IMPORTANT: werkzeug uses the base64 string as UTF-8 bytes, NOT decoded bytes
+	// This is the key difference from standard implementations
+	salt := []byte(saltB64)
+
+	// Decode expected hash from hex
+	expectedHash, err := hex.DecodeString(hashHex)
+	if err != nil {
+		return false
+	}
+
+	// Compute password hash
+	computed, err := scrypt.Key([]byte(password), salt, int(n), int(r), int(p), len(expectedHash))
+	if err != nil {
+		return false
+	}
+
+	// Constant time comparison
+	return s.constantTimeCompare(expectedHash, computed)
+}
+
+// constantTimeCompare constant time comparison
+func (s *UserService) constantTimeCompare(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	var result byte
+	for i := 0; i < len(a); i++ {
+		result |= a[i] ^ b[i]
+	}
+
+	return result == 0
+}
+
+func defaultUserLanguage() string {
+	if strings.Contains(common.GetEnv(common.EnvLang), "zh_CN") {
+		return "Chinese"
+	}
+	return "English"
+}
+
+// ResolveAccessToken validates a signed user token and returns its identity
+// and tenant context.
+func (s *UserService) ResolveAccessToken(ctx context.Context, authorization string) (*AuthIdentity, common.ErrorCode, error) {
+	// Get secret key from config
+	secretKey, err := server.GetSecretKey(ctx, kvrocks.Get())
+	if err != nil {
+		return nil, common.CodeUnauthorized, err
+	}
+
+	tokenContext, err := common.ExtractAccessTokenContext(authorization, secretKey)
+	if err != nil {
+		return nil, common.CodeUnauthorized, fmt.Errorf("invalid authorization token: %w", err)
+	}
+
+	// Validate token format (should be at least 32 chars, UUID format)
+	if len(tokenContext.AccessToken) < 32 {
+		return nil, common.CodeUnauthorized, fmt.Errorf("invalid access token format")
+	}
+
+	// Get user by access token
+	user, err := s.userDAO.GetByAccessToken(ctx, dao.DB, tokenContext.AccessToken)
+	if err != nil {
+		return nil, common.CodeUnauthorized, err
+	}
+
+	tenantID, err := resolveUserAuthTenant(ctx, user, tokenContext.TenantID)
+	if err != nil {
+		return nil, common.CodeUnauthorized, err
+	}
+
+	return &AuthIdentity{User: user, TenantID: tenantID}, common.CodeSuccess, nil
+}
+
+// UpdateUserAccessToken updates user's access token
+func (s *UserService) UpdateUserAccessToken(ctx context.Context, user *entity.User, token string) error {
+	return s.userDAO.UpdateAccessToken(ctx, dao.DB, user, token)
+}
+
+// Logout invalidates user's access token
+func (s *UserService) Logout(ctx context.Context, user *entity.User) (common.ErrorCode, error) {
+	// Invalidate token by setting it to an invalid value
+	// Similar to Python implementation: "INVALID_" + secrets.token_hex(16)
+	invalidToken := "INVALID_" + common.GenerateToken()
+	err := s.UpdateUserAccessToken(ctx, user, invalidToken)
+	if err != nil {
+		return common.CodeServerError, err
+	}
+	return common.CodeSuccess, nil
+}
+
+// GetUserProfile returns user profile information
+func (s *UserService) GetUserProfile(ctx context.Context, user *entity.User) map[string]interface{} {
+	// Format create time and date (from database fields)
+	createTime := user.CreateTime
+	createDate := ""
+	if user.CreateDate != nil {
+		createDate = user.CreateDate.Format("2006-01-02T15:04:05")
+	}
+
+	// Format update time and date (from database fields)
+	var updateTime int64
+	updateDate := ""
+	if user.UpdateTime != nil {
+		updateTime = *user.UpdateTime
+	}
+	if user.UpdateDate != nil {
+		updateDate = user.UpdateDate.Format("2006-01-02T15:04:05")
+	}
+
+	// Format last login time
+	var lastLoginTime string
+	if user.LastLoginTime != nil {
+		lastLoginTime = user.LastLoginTime.Format("2006-01-02T15:04:05")
+	}
+
+	// Get avatar
+	var avatar interface{}
+	if user.Avatar != nil {
+		avatar = *user.Avatar
+	} else {
+		avatar = nil
+	}
+
+	// Get color schema
+	colorSchema := "Bright"
+	if user.ColorSchema != nil && *user.ColorSchema != "" {
+		colorSchema = *user.ColorSchema
+	}
+
+	// Get language
+	language := defaultUserLanguage()
+	if user.Language != nil && *user.Language != "" {
+		language = *user.Language
+	}
+
+	// Get timezone
+	timezone := "UTC+8\tAsia/Shanghai"
+	if user.Timezone != nil && *user.Timezone != "" {
+		timezone = *user.Timezone
+	}
+
+	// Get login channel
+	loginChannel := "password"
+	if user.LoginChannel != nil && *user.LoginChannel != "" {
+		loginChannel = *user.LoginChannel
+	}
+
+	// Get status
+	status := "1"
+	if user.Status != nil {
+		status = *user.Status
+	}
+
+	// Get is_superuser
+	isSuperuser := false
+	if user.IsSuperuser != nil {
+		isSuperuser = *user.IsSuperuser
+	}
+
+	// NOTE: access_token and password (hash) are intentionally omitted. This map
+	// is serialized into user-facing API responses (login/register/oauth/profile);
+	// the auth token is delivered via the Authorization header + cookie, not here.
+	return map[string]interface{}{
+		"avatar":           avatar,
+		"color_schema":     colorSchema,
+		"create_date":      createDate,
+		"create_time":      createTime,
+		"email":            user.Email,
+		"id":               user.ID,
+		"is_active":        user.IsActive,
+		"is_anonymous":     user.IsAnonymous,
+		"is_authenticated": user.IsAuthenticated,
+		"is_superuser":     isSuperuser,
+		"language":         language,
+		"last_login_time":  lastLoginTime,
+		"login_channel":    loginChannel,
+		"nickname":         user.Nickname,
+		"status":           status,
+		"timezone":         timezone,
+		"update_date":      updateDate,
+		"update_time":      updateTime,
+	}
+}
+
+// UpdateUserSettings updates user settings
+func (s *UserService) UpdateUserSettings(ctx context.Context, user *entity.User, req *UpdateSettingsRequest) (common.ErrorCode, error) {
+	// Update fields if provided
+	if req.Password != nil {
+		ciphertext, err := base64.StdEncoding.DecodeString(*req.Password)
+		if err != nil {
+			return common.CodeExceptionError, fmt.Errorf("Error('Incorrect padding')")
+		}
+		privateKey, err := common.LoadPrivateKey()
+		if err != nil {
+			return common.CodeExceptionError, err
+		}
+		oldPasswordBytes, err := rsa.DecryptPKCS1v15(nil, privateKey, ciphertext)
+		oldPassword := "Fail to decrypt password!"
+		if err == nil {
+			oldPassword = string(oldPasswordBytes)
+		}
+		if user.Password == nil || !s.VerifyPassword(*user.Password, oldPassword) {
+			return common.CodeAuthenticationError, fmt.Errorf("password error")
+		}
+
+		if req.NewPassword != nil {
+			ciphertext, err = base64.StdEncoding.DecodeString(*req.NewPassword)
+			if err != nil {
+				return common.CodeExceptionError, fmt.Errorf("Error('Incorrect padding')")
+			}
+			var newPasswordBytes []byte
+			newPasswordBytes, err = rsa.DecryptPKCS1v15(nil, privateKey, ciphertext)
+			if err != nil {
+				return common.CodeExceptionError, err
+			}
+
+			var hashedPassword string
+			hashedPassword, err = common.GenerateWerkzeugPasswordHash(string(newPasswordBytes))
+			if err != nil {
+				return common.CodeExceptionError, err
+			}
+			user.Password = &hashedPassword
+			invalidToken := "INVALID_" + common.GenerateToken()
+			user.AccessToken = &invalidToken
+		}
+	}
+	if req.Nickname != nil {
+		nickname := strings.TrimSpace(*req.Nickname)
+		if err := common.ValidateNameRunes(nickname, common.NicknameLimit); err != nil {
+			return common.CodeDataError, err
+		}
+		user.Nickname = nickname
+	}
+	if req.Avatar != nil {
+		// In Go version, avatar might be stored differently
+		// For now, just update if field exists
+		user.Avatar = req.Avatar
+	}
+	if req.Language != nil {
+		// Store language preference
+		user.Language = req.Language
+	}
+	if req.ColorSchema != nil {
+		// Store color schema preference
+		user.ColorSchema = req.ColorSchema
+	}
+	if req.Timezone != nil {
+		// Store timezone preference
+		user.Timezone = req.Timezone
+	}
+
+	// Save updated user
+	if err := s.userDAO.Update(ctx, dao.DB, user); err != nil {
+		return common.CodeServerError, err
+	}
+	return common.CodeSuccess, nil
+}
+
+// ChangePassword changes user password
+func (s *UserService) ChangePassword(ctx context.Context, user *entity.User, req *ChangePasswordRequest) (common.ErrorCode, error) {
+	// If password is provided, verify current password
+	if req.Password != nil {
+		if user.Password == nil || !s.VerifyPassword(*user.Password, *req.Password) {
+			return common.CodeBadRequest, fmt.Errorf("current password is incorrect")
+		}
+	}
+
+	// If new password is provided, update password
+	if req.NewPassword != nil {
+		hashedPassword, err := common.GenerateWerkzeugPasswordHash(*req.NewPassword)
+		if err != nil {
+			return common.CodeServerError, fmt.Errorf("failed to hash new password: %w", err)
+		}
+		user.Password = &hashedPassword
+		invalidToken := "INVALID_" + common.GenerateToken()
+		user.AccessToken = &invalidToken
+	}
+
+	// Save updated user
+	if err := s.userDAO.Update(ctx, dao.DB, user); err != nil {
+		return common.CodeServerError, err
+	}
+	return common.CodeSuccess, nil
+}
+
+// ResolveAPIToken validates an API key and resolves its authentication identity.
+func (s *UserService) ResolveAPIToken(ctx context.Context, authorization string) (*AuthIdentity, common.ErrorCode, error) {
+	token, err := parseAuthorizationToken(authorization)
+	if err != nil {
+		return nil, common.CodeUnauthorized, err
+	}
+
+	apiToken, err := dao.NewAPITokenDAO().GetByAPIToken(ctx, dao.DB, token)
+	if err != nil || apiToken == nil {
+		return nil, common.CodeUnauthorized, fmt.Errorf("invalid API token")
+	}
+	return s.resolveAPITokenIdentity(ctx, apiToken)
+}
+
+// ResolveBetaAPIToken validates a beta key and resolves its user, tenant, and
+// associated API token metadata.
+func (s *UserService) ResolveBetaAPIToken(ctx context.Context, authorization string) (*AuthIdentity, common.ErrorCode, error) {
+	token, err := parseAuthorizationToken(authorization)
+	if err != nil {
+		return nil, common.CodeUnauthorized, err
+	}
+
+	apiTokens, err := dao.NewAPITokenDAO().GetByBeta(ctx, dao.DB, token)
+	if err != nil || len(apiTokens) == 0 {
+		return nil, common.CodeUnauthorized, fmt.Errorf("invalid beta API token")
+	}
+	return s.resolveAPITokenIdentity(ctx, apiTokens[0])
+}
+
+func (s *UserService) resolveAPITokenIdentity(ctx context.Context, apiToken *entity.APIToken) (*AuthIdentity, common.ErrorCode, error) {
+	if apiToken.UserID == nil || *apiToken.UserID == "" {
+		return nil, common.CodeUnauthorized, fmt.Errorf("API token is missing user identity")
+	}
+
+	user, err := s.userDAO.GetByID(ctx, dao.DB, *apiToken.UserID)
+	if err != nil {
+		return nil, common.CodeUnauthorized, fmt.Errorf("user not found for API token")
+	}
+	if user.AccessToken == nil || *user.AccessToken == "" {
+		return nil, common.CodeUnauthorized, fmt.Errorf("user has empty access_token in database")
+	}
+	tenantID, err := resolveUserAuthTenant(ctx, user, apiToken.TenantID)
+	if err != nil {
+		return nil, common.CodeUnauthorized, err
+	}
+
+	apiTokenMetadata := *apiToken
+	apiTokenMetadata.TenantID = tenantID
+	return &AuthIdentity{User: user, TenantID: tenantID, APIToken: &apiTokenMetadata}, common.CodeSuccess, nil
+}
+
+func parseAuthorizationToken(authorization string) (string, error) {
+	parts := strings.Fields(authorization)
+	switch len(parts) {
+	case 1:
+		if strings.EqualFold(parts[0], "Bearer") {
+			return "", fmt.Errorf("invalid authorization format")
+		}
+		return parts[0], nil
+	case 2:
+		if !strings.EqualFold(parts[0], "Bearer") || parts[1] == "" {
+			return "", fmt.Errorf("invalid authorization format")
+		}
+		return parts[1], nil
+	default:
+		return "", fmt.Errorf("invalid authorization format")
+	}
+}

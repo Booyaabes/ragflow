@@ -1,0 +1,17 @@
+{
+  "name": "MinerU",
+  "url_suffix": {
+    "doc_parse": "file_parse",
+    "task": "tasks"
+  },
+  "url_hint": "http://host.docker.internal:9987",
+  "class": "local",
+  "models": [
+    {
+      "name": "MinerU-model",
+      "model_types": [
+        "ocr"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,389 @@
+package dataset
+
+import (
+	"context"
+	"fmt"
+
+	"ragflow/internal/dao"
+	"ragflow/internal/permission"
+	"slices"
+
+	"go.uber.org/zap"
+
+	"ragflow/internal/common"
+	"ragflow/internal/entity"
+	modelModule "ragflow/internal/entity/models"
+	permissionresponse "ragflow/internal/permission/response"
+	"ragflow/internal/service"
+	"ragflow/internal/service/nlp"
+)
+
+func (d *DatasetService) SearchDataset(ctx context.Context, datasetID string, req *service.SearchDatasetRequest) (*service.SearchDatasetsResponse, error) {
+	if datasetID == "" {
+		return nil, fmt.Errorf("dataset_id is required")
+	}
+	return d.SearchDatasets(ctx, req.ToSearchDatasetsRequest(datasetID))
+}
+
+func (d *DatasetService) SearchDatasets(ctx context.Context, req *service.SearchDatasetsRequest) (*service.SearchDatasetsResponse, error) {
+	if req.Question == "" {
+		return nil, fmt.Errorf("question is required")
+	}
+	if len(req.DatasetIDs) == 0 {
+		return nil, fmt.Errorf("dataset_ids is required")
+	}
+	if err := service.ValidateKnowledgeCompilationScope(req.KnowledgeCompilationScope); err != nil {
+		return nil, err
+	}
+	userID := permission.UserIDFromContext(ctx)
+	common.Info("SearchDatasets started", zap.String("userID", userID), zap.Any("datasets", req.DatasetIDs), zap.String("question", req.Question))
+
+	page := common.DefaultPage
+	if req.Page != nil {
+		page = *req.Page
+	}
+	pageSize := common.DefaultPageSize
+	if req.PageSize != nil {
+		pageSize = *req.PageSize
+	} else if req.Size != nil {
+		pageSize = *req.Size
+	}
+	rerankCandidatesCount := 64
+	if req.RerankCandidatesCount != nil {
+		rerankCandidatesCount = *req.RerankCandidatesCount
+	}
+	useKG := false
+	if req.UseKG != nil {
+		useKG = *req.UseKG
+	}
+	similarityThreshold := 0.2
+	if req.SimilarityThreshold != nil {
+		similarityThreshold = *req.SimilarityThreshold
+	}
+	vectorSimilarityWeight := 0.3
+	if req.VectorSimilarityWeight != nil {
+		vectorSimilarityWeight = *req.VectorSimilarityWeight
+	}
+	knnTopK := 1024
+	if req.KNNTopK != nil {
+		knnTopK = *req.KNNTopK
+	} else if req.TopK != nil {
+		knnTopK = *req.TopK
+	}
+	if knnTopK < 1 {
+		knnTopK = 1
+	} else if knnTopK > 2048 {
+		knnTopK = 2048
+	}
+	knnNumCandidates := 2048
+	if req.KNNNumCandidates != nil {
+		knnNumCandidates = *req.KNNNumCandidates
+	}
+	keyword := false
+	if req.Keyword != nil {
+		keyword = *req.Keyword
+	}
+	searchID := ""
+	if req.SearchID != nil {
+		searchID = *req.SearchID
+	}
+	rerankID := ""
+	if req.RerankID != nil {
+		rerankID = *req.RerankID
+	}
+
+	question := req.Question
+	datasetIDs := req.DatasetIDs
+	metadataFilter := req.MetadataFilter
+	if req.MetadataCondition != nil {
+		manual := make([]interface{}, 0)
+		if conditions, ok := req.MetadataCondition["conditions"].([]interface{}); ok {
+			for _, item := range conditions {
+				if condition, ok := item.(map[string]interface{}); ok {
+					manual = append(manual, map[string]interface{}{"key": condition["name"], "op": condition["comparison_operator"], "value": condition["value"]})
+				}
+			}
+		}
+		metadataFilter = map[string]interface{}{"method": "manual", "logic": req.MetadataCondition["logic"], "manual": manual}
+	}
+	crossLanguages := req.CrossLanguages
+	documentIDs := req.DocumentIDs
+	if documentIDs == nil {
+		documentIDs = req.DocIDs
+	}
+
+	modelFactory := service.NewModelFactory()
+
+	// Access check for all datasets
+	var tenantIDs []string
+	var kbRecords []*entity.Knowledgebase
+	seenTenants := make(map[string]bool)
+	for _, datasetID := range datasetIDs {
+		if err := permission.NewDatabaseChecker(dao.DB).CheckResource(ctx, permission.ResourceRef{Kind: permission.ResourceKindDataset, ID: datasetID}, permission.OperationUse); err != nil {
+			common.Warn("SearchDatasets access denied", zap.String("datasetID", datasetID), zap.String("userID", userID))
+			_, permissionErr := permissionresponse.Normalize(err)
+			return nil, permissionErr
+		}
+
+		kb, err := d.kbDAO.GetByID(ctx, dao.DB, datasetID)
+		if err != nil || kb == nil {
+			common.Warn("SearchDatasets dataset not found", zap.String("datasetID", datasetID))
+			return nil, fmt.Errorf("dataset %s not found", datasetID)
+		}
+		if !seenTenants[kb.TenantID] {
+			seenTenants[kb.TenantID] = true
+			tenantIDs = append(tenantIDs, kb.TenantID)
+		}
+		kbRecords = append(kbRecords, kb)
+	}
+
+	// Check if all kbs have the same embedding model
+	if err := service.ValidateDatasetEmbeddingModels(ctx, dao.DB, kbRecords); err != nil {
+		return nil, err
+	}
+
+	// Override request fields with values from saved search config
+	var chatID string
+	if searchID != "" {
+		if d.searchService == nil {
+			common.Warn("Search service is not initialized for search_id", zap.String("searchID", searchID))
+			return nil, fmt.Errorf("invalid search_id")
+		}
+		searchDetail, err := d.searchService.GetDetail(ctx, searchID)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if permissionresponse.IsPermissionError(err) {
+				return nil, err
+			}
+			common.Warn("Invalid search_id", zap.String("searchID", searchID), zap.Error(err))
+			return nil, fmt.Errorf("invalid search_id")
+		}
+		if searchDetail == nil || len(searchDetail) == 0 {
+			common.Warn("Invalid search_id", zap.String("searchID", searchID))
+			return nil, fmt.Errorf("invalid search_id")
+		}
+		if searchConfig, ok := searchDetail["search_config"].(map[string]interface{}); ok && searchConfig != nil {
+			rerankCandidatesCount = 100
+			if scMetadataFilter, ok := searchConfig["meta_data_filter"].(map[string]interface{}); ok {
+				metadataFilter = scMetadataFilter
+			}
+			if scST, ok := searchConfig["similarity_threshold"].(float64); ok {
+				similarityThreshold = scST
+			}
+			if scVSW, ok := searchConfig["vector_similarity_weight"].(float64); ok {
+				vectorSimilarityWeight = scVSW
+			}
+			if scTopK, ok := searchConfig["top_k"].(float64); ok {
+				knnTopK = int(scTopK)
+				if knnTopK < 1 {
+					knnTopK = 1
+				} else if knnTopK > 2048 {
+					knnTopK = 2048
+				}
+			}
+			if scRerankCandidatesCount, ok := common.GetInt(searchConfig["rerank_candidates_count"]); ok {
+				rerankCandidatesCount = scRerankCandidatesCount
+			}
+			if scUseKG, ok := searchConfig["use_kg"].(bool); ok {
+				useKG = scUseKG
+			}
+			if scLangs, ok := searchConfig["cross_languages"].([]interface{}); ok {
+				crossLanguages = make([]string, len(scLangs))
+				for i, l := range scLangs {
+					if s, ok := l.(string); ok {
+						crossLanguages[i] = s
+					}
+				}
+			}
+			if scKeyword, ok := searchConfig["keyword"].(bool); ok {
+				keyword = scKeyword
+			}
+			if scRerankID, ok := searchConfig["rerank_id"].(string); ok {
+				rerankID = scRerankID
+			}
+			chatID, _ = searchConfig["chat_id"].(string)
+		} else {
+			common.Warn("Invalid search_id: search_config missing or invalid", zap.String("searchID", searchID))
+			return nil, fmt.Errorf("invalid search_id")
+		}
+	}
+	knnNumCandidates = max(knnNumCandidates, knnTopK)
+
+	// If meta_data_filter method is auto/semi_auto, get chat model
+	var chatModelForFilter *modelModule.ChatModel
+	var err error
+	if metadataFilter != nil {
+		method, _ := metadataFilter["method"].(string)
+		if method == "auto" || method == "semi_auto" {
+			modelCtx := permission.WithTenantID(ctx, tenantIDs[0])
+			if chatID != "" {
+				chatModelForFilter, err = modelFactory.NewChatModel(modelCtx, chatID)
+				if err != nil {
+					common.Warn("Failed to get chat model config from search_config chat_id, using tenant default", zap.String("chatID", chatID), zap.Error(err))
+				}
+			}
+
+			if chatModelForFilter == nil {
+				chatModelForFilter, err = modelFactory.NewDefaultChatModel(modelCtx)
+				if err != nil {
+					common.Warn("Failed to get tenant default chat model for meta_data_filter", zap.Error(err))
+				}
+			}
+		}
+	}
+
+	// Apply meta_data_filter to get filtered doc_ids
+	docIDs := make([]string, len(documentIDs))
+	copy(docIDs, documentIDs)
+	if len(metadataFilter) > 0 {
+		metadataSvc := service.NewMetadataService()
+		flattedMeta, err := metadataSvc.GetFlattedMetaByKBs(ctx, datasetIDs)
+		if err != nil {
+			common.Warn("Failed to get flatted metadata, using empty metadata for filter", zap.Error(err))
+			flattedMeta = make(common.MetaData)
+		}
+		// nil means the metadata filter produced no scope at all, so the
+		// request keeps the document scope it came with.
+		if filteredDocIDs := service.ApplyMetaDataFilter(ctx, metadataFilter, flattedMeta, question, chatModelForFilter, documentIDs, datasetIDs); filteredDocIDs != nil {
+			docIDs = filteredDocIDs
+		}
+	}
+
+	// Apply cross_languages and keyword extraction
+	modifiedQuestion := question
+	if len(crossLanguages) > 0 {
+		translated, err := service.CrossLanguages(ctx, tenantIDs[0], "", question, crossLanguages)
+		if err != nil {
+			common.Warn("Failed to translate question", zap.String("llmID", ""), zap.Error(err))
+		} else {
+			modifiedQuestion = translated
+		}
+	}
+	if keyword {
+		chatModel, err := modelFactory.NewDefaultChatModel(permission.WithTenantID(ctx, tenantIDs[0]))
+		if err != nil {
+			common.Warn("Failed to get default chat model for LLM transformations", zap.Error(err))
+		} else {
+			extractedKeywords, err := service.KeywordExtraction(ctx, chatModel, modifiedQuestion, 3)
+			if err != nil {
+				common.Warn("Failed to extract keywords from question", zap.Error(err))
+			} else {
+				modifiedQuestion = service.AppendKeywords(modifiedQuestion, extractedKeywords)
+			}
+		}
+	}
+
+	// Get tag-based rank features via LabelQuestion
+	metadataSvc := service.NewMetadataService()
+	labels := metadataSvc.LabelQuestion(ctx, modifiedQuestion, kbRecords)
+
+	// Determine embedding model
+	var embeddingModel *modelModule.EmbeddingModel
+	if kbRecords[0].EmbdID != "" {
+		embeddingModel, err = modelFactory.NewEmbeddingModel(permission.WithTenantID(ctx, tenantIDs[0]), kbRecords[0].EmbdID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get embedding model by embd_id: %w", err)
+		}
+	}
+
+	// Get rerank model if rerankID is specified
+	var rerankModel *modelModule.RerankModel
+	if rerankID != "" {
+		rerankModel, err = modelFactory.NewRerankModel(permission.WithTenantID(ctx, tenantIDs[0]), rerankID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get rerank model by rerank_id: %w", err)
+		}
+	}
+
+	retrievalReq := &nlp.RetrievalRequest{
+		TenantIDs:              tenantIDs,
+		Question:               modifiedQuestion,
+		KbIDs:                  datasetIDs,
+		DocIDs:                 docIDs,
+		Page:                   page,
+		PageSize:               pageSize,
+		RerankCandidatesCount:  &rerankCandidatesCount,
+		KNNTopK:                &knnTopK,
+		KNNNumCandidates:       &knnNumCandidates,
+		SimilarityThreshold:    &similarityThreshold,
+		VectorSimilarityWeight: &vectorSimilarityWeight,
+		RerankModel:            rerankModel,
+		RankFeature:            &labels,
+		EmbeddingModel:         embeddingModel,
+		Highlight:              req.Highlight,
+		Language:               entity.KnowledgebasesLanguage(kbRecords),
+	}
+	retrievalReq.Filter = knowledgeCompilationFilter(req.IncludeCompiledChunks, req.KnowledgeCompilationScope)
+	if len(docIDs) > 0 && (req.IncludeCompiledChunks == nil || *req.IncludeCompiledChunks) && req.KnowledgeCompilationScope != "document" {
+		// Dataset artifacts use dataset IDs instead of source document IDs.
+		retrievalReq.DocIDs = append(slices.Clone(docIDs), datasetIDs...)
+	}
+
+	retrievalResult, err := nlp.NewRetrievalService(d.docEngine, d.documentDAO).Retrieval(ctx, retrievalReq)
+	if err != nil {
+		return nil, fmt.Errorf("retrieval search failed: %w", err)
+	}
+
+	filteredChunks := retrievalResult.Chunks
+
+	if useKG {
+		common.Warn("use_kg is not yet implemented in Go - skipping KG retrieval")
+	}
+
+	filteredChunks = nlp.RetrievalByChildren(filteredChunks, tenantIDs, d.docEngine, ctx)
+	formatDatasetSearchChunks(filteredChunks, req.IncludeCompiledChunks)
+
+	common.Info("SearchDatasets completed", zap.String("userID", userID), zap.Any("kbID", datasetIDs), zap.String("question", question), zap.Int64("chunkCount", int64(len(filteredChunks))))
+
+	pyChunks := common.ConvertFloatsToPyFormat(filteredChunks).([]map[string]interface{})
+
+	return &service.SearchDatasetsResponse{
+		Chunks:  pyChunks,
+		DocAggs: retrievalResult.DocAggs,
+		Labels:  &labels,
+		Total:   retrievalResult.Total,
+	}, nil
+}
+
+// formatDatasetSearchChunks applies API field names and compilation visibility after parent promotion.
+func formatDatasetSearchChunks(filteredChunks []map[string]interface{}, includeCompiledChunks *bool) {
+	keyMapping := map[string]string{
+		"chunk_id":            "id",
+		"content_with_weight": "content",
+		"doc_id":              "document_id",
+		"important_kwd":       "important_keywords",
+		"question_kwd":        "questions",
+		"docnm_kwd":           "document_keyword",
+		"kb_id":               "dataset_id",
+	}
+	for i := range filteredChunks {
+		if includeCompiledChunks != nil && !*includeCompiledChunks {
+			delete(filteredChunks[i], "compile_kwd")
+		}
+		delete(filteredChunks[i], "vector")
+		for oldKey, newKey := range keyMapping {
+			if value, ok := filteredChunks[i][oldKey]; ok {
+				filteredChunks[i][newKey] = value
+				delete(filteredChunks[i], oldKey)
+			}
+		}
+	}
+}
+
+func knowledgeCompilationFilter(include *bool, scope string) map[string]interface{} {
+	ordinary := map[string]interface{}{"must_not": map[string]interface{}{"exists": "compile_kwd"}}
+	if include != nil && !*include {
+		return ordinary
+	}
+	switch scope {
+	case "all":
+		return nil
+	case "document":
+		scope = "doc"
+	default:
+		scope = "dataset"
+	}
+	return map[string]interface{}{"or": []map[string]interface{}{ordinary, {"scope_kwd": scope}}}
+}

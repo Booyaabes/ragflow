@@ -1,0 +1,431 @@
+package dataset
+
+import (
+	"context"
+	"encoding/json"
+	"math"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"ragflow/internal/dao"
+	"ragflow/internal/entity"
+	modelModule "ragflow/internal/entity/models"
+	"ragflow/internal/service"
+)
+
+// pipelineVersionOutdated reports whether a dataset pinned pipeline version is
+// still the latest of its canvas (design section 6.3 D1/D2/D3). It is purely
+// informational: a non-latest version remains fully usable. BuiltIn datasets or
+// datasets without a pinned version are never outdated.
+func pipelineVersionOutdated(ctx context.Context, pipelineID, versionID *string) bool {
+	if pipelineID == nil || strings.TrimSpace(*pipelineID) == "" || versionID == nil {
+		return false
+	}
+	latest, err := dao.NewUserCanvasVersionDAO().GetLatest(ctx, dao.DB, strings.TrimSpace(*pipelineID))
+	if err != nil || latest == nil {
+		return false
+	}
+	return latest.ID != *versionID
+}
+
+// pipelineVersionOutdatedBatch is the list-endpoint variant of
+// pipelineVersionOutdated. It resolves the latest version id from a precomputed
+// {canvasID: latestVersionID} map (one query for the whole page) instead of a
+// GetLatest per row. A canvas absent from the map has no versions, so a pinned
+// version there is treated as not-outdated (matches the single-row fallback,
+// which returns false when GetLatest finds nothing).
+func pipelineVersionOutdatedBatch(latestByCanvas map[string]string, pipelineID, versionID *string) bool {
+	if pipelineID == nil || strings.TrimSpace(*pipelineID) == "" || versionID == nil {
+		return false
+	}
+	latestID, ok := latestByCanvas[strings.TrimSpace(*pipelineID)]
+	if !ok {
+		return false
+	}
+	return latestID != *versionID
+}
+
+// latestVersionIDsByCanvas resolves the latest version id per canvas for the
+// given knowledgebases in one query, so a dataset list page computes every
+// row's outdated flag without an N+1 of GetLatest calls. Returns nil on error
+// or when no dataset pins a pipeline, letting the mapper treat everything as
+// not-outdated.
+func latestVersionIDsByCanvas(ctx context.Context, kbs []*entity.KnowledgebaseListItem) map[string]string {
+	ids := make([]string, 0, len(kbs))
+	seen := make(map[string]struct{}, len(kbs))
+	for _, kb := range kbs {
+		if kb == nil || kb.PipelineID == nil {
+			continue
+		}
+		id := strings.TrimSpace(*kb.PipelineID)
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	m, err := dao.NewUserCanvasVersionDAO().LatestIDsByCanvasIDs(ctx, dao.DB, ids)
+	if err != nil {
+		return nil
+	}
+	return m
+}
+
+func datasetListItemToMap(latestByCanvas map[string]string, kb *entity.KnowledgebaseListItem) map[string]interface{} {
+	// avatar/language/description keys are always present (null when unset),
+	// matching Python's full-row dict response.
+	item := map[string]interface{}{
+		"id":                         kb.ID,
+		"name":                       kb.Name,
+		"avatar":                     stringPointerValue(kb.Avatar),
+		"language":                   stringPointerValue(kb.Language),
+		"description":                stringPointerValue(kb.Description),
+		"tenant_id":                  kb.TenantID,
+		"permission":                 kb.Permission,
+		"document_count":             kb.DocNum,
+		"token_num":                  kb.TokenNum,
+		"chunk_count":                kb.ChunkNum,
+		"similarity_threshold":       kb.SimilarityThreshold,
+		"keywords_similarity_weight": 1 - kb.VectorSimilarityWeight,
+		"parser_id":                  datasetParserIDForResponse(kb.ParserID),
+		"parser_config":              jsonMapValue(kb.ParserConfig),
+		"pagerank":                   kb.Pagerank,
+		"embedding_model":            kb.EmbdID,
+		"nickname":                   kb.Nickname,
+	}
+	if kb.TenantAvatar != nil {
+		item["tenant_avatar"] = *kb.TenantAvatar
+	}
+	if kb.UpdateTime != nil {
+		item["update_time"] = *kb.UpdateTime
+	}
+	if kb.PipelineID != nil {
+		item["pipeline_id"] = *kb.PipelineID
+	}
+	if kb.PipelineVersionID != nil {
+		item["pipeline_version_id"] = *kb.PipelineVersionID
+	}
+	// Design section 6.3 (! indicator): true when a pinned version is no longer
+	// the latest of its canvas. Purely informational; never blocks parsing.
+	item["pipeline_version_outdated"] = pipelineVersionOutdatedBatch(latestByCanvas, kb.PipelineID, kb.PipelineVersionID)
+	return item
+}
+
+func datasetToMap(ctx context.Context, kb *entity.Knowledgebase) map[string]interface{} {
+	item := map[string]interface{}{
+		"id":                         kb.ID,
+		"tenant_id":                  kb.TenantID,
+		"name":                       kb.Name,
+		"embedding_model":            kb.EmbdID,
+		"permission":                 kb.Permission,
+		"created_by":                 kb.CreatedBy,
+		"document_count":             kb.DocNum,
+		"token_num":                  kb.TokenNum,
+		"chunk_count":                kb.ChunkNum,
+		"similarity_threshold":       kb.SimilarityThreshold,
+		"keywords_similarity_weight": 1 - kb.VectorSimilarityWeight,
+		"parser_id":                  datasetParserIDForResponse(kb.ParserID),
+		"parser_config":              kb.ParserConfig,
+		"pagerank":                   kb.Pagerank,
+		"create_time":                kb.CreateTime,
+	}
+	if kb.Avatar != nil {
+		item["avatar"] = *kb.Avatar
+	}
+	if kb.Language != nil {
+		item["language"] = *kb.Language
+	}
+	if kb.Description != nil {
+		item["description"] = *kb.Description
+	}
+	if kb.PipelineID != nil {
+		item["pipeline_id"] = *kb.PipelineID
+	}
+	if kb.PipelineVersionID != nil {
+		item["pipeline_version_id"] = *kb.PipelineVersionID
+	}
+	// Design section 6.3 (! indicator): true when a pinned version is no longer
+	// the latest of its canvas. Purely informational; never blocks parsing.
+	item["pipeline_version_outdated"] = pipelineVersionOutdated(ctx, kb.PipelineID, kb.PipelineVersionID)
+	if kb.GraphragTaskID != nil {
+		item["graphrag_task_id"] = *kb.GraphragTaskID
+	}
+	if kb.GraphragTaskFinishAt != nil {
+		item["graphrag_task_finish_at"] = kb.GraphragTaskFinishAt.Format("2006-01-02 15:04:05")
+	}
+	if kb.RaptorTaskID != nil {
+		item["raptor_task_id"] = *kb.RaptorTaskID
+	}
+	if kb.RaptorTaskFinishAt != nil {
+		item["raptor_task_finish_at"] = kb.RaptorTaskFinishAt.Format("2006-01-02 15:04:05")
+	}
+	if kb.MindmapTaskID != nil {
+		item["mindmap_task_id"] = *kb.MindmapTaskID
+	}
+	if kb.MindmapTaskFinishAt != nil {
+		item["mindmap_task_finish_at"] = kb.MindmapTaskFinishAt.Format("2006-01-02 15:04:05")
+	}
+	if kb.UpdateTime != nil {
+		item["update_time"] = *kb.UpdateTime
+	}
+	return item
+}
+
+func limitStrings(values []string, limit int) []string {
+	if len(values) <= limit {
+		return values
+	}
+	return values[:limit]
+}
+
+func stringPointerValue(s *string) interface{} {
+	if s == nil {
+		return nil
+	}
+	return *s
+}
+
+func int64PointerValue(i *int64) interface{} {
+	if i == nil {
+		return nil
+	}
+	return *i
+}
+
+func timePointerValue(t *time.Time) interface{} {
+	if t == nil {
+		return nil
+	}
+	return t.Format("2006-01-02 15:04:05")
+}
+
+func jsonMapValue(m entity.JSONMap) interface{} {
+	if m == nil {
+		return nil
+	}
+	return map[string]interface{}(m)
+}
+
+func datasetMap(value interface{}) map[string]interface{} {
+	if m, ok := value.(map[string]interface{}); ok {
+		return m
+	}
+	return nil
+}
+
+func datasetString(value interface{}) string {
+	if s, ok := value.(string); ok {
+		return s
+	}
+	return ""
+}
+
+func datasetStringSlice(value interface{}) []string {
+	if sl, ok := value.([]string); ok {
+		return sl
+	}
+	if raw, ok := value.([]interface{}); ok {
+		result := make([]string, 0, len(raw))
+		for _, v := range raw {
+			if s, ok := v.(string); ok {
+				result = append(result, s)
+			}
+		}
+		return result
+	}
+	return nil
+}
+
+func datasetGuessVecField(src map[string]interface{}) string {
+	for k := range src {
+		if strings.HasSuffix(k, "_vec") {
+			return k
+		}
+	}
+	return ""
+}
+
+func datasetAsFloatVec(v interface{}) []float64 {
+	switch val := v.(type) {
+	case []float64:
+		return val
+	case []float32:
+		vec := make([]float64, len(val))
+		for i, n := range val {
+			vec[i] = float64(n)
+		}
+		return vec
+	case []interface{}:
+		vec := make([]float64, 0, len(val))
+		for _, item := range val {
+			switch n := item.(type) {
+			case float64:
+				vec = append(vec, n)
+			case float32:
+				vec = append(vec, float64(n))
+			case int:
+				vec = append(vec, float64(n))
+			case int64:
+				vec = append(vec, float64(n))
+			case json.Number:
+				f, err := n.Float64()
+				if err != nil {
+					return nil
+				}
+				vec = append(vec, f)
+			case string:
+				f, err := strconv.ParseFloat(strings.TrimSpace(n), 64)
+				if err != nil {
+					return nil
+				}
+				vec = append(vec, f)
+			default:
+				return nil
+			}
+		}
+		return vec
+	case string:
+		parts := strings.FieldsFunc(strings.Trim(val, "[]{}"), func(r rune) bool { return r == '\t' || r == ',' })
+		vec := make([]float64, 0, len(parts))
+		for _, part := range parts {
+			f, err := strconv.ParseFloat(strings.TrimSpace(part), 64)
+			if err != nil {
+				return nil
+			}
+			vec = append(vec, f)
+		}
+		return vec
+	}
+	return nil
+}
+
+func datasetCosSim(a, b []float64) float64 {
+	if len(a) != len(b) || len(a) == 0 {
+		return 0
+	}
+	var dot, na, nb float64
+	for i := range a {
+		dot += a[i] * b[i]
+		na += a[i] * a[i]
+		nb += b[i] * b[i]
+	}
+	if na == 0 || nb == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(na) * math.Sqrt(nb))
+}
+
+func datasetCleanEmbeddingText(s string) string {
+	re := regexp.MustCompile(`<[^>]*>`)
+	return re.ReplaceAllString(s, "")
+}
+
+func datasetEncodeEmbedding(ctx context.Context, embeddingModel *modelModule.EmbeddingModel, texts []string) ([][]float64, error) {
+	if len(texts) == 0 {
+		return nil, nil
+	}
+	cleaned := make([]string, len(texts))
+	for i, t := range texts {
+		cleaned[i] = datasetCleanEmbeddingText(t)
+	}
+	embeddingConfig := &modelModule.EmbeddingConfig{Dimension: 0}
+	// Embed inside the model's window: this path takes whatever text the API handed
+	// it, and the provider rejects an over-window input with 400/20015 instead of
+	// truncating it.
+	embeddings, err := embeddingModel.Embed(ctx, modelModule.EmbedRequest{Texts: cleaned}, embeddingConfig, nil)
+	if err != nil {
+		return nil, err
+	}
+	vectors := make([][]float64, len(embeddings))
+	for i, embedding := range embeddings {
+		vectors[i] = embedding.Embedding
+	}
+	return vectors, nil
+}
+
+func datasetMixVectors(titleVector, contentVector []float64, titleWeight float64) []float64 {
+	if len(titleVector) == 0 && len(contentVector) == 0 {
+		return nil
+	}
+	if len(titleVector) == 0 {
+		return contentVector
+	}
+	if len(contentVector) == 0 {
+		return titleVector
+	}
+	minLen := len(titleVector)
+	if len(contentVector) < minLen {
+		minLen = len(contentVector)
+	}
+	mixed := make([]float64, minLen)
+	for i := 0; i < minLen; i++ {
+		mixed[i] = titleWeight*titleVector[i] + (1-titleWeight)*contentVector[i]
+	}
+	return mixed
+}
+
+func datasetEmbeddingCheckSummary(datasetID, embeddingID string, sampled int, similarities []float64, matchMode string) service.EmbeddingCheckSummary {
+	if len(similarities) == 0 {
+		return service.EmbeddingCheckSummary{
+			KbID:      datasetID,
+			Model:     embeddingID,
+			Sampled:   sampled,
+			Valid:     0,
+			AvgCosSim: 0,
+			MinCosSim: 0,
+			MaxCosSim: 0,
+			MatchMode: matchMode,
+		}
+	}
+	sort.Float64s(similarities)
+	var sum float64
+	for _, v := range similarities {
+		sum += v
+	}
+	return service.EmbeddingCheckSummary{
+		KbID:      datasetID,
+		Model:     embeddingID,
+		Sampled:   sampled,
+		Valid:     len(similarities),
+		AvgCosSim: datasetRoundFloat(sum/float64(len(similarities)), 4),
+		MinCosSim: datasetRoundFloat(similarities[0], 4),
+		MaxCosSim: datasetRoundFloat(similarities[len(similarities)-1], 4),
+		MatchMode: matchMode,
+	}
+}
+
+func datasetRoundFloat(value float64, places int) float64 {
+	shift := math.Pow(10, float64(places))
+	return math.Round(value*shift) / shift
+}
+
+func datasetChunkID(chunk map[string]interface{}) string {
+	if id, ok := chunk["chunk_id"]; ok {
+		if s, ok := id.(string); ok {
+			return s
+		}
+	}
+	if id, ok := chunk["id"]; ok {
+		if s, ok := id.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+func interfaceSlice(items ...string) []interface{} {
+	result := make([]interface{}, len(items))
+	for i, v := range items {
+		result[i] = v
+	}
+	return result
+}

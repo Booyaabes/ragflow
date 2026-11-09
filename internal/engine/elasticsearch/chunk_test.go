@@ -1,0 +1,644 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
+package elasticsearch
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/elastic/go-elasticsearch/v8"
+	"ragflow/internal/common"
+	"ragflow/internal/engine/types"
+)
+
+// makeResponse builds a SearchResponse with `n` synthetic hits whose id
+// is the index in the batch ("h-0", "h-1", ...) and whose sort cursor is
+// ["h-0", "h-1", ...] so each iteration's cursor advances deterministically.
+func makeResponse(n int, startID int, total int64) SearchResponse {
+	resp := SearchResponse{}
+	resp.Hits.Total.Value = total
+	if n == 0 {
+		return resp
+	}
+	hits := make([]struct {
+		ID        string                 `json:"_id"`
+		Index     string                 `json:"_index"`
+		Score     float64                `json:"_score"`
+		Source    map[string]interface{} `json:"_source"`
+		Fields    map[string]interface{} `json:"fields"`
+		Highlight map[string]interface{} `json:"highlight,omitempty"`
+		Sort      []interface{}          `json:"sort,omitempty"`
+	}, n)
+	for i := 0; i < n; i++ {
+		id := startID + i
+		hits[i].ID = "h-" + itoa(id)
+		hits[i].Source = map[string]interface{}{"id": id}
+		hits[i].Sort = []interface{}{"h-" + itoa(id)}
+	}
+	resp.Hits.Hits = hits
+	return resp
+}
+
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	neg := false
+	if i < 0 {
+		neg = true
+		i = -i
+	}
+	var buf [20]byte
+	pos := len(buf)
+	for i > 0 {
+		pos--
+		buf[pos] = byte('0' + i%10)
+		i /= 10
+	}
+	if neg {
+		pos--
+		buf[pos] = '-'
+	}
+	return string(buf[pos:])
+}
+
+// mockFetcher returns searchAfterFetcher implementations that draw
+// from a pre-loaded sequence of (batch, hits) responses and record
+// every call so tests can assert against them.
+//
+// The mock honours the `batch` argument the way a real ES client
+// would: it returns at most `min(batch, scriptedHitsRemaining)` hits
+// per call. This makes the loop's "did we ask for more than ES gave
+// us?" branch observable.
+type mockFetcher struct {
+	// scripted: each entry is the FULL response the fetcher would
+	// return for one request. The hits inside it are pre-truncated to
+	// the size the test wants the fetcher to deliver.
+	scripted      []SearchResponse
+	scriptedTotal int64
+	idx           int
+	// calls records every (batch, cursor, trackTotalHits) tuple the
+	// pagination loop sent.
+	calls []mockCall
+}
+
+type mockCall struct {
+	batch          int
+	cursor         []interface{}
+	trackTotalHits bool
+}
+
+func (m *mockFetcher) fetch(_ context.Context, _ map[string]interface{}, batch int, cursor []interface{}, trackTotalHits bool) (SearchResponse, error) {
+	m.calls = append(m.calls, mockCall{batch: batch, cursor: cursor, trackTotalHits: trackTotalHits})
+	if m.idx >= len(m.scripted) {
+		return SearchResponse{}, nil
+	}
+	resp := m.scripted[m.idx]
+	m.idx++
+	// Honour `batch` like a real ES: trim the hit list to the
+	// requested size so the loop's "short batch" branch is reachable.
+	if batch > 0 && len(resp.Hits.Hits) > batch {
+		resp.Hits.Hits = resp.Hits.Hits[:batch]
+	}
+	// Only the first request is asked to track the exact total. The
+	// scripted response may already carry a total; the fetcher fills
+	// in scriptedTotal only when the response's total is zero AND the
+	// caller asked for the exact count.
+	if trackTotalHits && resp.Hits.Total.Value == 0 && m.scriptedTotal > 0 {
+		resp.Hits.Total.Value = m.scriptedTotal
+	}
+	return resp, nil
+}
+
+// TestSortValuesEqual pins down the cursor-equality helper. The
+// pagination loop uses it to detect "ES didn't advance" — when the
+// cursor between two consecutive responses is unchanged, the index is
+// exhausted and the loop must stop. False negatives here would loop
+// forever; false positives would terminate early and miss data.
+func TestSortValuesEqual(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b []interface{}
+		want bool
+	}{
+		{name: "both_nil", a: nil, b: nil, want: true},
+		{name: "first_nil", a: nil, b: []interface{}{"x"}, want: false},
+		{name: "second_nil", a: []interface{}{"x"}, b: nil, want: false},
+		{name: "equal_strings", a: []interface{}{"a", "b"}, b: []interface{}{"a", "b"}, want: true},
+		{name: "different_strings", a: []interface{}{"a"}, b: []interface{}{"b"}, want: false},
+		{name: "different_lengths", a: []interface{}{"a"}, b: []interface{}{"a", "b"}, want: false},
+		{name: "mixed_types_equal", a: []interface{}{"x", float64(1)}, b: []interface{}{"x", float64(1)}, want: true},
+		{name: "mixed_types_differ", a: []interface{}{"x", float64(1)}, b: []interface{}{"x", float64(2)}, want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sortValuesEqual(tc.a, tc.b); got != tc.want {
+				t.Errorf("sortValuesEqual(%#v, %#v) = %v, want %v", tc.a, tc.b, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSearchAfterPaginateSimpleFirstPage exercises the trivial case:
+// offset=0, limit=N, N hits available in one response. The loop must
+// send one request, return the hits, and report the total.
+func TestSearchAfterPaginateSimpleFirstPage(t *testing.T) {
+	m := &mockFetcher{
+		scripted:      []SearchResponse{makeResponse(5, 0, 5)},
+		scriptedTotal: 5,
+	}
+	ctx := t.Context()
+	got, total, err := searchAfterPaginate(ctx, map[string]interface{}{}, 0, 5, m.fetch)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if total != 5 {
+		t.Errorf("total = %d, want 5", total)
+	}
+	if len(got) != 5 {
+		t.Fatalf("len(hits) = %d, want 5", len(got))
+	}
+	if m.idx != 1 {
+		t.Errorf("expected 1 fetch call, got %d", m.idx)
+	}
+}
+
+// TestSearchAfterPaginateSkipsDeepOffset covers the regression the
+// `useSearchAfter` bug report flagged: offset=10_500 (past the
+// MAX_RESULT_WINDOW of 10_000) with limit=10 must NOT return the
+// first page — it must walk the result set and return the right slice.
+//
+// We simulate 10,510 total hits, asking for offset=10_500 + limit=10.
+// The mock returns full 1000-hit batches with advancing cursors; the
+// loop should issue 11 batches (10 to skip + 1 to take) and return
+// the last 10 hits (h-10500..h-10509).
+func TestSearchAfterPaginateSkipsDeepOffset(t *testing.T) {
+	const total = 10510
+	const offset = 10500
+	const limit = 10
+
+	// 10 full skip batches: each 1000 hits, cursor advances.
+	// The 11th batch has 510 hits — the skip phase asks for 500
+	// (the remaining 500 to skip), the take phase picks up the
+	// leftover 10. So 11 fetches total cover both phases.
+	m := &mockFetcher{scriptedTotal: total}
+	for i := 0; i < 10; i++ {
+		m.scripted = append(m.scripted, makeResponse(common.SearchAfterBatchSize, i*common.SearchAfterBatchSize, 0))
+	}
+	// Partial batch: 510 hits (10*1000..10*1000+509). Skip uses
+	// the first 500, take uses the last 10.
+	m.scripted = append(m.scripted, makeResponse(510, 10*common.SearchAfterBatchSize, 0))
+	// Defensive: if the loop miscounts and asks for another take
+	// batch, this would surface as a 12th fetch.
+	m.scripted = append(m.scripted, makeResponse(10, 10500, 0))
+	ctx := t.Context()
+
+	got, totalHits, err := searchAfterPaginate(ctx, map[string]interface{}{}, offset, limit, m.fetch)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if totalHits != total {
+		t.Errorf("total = %d, want %d", totalHits, total)
+	}
+	if len(got) != limit {
+		t.Fatalf("len(hits) = %d, want %d", len(got), limit)
+	}
+	// The first returned hit must be h-10500, not h-0 — that is the
+	// entire point of the search_after path.
+	wantFirstID := "h-" + itoa(offset)
+	if id, _ := got[0]["id"].(string); id != wantFirstID {
+		t.Errorf("first hit id = %s, want %s (search_after must skip the deep offset)", id, wantFirstID)
+	}
+	wantLastID := "h-" + itoa(offset+limit-1)
+	if id, _ := got[limit-1]["id"].(string); id != wantLastID {
+		t.Errorf("last hit id = %s, want %s", id, wantLastID)
+	}
+	// 12 fetches: 10 full skip + 1 partial-skip (trims scripted 510
+	// down to 500) + 1 partial-take (the 10 leftover hits the take
+	// phase still needs). The 12th batch in scripted is a defensive
+	// sentinel; if the loop miscounts, that fetch would not be hit.
+	if m.idx != 12 {
+		t.Errorf("expected 12 fetches, got %d", m.idx)
+	}
+}
+
+// TestSearchAfterPaginateExhaustsIndex: when the skip phase reaches
+// the end of the index, the loop must stop, not loop forever waiting
+// for non-empty hits. We simulate a small index that runs out mid-skip.
+func TestSearchAfterPaginateExhaustsIndex(t *testing.T) {
+	// 500 total hits, offset=400, limit=10.
+	// Skip phase: one batch of 500 (the whole index). remainingSkip
+	// becomes 400-500 = -100, loop ends.
+	m := &mockFetcher{
+		scripted: []SearchResponse{
+			makeResponse(500, 0, 500),
+			// We don't expect a second call; if we get one the
+			// loop failed to terminate. Return empty to make
+			// that visible.
+		},
+		scriptedTotal: 500,
+	}
+	ctx := t.Context()
+	got, total, err := searchAfterPaginate(ctx, map[string]interface{}{}, 400, 10, m.fetch)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if total != 500 {
+		t.Errorf("total = %d, want 500", total)
+	}
+	// After skipping all 500 hits, the take phase should issue one
+	// fetch and find 0 hits, returning empty. We check call count
+	// (not m.idx) because the empty response path in the mock
+	// fetcher returns early without incrementing idx.
+	if len(got) != 0 {
+		t.Errorf("len(hits) = %d, want 0 (index exhausted past offset)", len(got))
+	}
+	if len(m.calls) != 2 {
+		t.Errorf("expected 2 fetches (skip+take-empty), got %d", len(m.calls))
+	}
+}
+
+// TestSearchAfterPaginateEmptyResult: zero total hits means the very
+// first response is empty; loop must not loop forever and must
+// return total=0.
+func TestSearchAfterPaginateEmptyResult(t *testing.T) {
+	m := &mockFetcher{
+		scripted:      []SearchResponse{makeResponse(0, 0, 0)},
+		scriptedTotal: 0,
+	}
+	ctx := t.Context()
+	got, total, err := searchAfterPaginate(ctx, map[string]interface{}{}, 50, 10, m.fetch)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if total != 0 {
+		t.Errorf("total = %d, want 0", total)
+	}
+	if len(got) != 0 {
+		t.Errorf("len(hits) = %d, want 0", len(got))
+	}
+	if m.idx != 1 {
+		t.Errorf("expected 1 fetch, got %d", m.idx)
+	}
+}
+
+// TestSearchAfterPaginateStopOnUnchangedCursor: the loop must detect
+// the "ES didn't advance" signal (next sort cursor == previous) and
+// stop, rather than spinning. This is a defensive break in case
+// search_after returns identical hits on consecutive requests.
+func TestSearchAfterPaginateStopOnUnchangedCursor(t *testing.T) {
+	// First response advances the cursor; second response is the
+	// same cursor — loop should stop, NOT call a third time.
+	resp1 := makeResponse(1000, 0, 5000)
+	resp1.Hits.Hits[999].Sort = []interface{}{"cursor-1"}
+	resp2 := makeResponse(1000, 1000, 0)
+	resp2.Hits.Hits[999].Sort = []interface{}{"cursor-1"} // same as resp1's last
+	m := &mockFetcher{
+		scripted:      []SearchResponse{resp1, resp2},
+		scriptedTotal: 5000,
+	}
+	// offset=500, limit=10.
+	ctx := t.Context()
+	_, _, err := searchAfterPaginate(ctx, map[string]interface{}{}, 500, 10, m.fetch)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// 2 fetches: 1 skip, 1 take that hit the unchanged-cursor
+	// termination. A 3rd fetch would mean we failed to stop.
+	if m.idx != 2 {
+		t.Errorf("expected 2 fetches (loop must stop on unchanged cursor), got %d", m.idx)
+	}
+}
+
+// TestSearchAfterPaginateLimitLargerThanBatchSize: when limit exceeds
+// SearchAfterBatchSize, the take phase must issue multiple iterations.
+func TestSearchAfterPaginateLimitLargerThanBatchSize(t *testing.T) {
+	const limit = 2500 // > 2 * common.SearchAfterBatchSize
+	m := &mockFetcher{
+		scripted: []SearchResponse{
+			// Skip phase empty (offset=0).
+			makeResponse(1000, 0, 10000),
+			makeResponse(1000, 1000, 0),
+			makeResponse(1000, 2000, 0),
+		},
+		scriptedTotal: 10000,
+	}
+	ctx := t.Context()
+	got, total, err := searchAfterPaginate(ctx, map[string]interface{}{}, 0, limit, m.fetch)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if total != 10000 {
+		t.Errorf("total = %d, want 10000", total)
+	}
+	if len(got) != limit {
+		t.Errorf("len(hits) = %d, want %d", len(got), limit)
+	}
+	// offset=0 means the skip loop doesn't run; the take loop
+	// issues 3 fetches (1000 + 1000 + 500 = 2500). The third fetch
+	// is "short" (500 < 1000), which the loop uses to stop early
+	// without over-collecting.
+	if m.idx != 3 {
+		t.Errorf("expected 3 take fetches, got %d", m.idx)
+	}
+	// Hits should be in order h-0..h-2499.
+	for i, h := range got {
+		wantID := "h-" + itoa(i)
+		if id, _ := h["id"].(string); id != wantID {
+			t.Errorf("hit[%d].id = %s, want %s", i, id, wantID)
+			break
+		}
+	}
+}
+
+func TestBuildBoolQueryFromConditionUsesLegacyGraphFallback(t *testing.T) {
+	got := buildBoolQueryFromCondition(map[string]interface{}{"knowledge_graph_kwd": "entity"}, nil, false, false)
+	outer, ok := got["bool"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("missing bool wrapper: %v", got)
+	}
+	filters, ok := outer["filter"].([]interface{})
+	if !ok || len(filters) != 1 {
+		t.Fatalf("graph filter = %#v, want one compatibility clause", outer["filter"])
+	}
+	encoded, err := json.Marshal(filters[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"type_kwd", "knowledge_graph_kwd"} {
+		if !strings.Contains(string(encoded), "\""+field+"\":\"entity\"") {
+			t.Errorf("graph filter %s does not match %s: %s", field, field, encoded)
+		}
+	}
+}
+
+// TestBuildBoolQueryFromConditionIDFilter is the regression for the
+// "id filter encoded as a nested array inside bool.should" bug.
+//
+// Each branch of the `k == "id"` clause used to append a
+// `[]map[string]interface{}` literal as a single element, so the emitted
+// JSON was `should: [[{...}, {...}]]` (a nested array) instead of
+// `should: [{...}, {...}]`. ES rejects the nested form as malformed.
+// This test pins down the flat shape for the list, string, and int
+// branches.
+//
+// The id restriction must also stay out of the top-level bool.should:
+// Search appends rank_feature clauses to that slot, and a top-level
+// minimum_should_match=1 then let any rank-feature-carrying document satisfy
+// the id scope. id is emitted as a mandatory filter clause whose nested bool
+// keeps the id/_id alternative, exactly as the Python reference does
+// (rag/utils/es_conn.py: scalar id -> term, list -> terms).
+func TestBuildBoolQueryFromConditionIDFilter(t *testing.T) {
+	check := func(name string, cond map[string]interface{}, wantFields []string, wantOp string) {
+		t.Helper()
+		got := buildBoolQueryFromCondition(cond, nil, false, false)
+		outer, ok := got["bool"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("%s: missing bool wrapper: %v", name, got)
+		}
+		if _, exists := outer["should"]; exists {
+			t.Fatalf("%s: id leaked into the top-level should slot: %v", name, outer["should"])
+		}
+		if _, exists := outer["minimum_should_match"]; exists {
+			t.Fatalf("%s: top-level minimum_should_match would also bind rank_feature clauses", name)
+		}
+		filter, ok := outer["filter"].([]interface{})
+		if !ok || len(filter) != 1 {
+			t.Fatalf("%s: filter = %v, want the single id restriction", name, outer["filter"])
+		}
+		wrapper, ok := filter[0].(map[string]interface{})
+		if !ok {
+			t.Fatalf("%s: filter[0] is %T, want map[string]interface{}", name, filter[0])
+		}
+		inner, ok := wrapper["bool"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("%s: filter[0] carries no bool: %v", name, wrapper)
+		}
+		if inner["minimum_should_match"] != 1 {
+			t.Fatalf("%s: id bool minimum_should_match = %v, want 1", name, inner["minimum_should_match"])
+		}
+		should, ok := inner["should"].([]interface{})
+		if !ok {
+			t.Fatalf("%s: should is not []interface{}: %T", name, inner["should"])
+		}
+		if len(should) != len(wantFields) {
+			t.Fatalf("%s: should length = %d, want %d (raw=%v)", name, len(should), len(wantFields), should)
+		}
+		// Every element must be a map (not another slice). A nested slice
+		// would be the bug we're guarding against.
+		seenFields := make(map[string]bool, len(wantFields))
+		for i, el := range should {
+			m, ok := el.(map[string]interface{})
+			if !ok {
+				t.Fatalf("%s: should[%d] is %T, want map[string]interface{} (nested array bug) — raw=%v", name, i, el, el)
+			}
+			clause, ok := m[wantOp].(map[string]interface{})
+			if !ok {
+				t.Fatalf("%s: should[%d] = %v, want %q clause", name, i, m, wantOp)
+			}
+			for f := range clause {
+				seenFields[f] = true
+			}
+		}
+		for _, want := range wantFields {
+			if !seenFields[want] {
+				t.Errorf("%s: expected field %q in should clauses, got %v", name, want, seenFields)
+			}
+		}
+	}
+
+	check("list_value", map[string]interface{}{
+		"id": []interface{}{"a", "b", "c"},
+	}, []string{"id", "_id"}, "terms")
+
+	check("string_list_value", map[string]interface{}{
+		"id": []string{"a", "b", "c"},
+	}, []string{"id", "_id"}, "terms")
+
+	check("string_value", map[string]interface{}{
+		"id": "doc-42",
+	}, []string{"id", "_id"}, "term")
+
+	check("int_value", map[string]interface{}{
+		"id": 42,
+	}, []string{"id", "_id"}, "term")
+
+	// A typed []string must be handled too: callers built from typed helpers
+	// (e.g. list_chunks' ChunkScope) pass []string, and the generic loop below
+	// skips the "id" key — without this branch the query carries NO id filter
+	// and a scoped read silently fetches the whole document (an 11-chunk
+	// window returned 3.8MB instead of ~17KB).
+	check("string_slice_value", map[string]interface{}{
+		"id": []string{"a", "b", "c"},
+	}, []string{"id", "_id"}, "terms")
+}
+
+// TestRankFeatureDoesNotWidenChunkIDScope pins why id must be a filter clause:
+// Search appends rank_feature queries to bool.should, so an id restriction
+// living in that slot is satisfied by the rank feature alone once
+// minimum_should_match=1 is set, and a chunk-id-scoped read returns unrelated
+// chunks.
+func TestRankFeatureDoesNotWidenChunkIDScope(t *testing.T) {
+	var captured map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Error(err)
+			http.Error(w, "bad query", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{
+			"hits": map[string]interface{}{
+				"total": map[string]interface{}{"value": 0},
+				"hits":  []interface{}{},
+			},
+		}); err != nil {
+			t.Error(err)
+		}
+	}))
+	defer server.Close()
+	client, err := elasticsearch.NewClient(elasticsearch.Config{Addresses: []string{server.URL}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := &Engine{client: client}
+	if _, err := eng.Search(context.Background(), &types.SearchRequest{
+		IndexNames:  []string{"ragflow_t1"},
+		KbIDs:       []string{"kb1"},
+		Limit:       10,
+		Filter:      map[string]interface{}{"id": []string{"chunk-a"}},
+		RankFeature: map[string]float64{common.PAGERANK_FLD: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	query, ok := captured["query"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("captured body carries no query: %v", captured)
+	}
+	boolMap, ok := query["bool"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("query carries no bool: %v", query)
+	}
+	if _, exists := boolMap["minimum_should_match"]; exists {
+		t.Fatalf("top-level minimum_should_match also binds the rank_feature clauses: %v", boolMap)
+	}
+	encoded, err := json.Marshal(boolMap["filter"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"id":["chunk-a"]`) {
+		t.Fatalf("id restriction is not a mandatory filter clause: %s", encoded)
+	}
+	if !strings.Contains(string(encoded), `"minimum_should_match":1`) {
+		t.Fatalf("id filter lost the id/_id alternative: %s", encoded)
+	}
+}
+
+// paginationGRID mirrors the (page_size, top) grid from
+// rag/nlp/search.py::Dealer._rerank_window tests. It covers the common page
+// sizes that do NOT divide 64 (the exact case the legacy min(..., 64) clamp
+// broke) plus tiny / large / page-aligned tops.
+var paginationGRID = func() []struct{ size, topK int } {
+	sizes := []int{1, 5, 7, 10, 30, 50, 64}
+	tops := []int{0, 5, 30, 50, 55, 64, 100, 1024}
+	out := make([]struct{ size, topK int }, 0, len(sizes)*len(tops))
+	for _, s := range sizes {
+		for _, t := range tops {
+			out = append(out, struct{ size, topK int }{s, t})
+		}
+	}
+	return out
+}()
+
+func TestFormatOrderedTagFeas(t *testing.T) {
+	tagFeas := map[string]any{
+		"价格咨询": 4,
+		"活动咨询": 9,
+		"正面评价": 3,
+		"服务投诉": 6,
+		"质量投诉": 3,
+	}
+
+	raw, ok := formatOrderedTagFeas(tagFeas)
+	if !ok {
+		t.Fatal("expected formatOrderedTagFeas to succeed")
+	}
+
+	expectedJSON := `{"活动咨询":9,"服务投诉":6,"价格咨询":4,"正面评价":3,"质量投诉":3}`
+	if string(raw) != expectedJSON {
+		t.Fatalf("formatOrderedTagFeas output mismatch:\ngot:  %s\nwant: %s", string(raw), expectedJSON)
+	}
+
+	// Test json.Number and float rounding support
+	tagFeasWithJSONNumber := map[string]any{
+		"LowTag":  json.Number("3.2"),
+		"HighTag": json.Number("8.7"),
+		"MidTag":  float64(5.6),
+	}
+	rawNum, okNum := formatOrderedTagFeas(tagFeasWithJSONNumber)
+	if !okNum {
+		t.Fatal("expected formatOrderedTagFeas with json.Number to succeed")
+	}
+	expectedNumJSON := `{"HighTag":9,"MidTag":6,"LowTag":3}`
+	if string(rawNum) != expectedNumJSON {
+		t.Fatalf("formatOrderedTagFeas with json.Number mismatch:\ngot:  %s\nwant: %s", string(rawNum), expectedNumJSON)
+	}
+
+	// Verify that jsonIterator preserves the raw byte order inside docCopy
+	docCopy := map[string]any{
+		"doc_id":   "doc-1",
+		"tag_feas": raw,
+	}
+	var buf bytes.Buffer
+	if err := jsonIterator.NewEncoder(&buf).Encode(docCopy); err != nil {
+		t.Fatalf("jsonIterator Encode failed: %v", err)
+	}
+
+	encodedStr := buf.String()
+	if !strings.Contains(encodedStr, `"tag_feas":{"活动咨询":9,"服务投诉":6,"价格咨询":4,"正面评价":3,"质量投诉":3}`) {
+		t.Fatalf("encoded JSON does not preserve score-descending order:\n%s", encodedStr)
+	}
+}
+
+func TestBuildQueryStringQueryMinimumShouldMatchHalfUp(t *testing.T) {
+	tests := []struct {
+		fraction float64
+		want     string
+	}{
+		{0.29, "29%"},
+		{0.125, "13%"},
+		{0.135, "14%"},
+		{0.0, "0%"},
+		{1.0, "100%"},
+	}
+	for _, tc := range tests {
+		query := buildQueryStringQuery(&types.MatchTextExpr{
+			MatchingText: "hello",
+			ExtraOptions: map[string]interface{}{"minimum_should_match": tc.fraction},
+		}, false, false)
+		got := query["query_string"].(map[string]interface{})["minimum_should_match"].(string)
+		if got != tc.want {
+			t.Errorf("buildQueryStringQuery minimum_should_match for %g = %q, want %q", tc.fraction, got, tc.want)
+		}
+	}
+}

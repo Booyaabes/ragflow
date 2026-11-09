@@ -1,0 +1,328 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
+package tool
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+)
+
+func TestQWeather_BuildURL(t *testing.T) {
+	// Not t.Parallel(): this test reads the package-level
+	// `qweatherEndpoint` var, which other tests (running in parallel)
+	// temporarily replace with a httptest.Server URL.
+
+	cases := []struct {
+		name     string
+		apiKey   string
+		params   qweatherParams
+		wantLoc  string
+		wantKey  string
+		wantLang string
+		wantHost string
+		wantPath string
+	}{
+		{
+			name:     "Beijing, default lang",
+			apiKey:   "K-abc",
+			params:   qweatherParams{Location: "101010100"},
+			wantLoc:  "101010100",
+			wantKey:  "K-abc",
+			wantLang: "zh",
+			wantHost: "devapi.qweather.com",
+			wantPath: "/v7/weather/now",
+		},
+		{
+			name:     "lat,lon with explicit English",
+			apiKey:   "K-xyz",
+			params:   qweatherParams{Location: "39.904,116.405", Lang: "en"},
+			wantLoc:  "39.904,116.405",
+			wantKey:  "K-xyz",
+			wantLang: "en",
+			wantHost: "devapi.qweather.com",
+			wantPath: "/v7/weather/now",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := buildQWeatherURL(tc.apiKey, tc.params)
+			u, err := url.Parse(got)
+			if err != nil {
+				t.Fatalf("url.Parse(%q): %v", got, err)
+			}
+			if u.Host != tc.wantHost {
+				t.Errorf("host = %q, want %q", u.Host, tc.wantHost)
+			}
+			if u.Path != tc.wantPath {
+				t.Errorf("path = %q, want %q", u.Path, tc.wantPath)
+			}
+			q := u.Query()
+			if q.Get("location") != tc.wantLoc {
+				t.Errorf("location = %q, want %q", q.Get("location"), tc.wantLoc)
+			}
+			if q.Get("key") != tc.wantKey {
+				t.Errorf("key = %q, want %q", q.Get("key"), tc.wantKey)
+			}
+			if q.Get("lang") != tc.wantLang {
+				t.Errorf("lang = %q, want %q", q.Get("lang"), tc.wantLang)
+			}
+		})
+	}
+}
+
+func TestQWeather_ParseResponse(t *testing.T) {
+	ctx := t.Context()
+	t.Parallel()
+
+	var gotQuery url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"code": "200",
+			"updateTime": "2024-05-01T12:00+08:00",
+			"now": {
+				"temp": "23",
+				"feelsLike": "22",
+				"text": "多云",
+				"windDir": "东南风",
+				"humidity": "65"
+			}
+		}`))
+	}))
+	defer srv.Close()
+
+	prev := qweatherEndpoint
+	qweatherEndpoint = srv.URL + "/v7/weather/now"
+	t.Cleanup(func() { qweatherEndpoint = prev })
+
+	helper := NewHTTPHelper().WithClient(&http.Client{
+		Transport: rewriteHostTransport(srv.URL),
+	})
+	tool := NewQWeatherToolWith(helper, "K-abc")
+
+	out, err := tool.InvokableRun(ctx,
+		`{"location":"101010100"}`)
+	if err != nil {
+		t.Fatalf("InvokableRun: %v", err)
+	}
+	if gotQuery.Get("key") != "K-abc" {
+		t.Errorf("server saw key = %q, want K-abc", gotQuery.Get("key"))
+	}
+	if gotQuery.Get("location") != "101010100" {
+		t.Errorf("server saw location = %q, want 101010100", gotQuery.Get("location"))
+	}
+	if gotQuery.Get("lang") != "zh" {
+		t.Errorf("server saw lang = %q, want zh (default)", gotQuery.Get("lang"))
+	}
+
+	var env qweatherEnvelope
+	if jerr := json.Unmarshal([]byte(out), &env); jerr != nil {
+		t.Fatalf("output is not valid JSON: %v (raw=%s)", jerr, out)
+	}
+	if env.Error != "" {
+		t.Errorf("Error = %q, want empty", env.Error)
+	}
+	if env.Temp != "23" {
+		t.Errorf("Temp = %q, want 23", env.Temp)
+	}
+	if env.FeelsLike != "22" {
+		t.Errorf("FeelsLike = %q, want 22", env.FeelsLike)
+	}
+	if env.Text != "多云" {
+		t.Errorf("Text = %q, want 多云", env.Text)
+	}
+	if env.WindDir != "东南风" {
+		t.Errorf("WindDir = %q, want 东南风", env.WindDir)
+	}
+	if env.Humidity != "65" {
+		t.Errorf("Humidity = %q, want 65", env.Humidity)
+	}
+}
+
+func TestQWeather_UpstreamBusinessError(t *testing.T) {
+	ctx := t.Context()
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":"404","msg":"location not found"}`))
+	}))
+	defer srv.Close()
+
+	prev := qweatherEndpoint
+	qweatherEndpoint = srv.URL + "/v7/weather/now"
+	t.Cleanup(func() { qweatherEndpoint = prev })
+
+	helper := NewHTTPHelper().WithClient(&http.Client{
+		Transport: rewriteHostTransport(srv.URL),
+	})
+	tool := NewQWeatherToolWith(helper, "K-abc")
+
+	_, err := tool.InvokableRun(ctx,
+		`{"location":"000000000"}`)
+	if err == nil {
+		t.Fatal("expected error for non-200 upstream code, got nil")
+	}
+	if !strings.Contains(err.Error(), "404") {
+		t.Errorf("err = %v, want to surface upstream code", err)
+	}
+}
+
+// TestQWeather_NetworkErrorRedactsCredential pins that a transport failure
+// never echoes the node-level or environment API key. The key travels in the
+// request URL's query string and Go's *url.Error prints that URL, so the raw
+// error would both reach the model through _ERROR and land in the logs.
+func TestQWeather_NetworkErrorRedactsCredential(t *testing.T) {
+	// Not t.Parallel(): this test replaces the package-level qweatherEndpoint.
+	prev := qweatherEndpoint
+	// 127.0.0.1:1 refuses connections, so HTTPHelper exhausts its retries.
+	qweatherEndpoint = "http://127.0.0.1:1/v7/weather/now"
+	t.Cleanup(func() { qweatherEndpoint = prev })
+
+	const secret = "secret-node-key"
+	out, err := NewQWeatherToolWith(nil, secret).InvokableRun(t.Context(), `{"location":"101010100"}`)
+	if err == nil {
+		t.Fatal("expected a transport error, got nil")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Errorf("returned error leaks the API key: %v", err)
+	}
+	if strings.Contains(out, secret) {
+		t.Errorf("tool output leaks the API key: %s", out)
+	}
+	if !strings.Contains(err.Error(), "REDACTED") {
+		t.Errorf("err = %v, want the redacted key marker", err)
+	}
+
+	var env qweatherEnvelope
+	if jerr := json.Unmarshal([]byte(out), &env); jerr != nil {
+		t.Fatalf("output is not valid JSON: %v (raw=%s)", jerr, out)
+	}
+	if env.Error == "" {
+		t.Error("expected _ERROR to describe the transport failure")
+	}
+}
+
+// TestQWeather_RejectsMissingCredential pins that the credential is a
+// server-side setting: an unconfigured tool fails before any request, and the
+// model cannot inject one through its arguments.
+func TestQWeather_RejectsMissingCredential(t *testing.T) {
+	t.Setenv("QWEATHER_API_KEY", "")
+	ctx := t.Context()
+
+	tool := NewQWeatherTool()
+	_, err := tool.InvokableRun(ctx,
+		`{"api_key":"model-supplied","location":"101010100"}`)
+	if err == nil {
+		t.Fatal("expected error for unconfigured api_key")
+	}
+	if !strings.Contains(err.Error(), "api_key is not configured") {
+		t.Errorf("err = %v, want to mention api_key is not configured", err)
+	}
+}
+
+func TestQWeather_UsesEnvCredential(t *testing.T) {
+	t.Setenv("QWEATHER_API_KEY", "env-key")
+	ctx := t.Context()
+
+	var gotKey string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.URL.Query().Get("key")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":"200","now":{"temp":"23"}}`))
+	}))
+	defer srv.Close()
+
+	prev := qweatherEndpoint
+	qweatherEndpoint = srv.URL + "/v7/weather/now"
+	t.Cleanup(func() { qweatherEndpoint = prev })
+
+	helper := NewHTTPHelper().WithClient(&http.Client{
+		Transport: rewriteHostTransport(srv.URL),
+	})
+	if _, err := NewQWeatherToolWith(helper, "").InvokableRun(ctx, `{"location":"101010100"}`); err != nil {
+		t.Fatalf("InvokableRun: %v", err)
+	}
+	if gotKey != "env-key" {
+		t.Errorf("server saw key = %q, want env-key", gotKey)
+	}
+}
+
+func TestQWeather_BuildByNameUsesNodeCredential(t *testing.T) {
+	t.Parallel()
+
+	built, err := BuildByName("qweather", map[string]any{"api_key": "node-key"})
+	if err != nil {
+		t.Fatalf("BuildByName: %v", err)
+	}
+	tool, ok := built.(*QWeatherTool)
+	if !ok {
+		t.Fatalf("BuildByName returned %T, want *QWeatherTool", built)
+	}
+	if tool.apiKey != "node-key" {
+		t.Errorf("apiKey = %q, want node-key", tool.apiKey)
+	}
+}
+
+func TestQWeather_RejectsMissingLocation(t *testing.T) {
+	ctx := t.Context()
+	t.Parallel()
+
+	tool := NewQWeatherToolWith(nil, "K-abc")
+	_, err := tool.InvokableRun(ctx,
+		`{}`)
+	if err == nil {
+		t.Fatal("expected error for missing location")
+	}
+	if !strings.Contains(err.Error(), "location") {
+		t.Errorf("err = %v, want to mention location", err)
+	}
+}
+
+func TestQWeather_Info(t *testing.T) {
+	ctx := t.Context()
+	t.Parallel()
+
+	tool := NewQWeatherTool()
+	info, err := tool.Info(ctx)
+	if err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+	if info.Name != "qweather" {
+		t.Errorf("Name = %q, want qweather", info.Name)
+	}
+	if !strings.Contains(info.Desc, "QWeather") && !strings.Contains(info.Desc, "和风") {
+		t.Errorf("Desc = %q, want to mention QWeather", info.Desc)
+	}
+	params, err := info.ParamsOneOf.ToJSONSchema()
+	if err != nil {
+		t.Fatalf("ToJSONSchema: %v", err)
+	}
+	raw, err := json.Marshal(params)
+	if err != nil {
+		t.Fatalf("marshal params schema: %v", err)
+	}
+	if strings.Contains(string(raw), `"api_key"`) {
+		t.Fatalf("schema exposes api_key; the credential must stay server-side: %s", raw)
+	}
+}

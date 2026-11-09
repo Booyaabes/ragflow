@@ -1,0 +1,1401 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
+package file
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"ragflow/internal/common"
+	"ragflow/internal/dao"
+	"ragflow/internal/engine"
+	enginetypes "ragflow/internal/engine/types"
+	"ragflow/internal/entity"
+	"ragflow/internal/permission"
+	"ragflow/internal/storage"
+	"ragflow/internal/utility"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode/utf8"
+
+	"go.uber.org/zap"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+// FileCommitService file commit service
+type FileCommitService struct {
+	commitDAO     *dao.FileCommitDAO
+	commitItemDAO *dao.FileCommitItemDAO
+	fileDAO       *dao.FileDAO
+	kbDAO         *dao.KnowledgebaseDAO
+}
+
+// NewFileCommitService create file commit service
+func NewFileCommitService() *FileCommitService {
+	return &FileCommitService{
+		commitDAO:     dao.NewFileCommitDAO(),
+		commitItemDAO: dao.NewFileCommitItemDAO(),
+		fileDAO:       dao.NewFileDAO(),
+		kbDAO:         dao.NewKnowledgebaseDAO(),
+	}
+}
+
+// maxCommitFolderDepth bounds the ancestor walk that places a commit's file IDs
+// inside the commit folder. Folder chains are short; the bound only stops a
+// corrupted parent_id cycle.
+const maxCommitFolderDepth = 64
+
+// ErrDeleteLiveFile rejects a delete change for a file that still exists in the
+// commit folder. Recording the tombstone would hide the live file from
+// GetUncommittedChanges, which skips every committed tombstone and marks the
+// entry as processed, so later edits would never be reported.
+var ErrDeleteLiveFile = errors.New("cannot commit the deletion of a file that is still in the folder")
+
+// ErrInvalidRenameTarget rejects a rename change whose target is empty or
+// exceeds the stored name limit. The handler maps it to a client error instead
+// of a server fault.
+var ErrInvalidRenameTarget = errors.New("invalid file rename target")
+
+// fileTreeContains reports whether fileID, or one of its ancestors, is folderID.
+// It walks from the file upwards rather than scanning the folder, and treats an
+// unknown ID as outside: a deletion is only valid for a file that is already
+// gone. The seen set stops a corrupted parent_id cycle.
+func (s *FileCommitService) fileTreeContains(ctx context.Context, tx *gorm.DB, folderID, fileID string) (bool, error) {
+	seen := make(map[string]bool)
+	current := fileID
+	for current != "" && !seen[current] {
+		seen[current] = true
+		if current == folderID {
+			return true, nil
+		}
+		var file entity.File
+		err := tx.WithContext(ctx).Select("id", "parent_id").Where("id = ?", current).First(&file).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("resolve file %s: %w", fileID, err)
+		}
+		current = file.ParentID
+	}
+	return false, nil
+}
+
+// normalizeCommitRenames trims and validates every rename target before the
+// transaction writes objects or rows. Object storage has no transaction, so a
+// later invalid rename would otherwise leave objects written by earlier
+// add/modify changes behind.
+func normalizeCommitRenames(changes []entity.FileChange) ([]entity.FileChange, error) {
+	normalized := make([]entity.FileChange, len(changes))
+	copy(normalized, changes)
+	for i := range normalized {
+		if normalized[i].Operation != "rename" {
+			continue
+		}
+		normalized[i].NewName = strings.TrimSpace(normalized[i].NewName)
+		if err := common.ValidateNameRunes(normalized[i].NewName, common.NameLimit255); err != nil {
+			return nil, fmt.Errorf("%w for file %s: %v", ErrInvalidRenameTarget, normalized[i].FileID, err)
+		}
+	}
+	return normalized, nil
+}
+
+// CreateCommit creates a new commit for a workspace folder
+func (s *FileCommitService) CreateCommit(ctx context.Context, folderID, authorID, message string, changes []entity.FileChange) (*entity.FileCommit, error) {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return nil, errors.New("commit message is required")
+	}
+	if utf8.RuneCountInString(message) > 512 {
+		return nil, errors.New("commit message must be at most 512 characters")
+	}
+	normalizedChanges, err := normalizeCommitRenames(changes)
+	if err != nil {
+		return nil, err
+	}
+	changes = normalizedChanges
+	// 1. Get the latest commit for this folder
+	latestCommit, _ := s.commitDAO.GetLatestByFolderID(ctx, dao.DB, folderID)
+
+	// 2. Build tree state from latest commit
+	treeState := make(map[string]interface{})
+	if latestCommit != nil && latestCommit.TreeState != nil {
+		if err := json.Unmarshal([]byte(*latestCommit.TreeState), &treeState); err != nil {
+			common.Warn("failed to unmarshal previous tree state", zap.Error(err))
+			treeState = make(map[string]interface{})
+		}
+	}
+
+	// 3. Create commit record
+	commitID := common.GenerateUUID()
+	nowMs := time.Now().UnixMilli()
+
+	commit := &entity.FileCommit{
+		ID:        commitID,
+		FolderID:  folderID,
+		Message:   message,
+		AuthorID:  authorID,
+		FileCount: len(changes),
+	}
+
+	if latestCommit != nil {
+		parentID := latestCommit.ID
+		commit.ParentID = &parentID
+	}
+
+	// All DB operations run inside a single transaction.
+	var treeStr string
+	if err := dao.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Authorize the named files against the rows this transaction is about
+		// to write, holding them so a concurrent move cannot relocate a file
+		// between the ancestry check and the update below.
+		if err := s.authorizeCommitFiles(ctx, tx, folderID, changes, treeState); err != nil {
+			return err
+		}
+
+		// Save commit
+		if err := tx.Create(commit).Error; err != nil {
+			return fmt.Errorf("failed to create commit: %w", err)
+		}
+
+		// Backfill parent_id for existing tree_state entries
+		for fid, entry := range treeState {
+			if m, ok := entry.(map[string]interface{}); ok {
+				if _, has := m["parent_id"]; !has {
+					var fileRec entity.File
+					if err := tx.Select("parent_id").Where("id = ?", fid).First(&fileRec).Error; err == nil {
+						m["parent_id"] = fileRec.ParentID
+					}
+				}
+			}
+		}
+
+		storageImpl := storage.GetStorageFactory().GetStorage()
+
+		for _, change := range changes {
+			item := &entity.FileCommitItem{
+				ID:        common.GenerateUUID(),
+				CommitID:  commitID,
+				FileID:    change.FileID,
+				Operation: change.Operation,
+			}
+
+			switch change.Operation {
+			case "add", "modify":
+				contentBytes := []byte(change.Content)
+				hash := sha256.Sum256(contentBytes)
+				hashHex := hex.EncodeToString(hash[:])
+				objKey := ".objects/" + hashHex
+
+				if storageImpl != nil {
+					if err := storageImpl.Put(ctx, folderID, objKey, contentBytes); err != nil {
+						return fmt.Errorf("failed to store object: %w", err)
+					}
+				}
+
+				if change.Operation == "modify" {
+					if oldEntry, ok := treeState[change.FileID]; ok {
+						if oldMap, ok := oldEntry.(map[string]interface{}); ok {
+							if oldHash, ok := oldMap["hash"].(string); ok {
+								item.OldHash = &oldHash
+							}
+							if oldLoc, ok := oldMap["location"].(string); ok {
+								item.OldLocation = &oldLoc
+							}
+						}
+					}
+				}
+
+				item.NewHash = &hashHex
+				item.NewLocation = &objKey
+
+				fSize := int64(len(contentBytes))
+				if err := tx.Model(&entity.File{}).Where("id = ?", change.FileID).Updates(map[string]interface{}{
+					"location": objKey,
+					"size":     fSize,
+				}).Error; err != nil {
+					return fmt.Errorf("failed to update file record: %w", err)
+				}
+
+				// Look up parent_id from the File table
+				fileParentID := ""
+				var fileRec entity.File
+				if err := tx.Select("parent_id").Where("id = ?", change.FileID).First(&fileRec).Error; err == nil {
+					fileParentID = fileRec.ParentID
+				}
+
+				treeState[change.FileID] = map[string]interface{}{
+					"hash":      hashHex,
+					"location":  objKey,
+					"name":      change.FileName,
+					"size":      fSize,
+					"status":    "1",
+					"parent_id": fileParentID,
+				}
+
+			case "delete":
+				if oldEntry, ok := treeState[change.FileID]; ok {
+					if oldMap, ok := oldEntry.(map[string]interface{}); ok {
+						if oldHash, ok := oldMap["hash"].(string); ok {
+							item.OldHash = &oldHash
+						}
+						if oldLoc, ok := oldMap["location"].(string); ok {
+							item.OldLocation = &oldLoc
+						}
+					}
+				}
+
+				// The file table has no status column: a deleted file is one
+				// already removed from the live tree, so the commit only keeps
+				// the tombstone in tree_state for history and diffs. A file
+				// that is still live would otherwise be hidden from
+				// GetUncommittedChanges for good: that scan marks every
+				// committed entry as processed and skips tombstones, so the
+				// live row is reported as neither deleted nor added.
+				liveInFolder, err := s.fileTreeContains(ctx, tx, folderID, change.FileID)
+				if err != nil {
+					return err
+				}
+				if liveInFolder {
+					return fmt.Errorf("%w: %s", ErrDeleteLiveFile, change.FileID)
+				}
+
+				if entry, ok := treeState[change.FileID]; ok {
+					if entryMap, ok := entry.(map[string]interface{}); ok {
+						entryMap["status"] = "0"
+					}
+				}
+
+			case "rename":
+				newName := change.NewName
+				item.OldName = &change.OldName
+				item.NewName = &newName
+
+				if err := tx.Model(&entity.File{}).Where("id = ?", change.FileID).Update("name", newName).Error; err != nil {
+					return fmt.Errorf("failed to rename file: %w", err)
+				}
+
+				if entry, ok := treeState[change.FileID]; ok {
+					if entryMap, ok := entry.(map[string]interface{}); ok {
+						entryMap["name"] = newName
+					}
+				} else {
+					treeState[change.FileID] = map[string]interface{}{
+						"name":   newName,
+						"status": "1",
+					}
+				}
+			}
+
+			// Save commit item
+			if err := tx.Create(item).Error; err != nil {
+				return fmt.Errorf("failed to create commit item: %w", err)
+			}
+		}
+
+		// Serialize and save tree state
+		treeJSON, err := json.Marshal(treeState)
+		if err != nil {
+			return fmt.Errorf("failed to marshal tree state: %w", err)
+		}
+		if err = tx.Model(&entity.FileCommit{}).Where("id = ?", commitID).Update("tree_state", string(treeJSON)).Error; err != nil {
+			return fmt.Errorf("failed to update tree state: %w", err)
+		}
+		treeStr = string(treeJSON)
+
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	commit.TreeState = &treeStr
+	commit.CreateTime = &nowMs
+
+	return commit, nil
+}
+
+// authorizeCommitFiles rejects commit changes whose file IDs fall outside the
+// commit folder. The route only proves the caller may use folderID, while every
+// files[].file_id is independent client input and the writes below address file
+// rows by ID alone, so an unchecked ID retargets another workspace or tenant
+// (IDOR, CWE-639). A change may record the deletion of a file that was already
+// removed or moved away, so such a delete-only ID is validated against the
+// previous tree state instead of the file table: every ID that ever entered the
+// folder history has a tree entry, and one that does not would mint a tombstone
+// for an arbitrary ID that the global per-file version history then exposes.
+//
+// It runs inside the commit transaction and locks the rows it reads: a
+// concurrent move would otherwise be able to relocate a file (or one of its
+// ancestors) after the parent chain was checked and before the write.
+func (s *FileCommitService) authorizeCommitFiles(ctx context.Context, tx *gorm.DB, folderID string, changes []entity.FileChange, treeState map[string]interface{}) error {
+	var folder entity.File
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", folderID).First(&folder).Error; err != nil {
+		return fmt.Errorf("resolve commit folder %s: %w", folderID, err)
+	}
+	if folder.Type != FileTypeFolder {
+		return fmt.Errorf("%w: %s is not a folder", permission.ErrResourceNotFound, folderID)
+	}
+
+	operations := make(map[string][]string, len(changes))
+	ids := make([]string, 0, len(changes))
+	for _, change := range changes {
+		if change.FileID == "" {
+			return fmt.Errorf("%w: file_id is required", permission.ErrResourceNotFound)
+		}
+		if _, seen := operations[change.FileID]; !seen {
+			ids = append(ids, change.FileID)
+		}
+		operations[change.FileID] = append(operations[change.FileID], change.Operation)
+	}
+
+	files, err := lockedCommitFiles(tx, ids)
+	if err != nil {
+		return fmt.Errorf("resolve commit files: %w", err)
+	}
+	existing := make(map[string]*entity.File, len(files))
+	for _, file := range files {
+		existing[file.ID] = file
+	}
+	scoped := make(map[string]*entity.File, len(existing))
+	for _, id := range ids {
+		hasNonDelete := false
+		for _, operation := range operations[id] {
+			if operation != "delete" {
+				hasNonDelete = true
+				break
+			}
+		}
+		if hasNonDelete {
+			file, ok := existing[id]
+			if !ok {
+				return fmt.Errorf("%w: file %s not found in folder %s", permission.ErrPermissionDenied, id, folderID)
+			}
+			scoped[id] = file
+		} else {
+			// A delete-only change records a tombstone in tree_state and never
+			// writes the file row, so the ID must be one this folder actually
+			// committed before (a file since removed or moved away). An ID
+			// absent from the previous tree never belonged to this history,
+			// whether it still has a live row elsewhere or not.
+			if _, ok := treeState[id]; !ok {
+				return fmt.Errorf("%w: file %s not found in folder %s", permission.ErrPermissionDenied, id, folderID)
+			}
+		}
+	}
+	return ensureFilesInFolder(tx, folderID, scoped)
+}
+
+// lockedCommitFiles loads file rows for the commit transaction with write locks
+// so their parent_id cannot change underneath the ancestry check.
+func lockedCommitFiles(tx *gorm.DB, ids []string) ([]*entity.File, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var files []*entity.File
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id IN ?", ids).Find(&files).Error
+	return files, err
+}
+
+// ensureFilesInFolder rejects files whose parent chain does not reach folderID.
+// Ancestors are resolved one folder level at a time, so a commit verifies all of
+// its files with one query per tree depth instead of one query per file.
+func ensureFilesInFolder(tx *gorm.DB, folderID string, files map[string]*entity.File) error {
+	if len(files) == 0 {
+		return nil
+	}
+	parentOf := make(map[string]string, len(files))
+	frontier := make([]string, 0, len(files))
+	for id, file := range files {
+		if id == folderID {
+			continue
+		}
+		parentOf[id] = file.ParentID
+		frontier = append(frontier, file.ParentID)
+	}
+
+	for depth := 0; depth < maxCommitFolderDepth && len(frontier) > 0; depth++ {
+		load := make([]string, 0, len(frontier))
+		queued := make(map[string]struct{}, len(frontier))
+		for _, id := range frontier {
+			if id == "" || id == folderID {
+				continue
+			}
+			if _, known := parentOf[id]; known {
+				continue
+			}
+			if _, dup := queued[id]; dup {
+				continue
+			}
+			queued[id] = struct{}{}
+			load = append(load, id)
+		}
+		if len(load) == 0 {
+			break
+		}
+		ancestors, err := lockedCommitFiles(tx, load)
+		if err != nil {
+			return fmt.Errorf("resolve commit file ancestors: %w", err)
+		}
+		for _, ancestor := range ancestors {
+			parentOf[ancestor.ID] = ancestor.ParentID
+		}
+		frontier = frontier[:0]
+		for _, id := range load {
+			parent, ok := parentOf[id]
+			if !ok {
+				// A missing ancestor terminates the chain for its descendants.
+				parentOf[id] = ""
+			}
+			frontier = append(frontier, parent)
+		}
+	}
+
+	for id := range files {
+		if !commitFileInFolder(id, folderID, parentOf) {
+			return fmt.Errorf("%w: file %s is outside folder %s", permission.ErrPermissionDenied, id, folderID)
+		}
+	}
+	return nil
+}
+
+func commitFileInFolder(fileID, folderID string, parentOf map[string]string) bool {
+	visited := make(map[string]struct{})
+	for current := fileID; current != ""; {
+		if current == folderID {
+			return true
+		}
+		if _, cycle := visited[current]; cycle {
+			return false
+		}
+		visited[current] = struct{}{}
+		current = parentOf[current]
+	}
+	return false
+}
+
+// PageEditCommitInput carries the data needed to record a single wiki/skill
+// page edit as an audit commit.
+type PageEditCommitInput struct {
+	DatasetID  string // knowledgebase scope, stored on the commit for isolation
+	Slug       string
+	PageType   string
+	Title      string
+	Comments   string // version note typed by the user in the commit dialog
+	AuthorID   string
+	OldContent string
+	NewContent string
+}
+
+// wikiFileID derives the stable file key used to scope page-edit commits to a
+// specific knowledgebase and page, so identical slugs in different
+// knowledgebases never share a commit parent or history.
+func wikiFileID(datasetID, pageType, slug string) string {
+	return datasetID + "/" + pageType + "/" + slug
+}
+
+var pageCommitSeq atomic.Uint64
+
+const (
+	wikiContentStorage     = "minio"
+	wikiCommitBucketPrefix = ".wiki_commits"
+)
+
+// RecordPageEdit records a wiki/skill page edit as an audit commit with a
+// git-style parent chain (each edit points at the previous commit for the same
+// page). The post-save content is stored as a content-addressed object and a
+// unified diff is stored on the commit item. The commit is scoped to the
+// dataset via FolderID and a derived page file key so page histories never cross
+// knowledgebase boundaries.
+//
+// This path is independent of the workspace File tree (it does not require a
+// File record or a tree_state snapshot).
+func (s *FileCommitService) RecordPageEdit(ctx context.Context, in PageEditCommitInput) (*entity.FileCommit, error) {
+	// Parent chain: previous commit that touched the same page file key.
+	fileID := wikiFileID(in.DatasetID, in.PageType, in.Slug)
+
+	commitID := common.GenerateUUID()
+
+	diffText := unifiedDiff(in.OldContent, in.NewContent)
+	if diffText == "" {
+		return nil, nil
+	}
+	contentAfterStorage, contentAfterLocation := s.storePageContent(ctx, in.DatasetID, in.NewContent)
+	slugKwd := in.Slug
+	pageTypeKwd := in.PageType
+	operation := "modify"
+	if in.OldContent == "" {
+		operation = "add"
+	}
+
+	item := &entity.FileCommitItem{
+		ID:          common.GenerateUUID(),
+		CommitID:    commitID,
+		FileID:      fileID,
+		Operation:   operation,
+		Diff:        &diffText,
+		SlugKwd:     &slugKwd,
+		PageTypeKwd: &pageTypeKwd,
+	}
+	if contentAfterStorage != "" {
+		item.ContentAfterStorage = &contentAfterStorage
+	}
+	if contentAfterLocation != "" {
+		item.ContentAfterLocation = &contentAfterLocation
+	}
+
+	var commit *entity.FileCommit
+	// Serialize parent selection with insertion in process so two concurrent
+	// edits on the same page cannot both read the same parent and fork the
+	// chain. This is backend-agnostic (works identically on MySQL and SQLite)
+	// and cheaper than row-level DB locks.
+	mu := pageCommitLock(fileID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	item.Seq = uint(pageCommitSeq.Add(1))
+
+	// Read the parent inside the lock, on the shared connection, so it always
+	// reflects the previously committed edit for this page.
+	parentID, perr := s.commitItemDAO.GetLatestCommitIDByFileID(ctx, dao.DB, fileID)
+	if perr != nil {
+		return nil, fmt.Errorf("failed to resolve page commit parent: %w", perr)
+	}
+
+	title := utility.TruncateRunes(strings.TrimSpace(in.Title), common.NameLimit255)
+	commit = &entity.FileCommit{
+		ID:        commitID,
+		FolderID:  in.DatasetID,
+		Message:   title,
+		AuthorID:  in.AuthorID,
+		Title:     &title,
+		Comments:  &in.Comments,
+		FileCount: 1,
+	}
+	if parentID != "" {
+		commit.ParentID = &parentID
+	}
+
+	if err := dao.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if cerr := tx.Create(commit).Error; cerr != nil {
+			return fmt.Errorf("failed to create page commit: %w", cerr)
+		}
+		if ierr := tx.Create(item).Error; ierr != nil {
+			return fmt.Errorf("failed to create page commit item: %w", ierr)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	return commit, nil
+}
+
+// storePageContent saves a page version in the same dataset-scoped object
+// layout used by Python's MinIO-backed artifact history. Missing storage is
+// tolerated because page updates and audit rows are intentionally best-effort.
+func (s *FileCommitService) storePageContent(ctx context.Context, datasetID, content string) (string, string) {
+	storageImpl := storage.GetStorageFactory().GetStorage()
+	if storageImpl == nil {
+		return "", ""
+	}
+	hash := sha256.Sum256([]byte(content))
+	location := wikiCommitBucketPrefix + "/" + hex.EncodeToString(hash[:])
+	if err := storageImpl.Put(ctx, datasetID, location, []byte(content)); err != nil {
+		common.Warn("failed to store wiki commit content", zap.Error(err))
+		return "", ""
+	}
+	return wikiContentStorage, location
+}
+
+// pageCommitLocks is a per-page-file-key mutex registry that serializes
+// RecordPageEdit calls for the same page. Entries are retained for the process
+// lifetime (bounded by the number of distinct pages edited).
+var pageCommitLocks sync.Map // fileID -> *sync.Mutex
+
+func pageCommitLock(fileID string) *sync.Mutex {
+	v, _ := pageCommitLocks.LoadOrStore(fileID, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
+// ListPageCommits lists audit commits for a specific wiki/skill page and
+// returns them in the row shape the wiki version-history UI consumes
+// (Python list_page_commits parity), including author nicknames.
+func (s *FileCommitService) ListPageCommits(ctx context.Context, datasetID, pageType, slug string, page, pageSize int) ([]*entity.WikiPageCommit, int64, error) {
+	items, err := s.commitItemDAO.ListByFileID(ctx, dao.DB, wikiFileID(datasetID, pageType, slug))
+	if err != nil {
+		return nil, 0, err
+	}
+	commitIDs := make([]string, 0, len(items))
+	for _, it := range items {
+		commitIDs = append(commitIDs, it.CommitID)
+	}
+	if len(commitIDs) == 0 {
+		return []*entity.WikiPageCommit{}, 0, nil
+	}
+
+	commits, total, err := s.commitDAO.ListByIDs(ctx, dao.DB, commitIDs, page, pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Resolve author nicknames for all distinct authors in one batched
+	// lookup (Python list_page_commits parity: a single IN query); a failed
+	// lookup degrades to empty nicknames instead of failing the listing.
+	authorIDs := make([]string, 0, len(commits))
+	seenAuthors := make(map[string]struct{}, len(commits))
+	for _, c := range commits {
+		if c.AuthorID == "" {
+			continue
+		}
+		if _, ok := seenAuthors[c.AuthorID]; ok {
+			continue
+		}
+		seenAuthors[c.AuthorID] = struct{}{}
+		authorIDs = append(authorIDs, c.AuthorID)
+	}
+	nicknames := make(map[string]string, len(authorIDs))
+	if len(authorIDs) > 0 {
+		if resolved, uerr := dao.NewUserDAO().GetNicknamesByIDs(ctx, dao.DB, authorIDs); uerr == nil {
+			nicknames = resolved
+		}
+	}
+
+	rows := make([]*entity.WikiPageCommit, 0, len(commits))
+	for _, c := range commits {
+		row := &entity.WikiPageCommit{
+			ID:           c.ID,
+			UserID:       c.AuthorID,
+			CreateTime:   c.CreateTime,
+			CreateDate:   c.CreateDate,
+			UserNickname: nicknames[c.AuthorID],
+		}
+		if c.Title != nil {
+			row.Title = *c.Title
+		}
+		if c.Comments != nil {
+			row.Comments = *c.Comments
+		}
+		rows = append(rows, row)
+	}
+	return rows, total, nil
+}
+
+type unifiedDiffLine struct {
+	prefix  byte
+	text    string
+	oldLine int
+	newLine int
+}
+
+// unifiedDiff produces a standard unified diff that can be parsed by the
+// frontend's wiki diff renderer and Python's artifact history implementation.
+func unifiedDiff(oldText, newText string) string {
+	oldLines := strings.Split(oldText, "\n")
+	newLines := strings.Split(newText, "\n")
+
+	const contextLines = 3
+	// Longest common subsequence over lines, then render the diff.
+	cur := make([][]int, len(oldLines)+1)
+	for i := range cur {
+		cur[i] = make([]int, len(newLines)+1)
+	}
+	for i := len(oldLines) - 1; i >= 0; i-- {
+		for j := len(newLines) - 1; j >= 0; j-- {
+			if oldLines[i] == newLines[j] {
+				cur[i][j] = cur[i+1][j+1] + 1
+			} else if cur[i+1][j] >= cur[i][j+1] {
+				cur[i][j] = cur[i+1][j]
+			} else {
+				cur[i][j] = cur[i][j+1]
+			}
+		}
+	}
+
+	lines := make([]unifiedDiffLine, 0, len(oldLines)+len(newLines))
+	i, j := 0, 0
+	for i < len(oldLines) && j < len(newLines) {
+		if oldLines[i] == newLines[j] {
+			lines = append(lines, unifiedDiffLine{' ', oldLines[i], i + 1, j + 1})
+			i++
+			j++
+		} else if cur[i+1][j] >= cur[i][j+1] {
+			lines = append(lines, unifiedDiffLine{'-', oldLines[i], i + 1, 0})
+			i++
+		} else {
+			lines = append(lines, unifiedDiffLine{'+', newLines[j], 0, j + 1})
+			j++
+		}
+	}
+	for ; i < len(oldLines); i++ {
+		lines = append(lines, unifiedDiffLine{'-', oldLines[i], i + 1, 0})
+	}
+	for ; j < len(newLines); j++ {
+		lines = append(lines, unifiedDiffLine{'+', newLines[j], 0, j + 1})
+	}
+
+	changed := make([]int, 0)
+	for index, line := range lines {
+		if line.prefix != ' ' {
+			changed = append(changed, index)
+		}
+	}
+	if len(changed) == 0 {
+		return ""
+	}
+
+	// Group nearby changes into hunks with up to three context lines, matching
+	// the format produced by Python's difflib.unified_diff.
+	type diffHunk struct {
+		start int
+		end   int
+	}
+	hunks := make([]diffHunk, 0)
+	for _, index := range changed {
+		start := index - contextLines
+		if start < 0 {
+			start = 0
+		}
+		end := index + contextLines
+		if end >= len(lines) {
+			end = len(lines) - 1
+		}
+		if len(hunks) > 0 && start <= hunks[len(hunks)-1].end+1 {
+			if end > hunks[len(hunks)-1].end {
+				hunks[len(hunks)-1].end = end
+			}
+			continue
+		}
+		hunks = append(hunks, diffHunk{start: start, end: end})
+	}
+
+	var b strings.Builder
+	b.WriteString("--- a\n+++ b\n")
+	for _, hunk := range hunks {
+		oldStart, oldCount := diffRange(lines, hunk.start, hunk.end, false, len(oldLines))
+		newStart, newCount := diffRange(lines, hunk.start, hunk.end, true, len(newLines))
+		b.WriteString(fmt.Sprintf("@@ -%d,%d +%d,%d @@\n", oldStart, oldCount, newStart, newCount))
+		for index := hunk.start; index <= hunk.end; index++ {
+			b.WriteByte(lines[index].prefix)
+			b.WriteString(lines[index].text)
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+// diffRange returns the first line number and line count for one side of a
+// unified diff hunk. A zero count is valid for pure insertions or deletions.
+func diffRange(lines []unifiedDiffLine, start, end int, newSide bool, totalLines int) (int, int) {
+	first := 0
+	count := 0
+	for index := start; index <= end; index++ {
+		lineNumber := lines[index].oldLine
+		if newSide {
+			lineNumber = lines[index].newLine
+		}
+		if lineNumber == 0 {
+			continue
+		}
+		if first == 0 {
+			first = lineNumber
+		}
+		count++
+	}
+	if first == 0 {
+		first = totalLines
+	}
+	return first, count
+}
+
+// ListCommits lists commits for a workspace folder with pagination
+func (s *FileCommitService) ListCommits(ctx context.Context, folderID string, page, pageSize int, orderBy string, desc bool) ([]*entity.FileCommit, int64, error) {
+	return s.commitDAO.ListByFolderID(ctx, dao.DB, folderID, page, pageSize, orderBy, desc)
+}
+
+// GetCommit gets a single commit by ID
+func (s *FileCommitService) GetCommit(ctx context.Context, commitID string) (*entity.FileCommit, error) {
+	return s.commitDAO.GetByID(ctx, dao.DB, commitID)
+}
+
+// GetPageCommitDetail returns the flat artifact-page commit shape shared by
+// the Python API and the wiki version-history frontend.
+func (s *FileCommitService) GetPageCommitDetail(ctx context.Context, datasetID, commitID string) (*entity.WikiPageCommitDetail, error) {
+	commit, err := s.commitDAO.GetByID(ctx, dao.DB, commitID)
+	if err != nil {
+		return nil, err
+	}
+	if commit.FolderID != datasetID || commit.Title == nil {
+		return nil, common.ErrNotFound
+	}
+
+	items, err := s.commitItemDAO.ListByCommitID(ctx, dao.DB, commitID)
+	if err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return nil, common.ErrNotFound
+	}
+	item := items[0]
+
+	tenantID := ""
+	if s.kbDAO != nil {
+		kb, kerr := s.kbDAO.GetByID(ctx, dao.DB, datasetID)
+		if kerr != nil {
+			return nil, kerr
+		}
+		tenantID = kb.TenantID
+	}
+
+	pageType := ""
+	if item.PageTypeKwd != nil {
+		pageType = *item.PageTypeKwd
+	}
+	slug := ""
+	if item.SlugKwd != nil {
+		slug = *item.SlugKwd
+	}
+	diff := ""
+	if item.Diff != nil {
+		diff = *item.Diff
+	}
+	title := ""
+	if commit.Title != nil {
+		title = *commit.Title
+	}
+	comments := ""
+	if commit.Comments != nil {
+		comments = *commit.Comments
+	}
+
+	var userID *string
+	if commit.AuthorID != "" {
+		authorID := commit.AuthorID
+		userID = &authorID
+	}
+	nickname := ""
+	if commit.AuthorID != "" {
+		if resolved, nerr := dao.NewUserDAO().GetNicknameByID(ctx, dao.DB, commit.AuthorID); nerr == nil {
+			nickname = resolved
+		}
+	}
+
+	return &entity.WikiPageCommitDetail{
+		ID:           commit.ID,
+		TenantID:     tenantID,
+		KBID:         datasetID,
+		PageType:     pageType,
+		Slug:         slug,
+		UserID:       userID,
+		UserNickname: nickname,
+		Title:        title,
+		Comments:     comments,
+		Diff:         diff,
+		ContentAfter: s.readPageContent(ctx, datasetID, tenantID, pageType, slug, item),
+		CreateTime:   commit.CreateTime,
+		CreateDate:   commit.CreateDate,
+	}, nil
+}
+
+func (s *FileCommitService) readPageContent(ctx context.Context, datasetID, tenantID, pageType, slug string, item *entity.FileCommitItem) string {
+	if item != nil && item.ContentAfterStorage != nil && item.ContentAfterLocation != nil {
+		storageKind := *item.ContentAfterStorage
+		location := *item.ContentAfterLocation
+		switch storageKind {
+		case wikiContentStorage, "minio_storage":
+			if storageImpl := storage.GetStorageFactory().GetStorage(); storageImpl != nil {
+				if content, err := storageImpl.Get(ctx, datasetID, location); err == nil {
+					return string(content)
+				}
+			}
+		case "es":
+			if docEngine := engine.Get(); docEngine != nil && tenantID != "" {
+				raw, err := docEngine.GetChunk(ctx, wikiIndexName(tenantID), location, []string{datasetID})
+				if err == nil {
+					if content := pageContentValue(raw); content != "" {
+						return content
+					}
+				}
+			}
+		}
+	}
+
+	// Older Go page commits referenced the live page document instead of a
+	// content snapshot. Keep those records readable while all new commits use
+	// the snapshot path above.
+	return s.readCurrentPageContent(ctx, tenantID, datasetID, pageType, slug)
+}
+
+func (s *FileCommitService) readCurrentPageContent(ctx context.Context, tenantID, datasetID, pageType, slug string) string {
+	if tenantID == "" || datasetID == "" || pageType == "" || slug == "" {
+		return ""
+	}
+	docEngine := engine.Get()
+	if docEngine == nil {
+		return ""
+	}
+	slugKwd := slug
+	if !strings.HasPrefix(slugKwd, pageType+"/") {
+		slugKwd = pageType + "/" + slugKwd
+	}
+	result, err := docEngine.Search(ctx, &enginetypes.SearchRequest{
+		IndexNames:   []string{wikiIndexName(tenantID)},
+		KbIDs:        []string{datasetID},
+		Limit:        1,
+		SelectFields: []string{"id", "content_with_weight"},
+		Filter: map[string]interface{}{
+			"type_kwd":      []string{"wiki_page"},
+			"page_type_kwd": []string{pageType},
+			"slug_kwd":      []string{slugKwd},
+			"available_int": 1,
+		},
+	})
+	if err != nil {
+		common.Warn("failed to read current Wiki page content", zap.Error(err))
+		return ""
+	}
+	if result == nil || len(result.Chunks) == 0 {
+		return ""
+	}
+	row := result.Chunks[0]
+	if content := enginetypes.WikiPageContent(row); content != "" {
+		return content
+	}
+	raw, err := docEngine.GetChunk(ctx, wikiIndexName(tenantID), pageContentValue(row["id"]), []string{datasetID})
+	if err != nil {
+		common.Warn("failed to read stored Wiki page content", zap.Error(err))
+		return ""
+	}
+	stored, _ := raw.(map[string]interface{})
+	return enginetypes.WikiPageContent(stored)
+}
+
+func pageContentValue(value interface{}) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []string:
+		if len(v) > 0 {
+			return v[0]
+		}
+	case []interface{}:
+		if len(v) > 0 {
+			if first, ok := v[0].(string); ok {
+				return first
+			}
+		}
+	}
+	return ""
+}
+
+func wikiIndexName(tenantID string) string {
+	return "ragflow_" + tenantID
+}
+
+// ListCommitFiles lists all file change items for a commit
+func (s *FileCommitService) ListCommitFiles(ctx context.Context, commitID string) ([]*entity.FileCommitItem, error) {
+	return s.commitItemDAO.ListByCommitID(ctx, dao.DB, commitID)
+}
+
+// DiffCommits compares two commits and returns the diff
+func (s *FileCommitService) DiffCommits(ctx context.Context, fromID, toID string) ([]entity.DiffEntry, error) {
+	fromItems, err := s.commitItemDAO.ListByCommitID(ctx, dao.DB, fromID)
+	if err != nil {
+		return nil, err
+	}
+	toItems, err := s.commitItemDAO.ListByCommitID(ctx, dao.DB, toID)
+	if err != nil {
+		return nil, err
+	}
+
+	fromMap := make(map[string]*entity.FileCommitItem)
+	for _, item := range fromItems {
+		fromMap[item.FileID] = item
+	}
+	toMap := make(map[string]*entity.FileCommitItem)
+	for _, item := range toItems {
+		toMap[item.FileID] = item
+	}
+
+	// Get tree state for file names (use to commit)
+	toCommit, err := s.commitDAO.GetByID(ctx, dao.DB, toID)
+	treeState := make(map[string]interface{})
+	if err == nil && toCommit != nil && toCommit.TreeState != nil {
+		json.Unmarshal([]byte(*toCommit.TreeState), &treeState)
+	}
+
+	getFileName := func(fileID string) string {
+		if entry, ok := treeState[fileID]; ok {
+			if m, ok := entry.(map[string]interface{}); ok {
+				if name, ok := m["name"].(string); ok {
+					return name
+				}
+			}
+		}
+		return fileID
+	}
+
+	allFileIDs := make(map[string]bool)
+	for fid := range fromMap {
+		allFileIDs[fid] = true
+	}
+	for fid := range toMap {
+		allFileIDs[fid] = true
+	}
+
+	// Sort for deterministic output
+	var sortedIDs []string
+	for fid := range allFileIDs {
+		sortedIDs = append(sortedIDs, fid)
+	}
+	sort.Strings(sortedIDs)
+
+	var diff []entity.DiffEntry
+	for _, fid := range sortedIDs {
+		fromItem := fromMap[fid]
+		toItem := toMap[fid]
+
+		var entry entity.DiffEntry
+		entry.FileID = fid
+		entry.FileName = getFileName(fid)
+
+		if fromItem != nil && toItem == nil {
+			// Deleted
+			entry.Operation = "delete"
+			entry.OldHash = fromItem.NewHash
+			entry.OldLocation = fromItem.NewLocation
+		} else if fromItem == nil && toItem != nil {
+			// Added
+			entry.Operation = "add"
+			entry.NewHash = toItem.NewHash
+			entry.NewLocation = toItem.NewLocation
+		} else {
+			// Both exist — compare hashes
+			fromHash := ""
+			if fromItem.NewHash != nil {
+				fromHash = *fromItem.NewHash
+			}
+			toHash := ""
+			if toItem.NewHash != nil {
+				toHash = *toItem.NewHash
+			}
+			if fromHash != toHash {
+				entry.Operation = "modify"
+				entry.OldHash = fromItem.NewHash
+				entry.OldLocation = fromItem.NewLocation
+				entry.NewHash = toItem.NewHash
+				entry.NewLocation = toItem.NewLocation
+			}
+		}
+
+		if entry.Operation != "" {
+			diff = append(diff, entry)
+		}
+	}
+
+	return diff, nil
+}
+
+// GetUncommittedChanges gets uncommitted changes for a workspace folder.
+// Recursively scans all sub-folders.
+func (s *FileCommitService) GetUncommittedChanges(ctx context.Context, folderID string) ([]entity.DiffEntry, error) {
+	// Get latest commit tree state
+	latest, err := s.commitDAO.GetLatestByFolderID(ctx, dao.DB, folderID)
+	committedFiles := make(map[string]map[string]interface{})
+	if err == nil && latest != nil && latest.TreeState != nil {
+		var treeData map[string]interface{}
+		if jsonErr := json.Unmarshal([]byte(*latest.TreeState), &treeData); jsonErr == nil {
+			for k, v := range treeData {
+				if m, ok := v.(map[string]interface{}); ok {
+					committedFiles[k] = m
+				}
+			}
+		}
+	}
+
+	// Get all live files recursively under this folder
+	liveMap := s.collectAllFilesRecursive(ctx, folderID)
+
+	var changes []entity.DiffEntry
+	processed := make(map[string]bool)
+
+	// Check committed files for modifications and deletions
+	for fid, committedEntry := range committedFiles {
+		processed[fid] = true
+		if committedEntry["status"] == "0" {
+			continue
+		}
+
+		if liveFile, ok := liveMap[fid]; ok {
+			liveHash := computeLiveFileHash(ctx, folderID, fid, liveFile)
+			committedHash := ""
+			if h, ok := committedEntry["hash"].(string); ok {
+				committedHash = h
+			}
+			if liveHash != "" && liveHash != committedHash {
+				changes = append(changes, entity.DiffEntry{
+					FileID:    fid,
+					FileName:  liveFile.Name,
+					Operation: "modify",
+				})
+			}
+		} else {
+			name := ""
+			if n, ok := committedEntry["name"].(string); ok {
+				name = n
+			}
+			changes = append(changes, entity.DiffEntry{
+				FileID:    fid,
+				FileName:  name,
+				Operation: "delete",
+			})
+		}
+	}
+
+	// Check for newly added files
+	for _, liveFile := range liveMap {
+		if !processed[liveFile.ID] {
+			changes = append(changes, entity.DiffEntry{
+				FileID:    liveFile.ID,
+				FileName:  liveFile.Name,
+				Operation: "add",
+			})
+		}
+	}
+
+	return changes, nil
+}
+
+// collectAllFilesRecursive recursively collects all non-folder files under a folder.
+func (s *FileCommitService) collectAllFilesRecursive(ctx context.Context, folderID string) map[string]*entity.File {
+	result := make(map[string]*entity.File)
+	// Direct files (non-folder)
+	files, _ := s.fileDAO.ListNonFolderByParentID(ctx, dao.DB, folderID)
+	for _, f := range files {
+		result[f.ID] = f
+	}
+	// Sub-folders — recurse
+	subFolders, _ := s.fileDAO.ListFolderByParentID(ctx, dao.DB, folderID)
+	for _, sf := range subFolders {
+		sub := s.collectAllFilesRecursive(ctx, sf.ID)
+		for k, v := range sub {
+			result[k] = v
+		}
+	}
+	return result
+}
+
+// GetCommitTree gets the tree state snapshot for a commit as a hierarchical tree.
+func (s *FileCommitService) GetCommitTree(ctx context.Context, commitID string) (map[string]interface{}, error) {
+	commit, err := s.commitDAO.GetByID(ctx, dao.DB, commitID)
+	if err != nil {
+		return nil, err
+	}
+	if commit.TreeState == nil {
+		return map[string]interface{}{"id": commit.FolderID, "name": "", "type": "folder", "children": []interface{}{}}, nil
+	}
+	var flat map[string]interface{}
+	if err = json.Unmarshal([]byte(*commit.TreeState), &flat); err != nil {
+		return nil, err
+	}
+	return s.buildHierarchicalTree(ctx, flat, commit.FolderID), nil
+}
+
+// buildHierarchicalTree builds a recursive tree from a flat tree_state map.
+// Sub-folder hierarchy is resolved from the File table's parent_id.
+func (s *FileCommitService) buildHierarchicalTree(ctx context.Context, flat map[string]interface{}, rootFolderID string) map[string]interface{} {
+	// Collect all unique folder IDs
+	folderIDs := map[string]bool{rootFolderID: true}
+	for _, v := range flat {
+		if entry, ok := v.(map[string]interface{}); ok {
+			pid, _ := entry["parent_id"].(string)
+			if pid == "" {
+				pid = rootFolderID
+			}
+			folderIDs[pid] = true
+		}
+	}
+
+	// Build folder parent map from File table
+	folderParentMap := make(map[string]string)
+	for fid := range folderIDs {
+		if fid != rootFolderID {
+			if f, err := s.fileDAO.GetByID(ctx, dao.DB, fid); err == nil {
+				folderParentMap[fid] = f.ParentID
+			}
+		}
+	}
+
+	// Group file entries by parent_id
+	filesByParent := make(map[string][]string)
+	fileEntries := make(map[string]map[string]interface{})
+	for fid, v := range flat {
+		entry, ok := v.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		pid, _ := entry["parent_id"].(string)
+		if pid == "" {
+			pid = rootFolderID
+		}
+		filesByParent[pid] = append(filesByParent[pid], fid)
+		fileEntries[fid] = entry
+	}
+
+	// Group sub-folders by their parent
+	childrenByFolder := make(map[string][]string)
+	for sfid, ppid := range folderParentMap {
+		childrenByFolder[ppid] = append(childrenByFolder[ppid], sfid)
+	}
+
+	var buildNode func(nodeID string) map[string]interface{}
+	buildNode = func(nodeID string) map[string]interface{} {
+		nodeName := nodeID
+		if f, err := s.fileDAO.GetByID(ctx, dao.DB, nodeID); err == nil {
+			nodeName = f.Name
+		}
+		node := map[string]interface{}{
+			"id":       nodeID,
+			"name":     nodeName,
+			"type":     "folder",
+			"children": []interface{}{},
+		}
+
+		// File children
+		for _, fid := range filesByParent[nodeID] {
+			entry := fileEntries[fid]
+			fn := map[string]interface{}{
+				"id":     fid,
+				"name":   entry["name"],
+				"type":   "file",
+				"hash":   entry["hash"],
+				"size":   entry["size"],
+				"status": entry["status"],
+			}
+			if loc, ok := entry["location"].(string); ok && loc != "" {
+				fn["location"] = loc
+			}
+			node["children"] = append(node["children"].([]interface{}), fn)
+		}
+		// Sub-folder children
+		for _, sfid := range childrenByFolder[nodeID] {
+			child := buildNode(sfid)
+			node["children"] = append(node["children"].([]interface{}), child)
+		}
+		return node
+	}
+
+	return buildNode(rootFolderID)
+}
+
+// GetCommitFileContent gets file content as it existed in a given commit
+func (s *FileCommitService) GetCommitFileContent(ctx context.Context, folderID, commitID, fileID string) ([]byte, error) {
+	_, err := s.commitDAO.GetByID(ctx, dao.DB, commitID)
+	if err != nil {
+		return nil, fmt.Errorf("commit not found: %w", err)
+	}
+
+	item, err := s.commitItemDAO.GetByCommitIDAndFileID(ctx, dao.DB, commitID, fileID)
+	if err != nil {
+		return nil, fmt.Errorf("file not found in commit: %w", err)
+	}
+
+	if item.NewHash == nil && item.OldHash == nil {
+		return nil, fmt.Errorf("file has no content in this commit")
+	}
+
+	hash := ""
+	if item.NewHash != nil {
+		hash = *item.NewHash
+	} else if item.OldHash != nil {
+		hash = *item.OldHash
+	}
+
+	objKey := ".objects/" + hash
+
+	storageImpl := storage.GetStorageFactory().GetStorage()
+	if storageImpl == nil {
+		return nil, fmt.Errorf("storage not initialized")
+	}
+
+	blob, err := storageImpl.Get(ctx, folderID, objKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file content from storage: %w", err)
+	}
+
+	return blob, nil
+}
+
+// GetFileVersionHistory gets version history for a specific file
+func (s *FileCommitService) GetFileVersionHistory(ctx context.Context, fileID string) ([]entity.VersionEntry, error) {
+	items, err := s.commitItemDAO.ListByFileID(ctx, dao.DB, fileID)
+	if err != nil {
+		return nil, err
+	}
+
+	var versions []entity.VersionEntry
+	for _, item := range items {
+		var commit *entity.FileCommit
+		commit, err = s.commitDAO.GetByID(ctx, dao.DB, item.CommitID)
+		if err != nil {
+			continue
+		}
+
+		h := ""
+		if item.NewHash != nil {
+			h = *item.NewHash
+		} else if item.OldHash != nil {
+			h = *item.OldHash
+		}
+
+		versions = append(versions, entity.VersionEntry{
+			CommitID:   item.CommitID,
+			Operation:  item.Operation,
+			Hash:       h,
+			CreateTime: commit.CreateTime,
+			Message:    commit.Message,
+		})
+	}
+
+	return versions, nil
+}
+
+// computeLiveFileHash computes the SHA256 hash of current file content from storage
+func computeLiveFileHash(ctx context.Context, folderID, fileID string, file *entity.File) string {
+	if file.Location == nil || *file.Location == "" {
+		return ""
+	}
+
+	storageImpl := storage.GetStorageFactory().GetStorage()
+	if storageImpl == nil {
+		return ""
+	}
+
+	data, err := storageImpl.Get(ctx, folderID, *file.Location)
+	if err != nil {
+		return ""
+	}
+
+	hash := sha256.Sum256(data)
+	return hex.EncodeToString(hash[:])
+}

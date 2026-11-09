@@ -1,0 +1,295 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
+// Gap C — `GET /api/v1/agents/<canvas_id>/components/<component_id>/input-form`.
+// Gap D — `POST /api/v1/agents/<canvas_id>/components/<component_id>/debug`.
+//
+// Both endpoints introspect the user_canvas DSL via
+// internal/agent/dsl helpers and, for debug only, construct a runtime
+// component via the production factory. The python reference uses
+// @_require_canvas_access_sync/_async decorators which return
+// OPERATING_ERROR (103) with the python permission message; we
+// inline the check here via loader.LoadCanvasByID and surface the
+// same envelope (CodeOperatingError + canvasNoAccessMessage) so
+// existing clients can pattern-match the response.
+
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+
+	"ragflow/internal/agent/canvas"
+	"ragflow/internal/agent/component"
+	"ragflow/internal/agent/dsl"
+	"ragflow/internal/agent/runtime"
+	"ragflow/internal/common"
+	"ragflow/internal/dao"
+	"ragflow/internal/entity/models"
+	"ragflow/internal/permission"
+)
+
+// GetComponentInputForm GET /api/v1/agents/:canvas_id/components/:component_id/input-form
+func (h *AgentHandler) GetComponentInputForm(c *gin.Context) {
+	canvasID := c.Param("canvas_id")
+	componentID := c.Param("component_id")
+	if canvasID == "" || componentID == "" {
+		common.RespondError(c, common.CodeArgumentError, "`canvas_id` and `component_id` are required.")
+		return
+	}
+
+	cv, err := h.loader.LoadCanvasByID(c.Request.Context(), canvasID)
+	if err != nil {
+		if errors.Is(err, dao.ErrUserCanvasNotFound) {
+			common.RespondError(c, common.CodeOperatingError, canvasNoAccessMessage)
+			return
+		}
+		common.RespondError(c, common.CodeServerError, err.Error())
+		return
+	}
+
+	form, err := h.componentInputForm(c.Request.Context(), cv.DSL, componentID)
+	if err != nil {
+		mapDSLError(c, componentID, err)
+		return
+	}
+	common.RespondSuccess(c, form, "success")
+}
+
+// componentInputForm returns the input-form schema for a single component.
+// It first tries the params.inputs stored in the DSL; if the component
+// does not define one (e.g. Agent components that generate it dynamically),
+// it instantiates the runtime component and calls its GetInputForm method.
+// This mirrors Python's Canvas.get_component_input_form which invokes the
+// component's own get_input_form when the static field is absent.
+func (h *AgentHandler) componentInputForm(ctx context.Context, dslMap map[string]any, componentID string) (map[string]any, error) {
+	form, err := dsl.ExtractComponentInputForm(dslMap, componentID)
+	if err == nil {
+		return form, nil
+	}
+	if !errors.Is(err, dsl.ErrMissingInputForm) {
+		return nil, err
+	}
+
+	name, err := dsl.ExtractComponentName(dslMap, componentID)
+	if err != nil {
+		return nil, err
+	}
+	params, _ := dsl.ExtractComponentParams(dslMap, componentID)
+	comp, err := runtime.DefaultFactory()(name, params)
+	if err != nil {
+		return nil, fmt.Errorf("%w: component factory: %w", dsl.ErrMalformedDSL, err)
+	}
+	getter, ok := comp.(interface{ GetInputForm() map[string]any })
+	if !ok {
+		return nil, dsl.ErrMissingInputForm
+	}
+	form = getter.GetInputForm()
+	if form == nil {
+		form = map[string]any{}
+	}
+	return form, nil
+}
+
+// DebugComponent handles POST /api/v1/agents/:canvas_id/components/:component_id/debug.
+// It flattens params.*.value into component inputs and returns the debug outputs.
+// An Agent request with include_model_inputs=true requires update permission and
+// wraps outputs with request-local model-input diagnostics, including on failure.
+func (h *AgentHandler) DebugComponent(c *gin.Context) {
+	user, code, msg := GetUser(c)
+	if code != common.CodeSuccess {
+		common.RespondError(c, code, msg)
+		return
+	}
+	canvasID := c.Param("canvas_id")
+	componentID := c.Param("component_id")
+	if canvasID == "" || componentID == "" {
+		common.RespondError(c, common.CodeArgumentError, "`canvas_id` and `component_id` are required.")
+		return
+	}
+
+	var body struct {
+		Params             map[string]map[string]any `json:"params"`
+		IncludeModelInputs json.RawMessage           `json:"include_model_inputs"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		common.RespondError(c, common.CodeArgumentError, "Invalid request: "+err.Error())
+		return
+	}
+	if body.Params == nil {
+		common.RespondError(c, common.CodeArgumentError, "`params` is required.")
+		return
+	}
+	includeModelInputs := false
+	switch strings.TrimSpace(string(body.IncludeModelInputs)) {
+	case "", "false":
+	case "true":
+		includeModelInputs = true
+	default:
+		common.RespondError(c, common.CodeArgumentError, "`include_model_inputs` must be a boolean.")
+		return
+	}
+
+	cv, err := h.loader.LoadCanvasByID(c.Request.Context(), canvasID)
+	if err != nil {
+		if errors.Is(err, dao.ErrUserCanvasNotFound) {
+			common.RespondError(c, common.CodeOperatingError, canvasNoAccessMessage)
+			return
+		}
+		common.RespondError(c, common.CodeServerError, err.Error())
+		return
+	}
+
+	name, err := dsl.ExtractComponentName(cv.DSL, componentID)
+	if err != nil {
+		mapDSLError(c, componentID, err)
+		return
+	}
+	dslParams, _ := dsl.ExtractComponentParams(cv.DSL, componentID)
+
+	// Build the Invoke inputs map by flattening the request body's
+	// {param: {value: ...}} shape into {param: value}. Mirrors python
+	// agent_api.py:830 (`component.invoke(**{k: o["value"] for k, o in
+	// req["params"].items()})`).
+	//
+	// The body contract requires `params.*.value` — a missing value
+	// field used to slip through as nil and still invoke the
+	// component, which silently corrupted debug input. Now we fail
+	// fast. CodeRabbit PR review #2.
+	inputs := make(map[string]any, len(body.Params))
+	for k, v := range body.Params {
+		if v == nil {
+			common.RespondError(c, common.CodeArgumentError, "`params."+k+".value` is required.")
+			return
+		}
+		value, ok := v["value"]
+		if !ok {
+			common.RespondError(c, common.CodeArgumentError, "`params."+k+".value` is required.")
+			return
+		}
+		inputs[k] = value
+	}
+
+	factory := runtime.DefaultFactory()
+	if factory == nil {
+		common.RespondError(c, common.CodeServerError, "component factory not initialised")
+		return
+	}
+	comp, err := factory(name, dslParams)
+	if err != nil {
+		common.RespondError(c, common.CodeDataError, "component factory: "+err.Error())
+		return
+	}
+	if includeModelInputs {
+		if _, ok := comp.(*component.AgentComponent); !ok {
+			common.RespondError(c, common.CodeArgumentError, "Model inputs are available only for Agent components.")
+			return
+		}
+		if err := permission.NewDatabaseChecker(dao.DB).CheckResource(c.Request.Context(), permission.ResourceRef{Kind: permission.ResourceKindCanvas, ID: canvasID}, permission.OperationUpdate); err != nil {
+			if errors.Is(err, permission.ErrResourceNotFound) || errors.Is(err, permission.ErrPermissionDenied) {
+				common.RespondError(c, common.CodeOperatingError, canvasNoAccessMessage)
+			} else {
+				common.RespondError(c, common.CodeServerError, err.Error())
+			}
+			return
+		}
+	}
+
+	// D4: skip set_debug_inputs (python-only LLM debug hook). The
+	// raw Invoke already supports the same inputs.
+	//
+	// Begin (and other stateful components) reads a *CanvasState
+	// from the request context. We attach a fresh one here so
+	// debug works on a single component without standing up the
+	// full canvas compile.
+	//
+	// Seed the authenticated caller identity (sys.user_id / sys.tenant_id)
+	// through the same entry the run bootstrap uses, so components that
+	// authorize against it (e.g. knowledge retrieval) and components that
+	// resolve LLM credentials from the tenant tables (e.g. AgentComponent)
+	// behave in single-component debug mode exactly as they do in a real
+	// run. Mirrors Python's @add_tenant_id_to_kwargs decorator and keeps the
+	// two paths from drifting. The request body must not override either key.
+	//
+	// Also seed cpnID@param inputs into state.Outputs so a single-component
+	// debug can resolve the {{cpn@param}} references its prompt/template
+	// declares (e.g. Agent reading an upstream Retrieval's
+	// formalized_content) without running the upstream components. Split on
+	// the first '@' because cpn IDs may contain ':' but never '@'; SetVar
+	// nests any dotted tail the same way getVarLocked reads it back.
+	debugState := canvas.NewCanvasState("debug-"+componentID, "debug-task")
+	debugState.SeedIdentity(user.ID, user.ID)
+	for key, value := range inputs {
+		switch {
+		case strings.HasPrefix(key, "sys.") && key != "sys.tenant_id" && key != "sys.user_id":
+			debugState.SetSys(strings.TrimPrefix(key, "sys."), value)
+		case strings.Contains(key, "@"):
+			if idx := strings.Index(key, "@"); idx > 0 && idx < len(key)-1 {
+				debugState.SetVar(key[:idx], key[idx+1:], value)
+			}
+		}
+	}
+	// Permission checks in Retrieval use the authenticated caller and the
+	// canvas whose component is being debugged. Set these after copying inputs
+	// so request parameters cannot impersonate another user or canvas.
+	debugState.SetSys("canvas_id", cv.ID)
+	debugState.SetSys("user_id", user.ID)
+	invokeCtx := runtime.WithState(c.Request.Context(), debugState)
+	var capture *models.ModelInputCapture
+	if includeModelInputs {
+		invokeCtx, capture = models.WithModelInputCapture(invokeCtx)
+		defer capture.Finalize()
+	}
+
+	outputs, err := runtime.TrackElapsed(name, func() (map[string]any, error) {
+		return comp.Invoke(invokeCtx, dao.DB, inputs)
+	})
+	if err != nil {
+		common.RespondError(c, common.CodeServerError, "invoke: "+err.Error())
+		return
+	}
+	var data any = outputs
+	if capture != nil {
+		data = struct {
+			Outputs     map[string]any     `json:"outputs"`
+			ModelInputs models.ModelInputs `json:"model_inputs"`
+		}{Outputs: outputs, ModelInputs: capture.Finalize()}
+	}
+	common.RespondSuccess(c, data, "success")
+}
+
+// mapDSLError translates a dsl extractor error into a 102 envelope.
+// Centralised so both handlers return consistent error shapes. The
+// default arm surfaces unknown errors as 500 (server error) so a
+// future unmapped dsl sentinel doesn't silently masquerade as a
+// user-data problem (code-review MEDIUM).
+func mapDSLError(c *gin.Context, componentID string, err error) {
+	switch {
+	case errors.Is(err, dsl.ErrComponentNotFound):
+		common.RespondError(c, common.CodeDataError, "component not found: "+componentID)
+	case errors.Is(err, dsl.ErrMissingInputForm):
+		common.RespondError(c, common.CodeDataError, "component has no params.inputs: "+componentID)
+	case errors.Is(err, dsl.ErrMalformedDSL):
+		common.RespondError(c, common.CodeDataError, "malformed dsl: "+err.Error())
+	default:
+		common.RespondError(c, common.CodeServerError, "internal: "+err.Error())
+	}
+}

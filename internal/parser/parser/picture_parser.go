@@ -1,0 +1,138 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
+// PictureParser validates image files and returns their image payload for
+// optional VLM enhancement in the ingestion component.
+
+package parser
+
+import (
+	"context"
+	"encoding/base64"
+	"fmt"
+	"path/filepath"
+	"strings"
+
+	"ragflow/internal/parser/media"
+)
+
+// imageExtensions mirrors Python's visual extensions used in
+// utility.FilenameType and the picture.py:chunk() image branch.
+// Video extensions (.mp4, .mov, ...) are excluded — those are
+// handled by maybeDispatchVideo.
+var imageExtensions = map[string]bool{
+	"jpg": true, "jpeg": true, "png": true, "gif": true,
+	"bmp": true, "tiff": true, "tif": true, "webp": true,
+	"svg": true, "ico": true, "avif": true, "heic": true,
+	"apng": true, "icon": true, "pcx": true, "tga": true,
+	"exif": true, "fpx": true, "psd": true, "cdr": true,
+	"pcd": true, "dxf": true, "ufo": true, "eps": true,
+	"ai": true, "raw": true, "wmf": true,
+}
+
+// PictureParser emits image files for optional vision enhancement.
+type PictureParser struct{}
+
+// NewPictureParser constructs a PictureParser.
+func NewPictureParser() *PictureParser {
+	return &PictureParser{}
+}
+
+// ParseWithResult validates the image extension and returns its image payload.
+func (p *PictureParser) ParseWithResult(ctx context.Context, filename string, data []byte) ParseResult {
+	ext := strings.ToLower(filepath.Ext(filename))
+	if len(ext) > 1 && ext[0] == '.' {
+		ext = ext[1:]
+	}
+
+	// Video extensions: defer to maybeDispatchVideo. The picture.py
+	// Python path handles both, but Go routes video separately.
+	if ext != "" && isVideoExtension(ext) {
+		return ParseResult{
+			Err: fmt.Errorf("picture: video file %q should be routed through video parser, not picture", filename),
+		}
+	}
+
+	if ext == "" || !imageExtensions[ext] {
+		return ParseResult{
+			Err: fmt.Errorf("picture: unsupported extension %q (filename: %s); accepted: .jpg/.jpeg/.png/.gif/.bmp/.tiff/.tif/.webp/.svg/.ico/.avif/.heic/...", ext, filename),
+		}
+	}
+	if len(data) == 0 || len(data) > media.ImageMaxBytes() {
+		return ParseResult{Err: fmt.Errorf("picture: image payload size %d is outside the %d-byte limit", len(data), media.ImageMaxBytes())}
+	}
+
+	release, err := AcquireImageMedia(ctx)
+	if err != nil {
+		return ParseResult{Err: err}
+	}
+	imagePayload := "data:" + pictureMIME(ext) + ";base64," + base64.StdEncoding.EncodeToString(data)
+	release()
+	item := map[string]any{
+		"text":         "",
+		"image":        imagePayload,
+		"doc_type_kwd": DocTypeImage,
+	}
+	if err := ctx.Err(); err != nil {
+		return ParseResult{Err: err}
+	}
+	return ParseResult{
+		File: map[string]any{
+			"name":         filename,
+			"size":         len(data),
+			"doc_type_kwd": DocTypeImage,
+		},
+		JSON: []DocItem{DocItemFromMap(item)},
+	}
+}
+
+func pictureMIME(ext string) string {
+	switch ext {
+	case "jpg", "jpeg":
+		return "image/jpeg"
+	case "png":
+		return "image/png"
+	case "gif":
+		return "image/gif"
+	case "bmp":
+		return "image/bmp"
+	case "webp":
+		return "image/webp"
+	case "svg":
+		return "image/svg+xml"
+	case "tiff", "tif":
+		return "image/tiff"
+	case "ico":
+		return "image/x-icon"
+	case "avif":
+		return "image/avif"
+	case "heic":
+		return "image/heic"
+	default:
+		return "image/png"
+	}
+}
+
+// isVideoExtension returns true when the extension is a video format
+// that Python's picture.py routes through the video branch.
+func isVideoExtension(ext string) bool {
+	switch ext {
+	case "mp4", "mov", "avi", "flv", "mpeg", "mpg",
+		"webm", "wmv", "3gp", "3gpp", "mkv":
+		return true
+	}
+	return false
+}

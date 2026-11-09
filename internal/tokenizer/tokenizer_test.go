@@ -1,0 +1,536 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//go:build manual
+
+package tokenizer
+
+import (
+	"strings"
+	"testing"
+	"time"
+)
+
+type languageDifferentiator struct {
+	input   string
+	english string
+	dutch   string
+}
+
+// saveEngineType saves the current engineTypeProvider and returns a function
+// to restore it. Use this when a test modifies the engine type to avoid
+// leaking global state between tests.
+func saveEngineType() func() {
+	original := engineType
+	return func() { engineType = original }
+}
+
+// ---------------------------------------------------------------------------
+// NumTokensFromString tests
+// ---------------------------------------------------------------------------
+
+func TestNumTokensFromString_Empty(t *testing.T) {
+	if got := NumTokensFromString(""); got != 0 {
+		t.Errorf("expected 0 for empty string, got %d", got)
+	}
+}
+
+func TestNumTokensFromString_Positive(t *testing.T) {
+	for _, s := range []string{"hello world", "你好世界"} {
+		if got := NumTokensFromString(s); got <= 0 {
+			t.Errorf("NumTokensFromString(%q) = %d, want >0", s, got)
+		}
+	}
+}
+
+func TestNumTokensFromString_VariedInputs(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"ascii letters", "hello world"},
+		{"chinese characters", "你好世界"},
+		{"japanese characters", "こんにちは世界"},
+		{"korean characters", "안녕하세요세계"},
+		{"emoji", "👋 hello 🌍"},
+		{"numbers only", "1234567890"},
+		{"special chars", "a+b=c; d!=e"},
+		{"newlines and tabs", "line1\nline2\tindented"},
+		{"mixed content", "RAGFlow 是一款 开源的 RAG (Retrieval-Augmented Generation) 引擎"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := NumTokensFromString(tt.input)
+			if got <= 0 {
+				t.Errorf("NumTokensFromString(%q) = %d, want >0", tt.input, got)
+			}
+		})
+	}
+}
+
+func TestNumTokensFromString_Consistency(t *testing.T) {
+	inputs := []string{"hello world", "你好世界", "a+b=c; d!=e"}
+	for _, s := range inputs {
+		first := NumTokensFromString(s)
+		second := NumTokensFromString(s)
+		if first != second {
+			t.Errorf("NumTokensFromString(%q) is not consistent: %d vs %d", s, first, second)
+		}
+	}
+}
+
+func TestNumTokensFromString_LongString(t *testing.T) {
+	long := strings.Repeat("the quick brown fox jumps over the lazy dog. ", 200)
+	got := NumTokensFromString(long)
+	if got <= 0 {
+		t.Errorf("NumTokensFromString(long_string) = %d, want >0", got)
+	}
+}
+
+func TestNumTokensFromString_WhitespaceOnly(t *testing.T) {
+	for _, s := range []string{" ", "\t", "\n", "   "} {
+		got := NumTokensFromString(s)
+		// Whitespace strings should still produce tokens in BPE encoding
+		if got == 0 {
+			t.Logf("NumTokensFromString(%q) = %d", s, got)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// RegisterEngineType tests
+// ---------------------------------------------------------------------------
+
+func TestRegisterEngineType_Basic(t *testing.T) {
+	restore := saveEngineType()
+	defer restore()
+
+	SetEngineType("infinity")
+	if got := engineType; got != "infinity" {
+		t.Errorf("expected 'infinity', got %q", got)
+	}
+}
+
+func TestRegisterEngineType_Overwrite(t *testing.T) {
+	restore := saveEngineType()
+	defer restore()
+
+	SetEngineType("first")
+	SetEngineType("second")
+	if got := engineType; got != "second" {
+		t.Errorf("expected 'second', got %q", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tokenize tests
+// ---------------------------------------------------------------------------
+
+func TestTokenize_InfinityEngine(t *testing.T) {
+	restore := saveEngineType()
+	defer restore()
+	SetEngineType("infinity")
+
+	inputs := []string{"hello world", "你好 世界", "", "a single word"}
+	for _, input := range inputs {
+		got, err := Tokenize(input)
+		if err != nil {
+			t.Errorf("Tokenize(%q) unexpected error: %v", input, err)
+		}
+		if got != input {
+			t.Errorf("Tokenize(%q) = %q, want %q", input, got, input)
+		}
+	}
+}
+
+func TestTokenize_PoolNotInitialized(t *testing.T) {
+	restore := saveEngineType()
+	defer restore()
+	// Ensure engine type is not "infinity" so we hit the pool path
+	SetEngineType("")
+
+	_, err := Tokenize("hello world")
+	if err == nil {
+		t.Error("expected error when pool is not initialized, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FineGrainedTokenize tests
+// ---------------------------------------------------------------------------
+
+func TestFineGrainedTokenize_InfinityEngine(t *testing.T) {
+	restore := saveEngineType()
+	defer restore()
+	SetEngineType("infinity")
+
+	inputs := []string{"hello world", "测试 分词", ""}
+	for _, input := range inputs {
+		got, err := FineGrainedTokenize(input)
+		if err != nil {
+			t.Errorf("FineGrainedTokenize(%q) unexpected error: %v", input, err)
+		}
+		if got != input {
+			t.Errorf("FineGrainedTokenize(%q) = %q, want %q", input, got, input)
+		}
+	}
+}
+
+func TestFineGrainedTokenize_PoolNotInitialized(t *testing.T) {
+	restore := saveEngineType()
+	defer restore()
+	SetEngineType("")
+
+	_, err := FineGrainedTokenize("hello world")
+	if err == nil {
+		t.Error("expected error when pool is not initialized, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Error-path tests for functions that require the pool
+// ---------------------------------------------------------------------------
+
+func TestTokenizeWithPosition_PoolNotInitialized(t *testing.T) {
+	_, err := TokenizeWithPosition("hello world")
+	if err == nil {
+		t.Error("expected error when pool is not initialized, got nil")
+	}
+}
+
+func TestAnalyze_PoolNotInitialized(t *testing.T) {
+	_, err := Analyze("hello world")
+	if err == nil {
+		t.Error("expected error when pool is not initialized, got nil")
+	}
+}
+
+func TestGetTermFreq_PoolNotInitialized(t *testing.T) {
+	got := GetTermFreq("hello")
+	if got != 0 {
+		t.Errorf("expected 0 when pool is not initialized, got %d", got)
+	}
+}
+
+func TestGetTermTag_PoolNotInitialized(t *testing.T) {
+	got := GetTermTag("hello")
+	if got != "" {
+		t.Errorf("expected empty string when pool is not initialized, got %q", got)
+	}
+}
+
+// The memo must hold the analyzer's answer (never a pre-Init zero), cost exactly
+// one entry per term whichever accessor is used, not grow on a repeat lookup, and
+// be dropped when the dictionaries are reloaded.
+func TestTermLookupCacheMemoizesPerTermAndDoesNotGrowOnHit(t *testing.T) {
+	if err := Init(&PoolConfig{
+		DictPath:       "",
+		MinSize:        1,
+		MaxSize:        1,
+		IdleTimeout:    5 * time.Second,
+		AcquireTimeout: 5 * time.Second,
+	}); err != nil {
+		t.Fatalf("Failed to initialize pool: %v", err)
+	}
+	defer Close()
+	resetTermLookupCaches()
+
+	const term = "hello"
+	freq, tag := GetTermFreqAndTag(term)
+
+	cached, ok := termLookupCache.Load(term)
+	if !ok {
+		t.Fatalf("GetTermFreqAndTag(%q) did not memoize its result", term)
+	}
+	if entry := cached.(termLookup); entry.freq != freq || entry.tag != tag {
+		t.Fatalf("memoized %+v, want {freq:%d tag:%q}", entry, freq, tag)
+	}
+
+	if gotFreq, gotTag := GetTermFreqAndTag(term); gotFreq != freq || gotTag != tag {
+		t.Fatalf("second lookup = (%d, %q), want (%d, %q)", gotFreq, gotTag, freq, tag)
+	}
+	// The single-value accessors read the same memo rather than keeping their
+	// own: one term occupies one entry however it is asked for.
+	if got := GetTermFreq(term); got != freq {
+		t.Fatalf("GetTermFreq(%q) = %d, want %d", term, got, freq)
+	}
+	if got := GetTermTag(term); got != tag {
+		t.Fatalf("GetTermTag(%q) = %q, want %q", term, got, tag)
+	}
+	if got := termLookupCached.Load(); got != 1 {
+		t.Fatalf("memo holds %d entries after one term, want 1", got)
+	}
+
+	// A miss resolves both halves in one analyzer checkout, so asking for just
+	// the frequency still leaves a complete entry behind for the tag.
+	resetTermLookupCaches()
+	if got := GetTermFreq(term); got != freq {
+		t.Fatalf("GetTermFreq(%q) after reset = %d, want %d", term, got, freq)
+	}
+	if entry, ok := termLookupCache.Load(term); !ok || entry.(termLookup).tag != tag {
+		t.Fatalf("a frequency-only lookup stored %v, want a full entry with tag %q", entry, tag)
+	}
+
+	resetTermLookupCaches()
+	if _, ok := termLookupCache.Load(term); ok {
+		t.Fatal("resetTermLookupCaches left an entry behind")
+	}
+	if got := termLookupCached.Load(); got != 0 {
+		t.Fatalf("memo counter = %d after reset, want 0", got)
+	}
+}
+
+// The three accessors have to agree, and the combined one has to be stable on a
+// repeat. The memo stores whatever the combined lookup returns, so a divergence
+// here would silently change weights. The terms mix in-dictionary entries (so
+// the tag is non-empty) with out-of-vocabulary ones.
+func TestGetTermFreqAndTagAgreesWithSingleValueAccessors(t *testing.T) {
+	if err := Init(&PoolConfig{
+		DictPath:       "",
+		MinSize:        1,
+		MaxSize:        1,
+		IdleTimeout:    5 * time.Second,
+		AcquireTimeout: 5 * time.Second,
+	}); err != nil {
+		t.Fatalf("Failed to initialize pool: %v", err)
+	}
+	defer Close()
+	resetTermLookupCaches()
+
+	for _, term := range []string{"hello", "文档", "北京", "xyzzy", "ab"} {
+		freq, tag := GetTermFreqAndTag(term)
+
+		if got := GetTermFreq(term); got != freq {
+			t.Errorf("GetTermFreq(%q) = %d, want %d", term, got, freq)
+		}
+		if got := GetTermTag(term); got != tag {
+			t.Errorf("GetTermTag(%q) = %q, want %q", term, got, tag)
+		}
+		if freq2, tag2 := GetTermFreqAndTag(term); freq2 != freq || tag2 != tag {
+			t.Errorf("repeat lookup for %q = (%d, %q), want (%d, %q)",
+				term, freq2, tag2, freq, tag)
+		}
+	}
+}
+
+func TestTokenize_DefaultLanguageResetsAnalyzerState(t *testing.T) {
+	restore := saveEngineType()
+	defer restore()
+	SetEngineType("")
+
+	if err := Init(&PoolConfig{
+		DictPath:       "",
+		MinSize:        1,
+		MaxSize:        1,
+		IdleTimeout:    5 * time.Second,
+		AcquireTimeout: 5 * time.Second,
+	}); err != nil {
+		t.Fatalf("Failed to initialize pool: %v", err)
+	}
+	defer Close()
+
+	sample := findEnglishDutchDifferentiator(t)
+
+	dutchGot, err := New("Dutch").Tokenize(sample.input)
+	if err != nil {
+		t.Fatalf("Tokenize(Dutch, %q) unexpected error: %v", sample.input, err)
+	}
+	if dutchGot != sample.dutch {
+		t.Fatalf("Tokenize(Dutch, %q) = %q, want %q", sample.input, dutchGot, sample.dutch)
+	}
+
+	defaultGot, err := Tokenize(sample.input)
+	if err != nil {
+		t.Fatalf("Tokenize(default, %q) unexpected error: %v", sample.input, err)
+	}
+	if defaultGot != sample.english {
+		t.Fatalf("Tokenize(default, %q) = %q, want explicit English result %q", sample.input, defaultGot, sample.english)
+	}
+	if defaultGot == dutchGot {
+		t.Fatalf("Tokenize(default, %q) unexpectedly inherited Dutch analyzer state: %q", sample.input, defaultGot)
+	}
+}
+
+func TestTokenize_SlovakCzechFoldDiacriticsAndSkipStemming(t *testing.T) {
+	restore := saveEngineType()
+	defer restore()
+	SetEngineType("")
+
+	if err := Init(&PoolConfig{
+		DictPath:       "",
+		MinSize:        1,
+		MaxSize:        1,
+		IdleTimeout:    5 * time.Second,
+		AcquireTimeout: 5 * time.Second,
+	}); err != nil {
+		t.Fatalf("Failed to initialize pool: %v", err)
+	}
+	defer Close()
+
+	tests := []struct {
+		lang  string
+		input string
+		want  string
+	}{
+		// The analyzer folds diacritics before splitting, so the split regex
+		// keeps words whole, and stemming/lemmatization are off.
+		{"Slovak", "škola daňové priznanie", "skola danove priznanie"},
+		{"Czech", "příliš žluťoučký kůň", "prilis zlutoucky kun"},
+		// No stemming for folding languages: the token survives unchanged.
+		{"Slovak", "running", "running"},
+	}
+	for _, tt := range tests {
+		got, err := New(tt.lang).Tokenize(tt.input)
+		if err != nil {
+			t.Fatalf("Tokenize(%s, %q) unexpected error: %v", tt.lang, tt.input, err)
+		}
+		if got != tt.want {
+			t.Errorf("Tokenize(%s, %q) = %q, want %q", tt.lang, tt.input, got, tt.want)
+		}
+	}
+
+	// English tokenization is unchanged and the pool resets sticky Slovak
+	// state: the default-language path still stems.
+	engGot, err := Tokenize("running")
+	if err != nil {
+		t.Fatalf("Tokenize(default, \"running\") unexpected error: %v", err)
+	}
+	if engGot == "running" {
+		t.Errorf("Tokenize(default, \"running\") = %q, want a stemmed form (English stemming must stay enabled)", engGot)
+	}
+
+	// FineGrainedTokenize on folded tokens must not stem either.
+	fg, err := New("Slovak").FineGrainedTokenize("danove priznanie")
+	if err != nil {
+		t.Fatalf("FineGrainedTokenize(Slovak) unexpected error: %v", err)
+	}
+	if fg != "danove priznanie" {
+		t.Errorf("FineGrainedTokenize(Slovak, \"danove priznanie\") = %q, want unchanged tokens", fg)
+	}
+}
+
+func TestTokenize_RussianFoldsCyrillicBeforeStemming(t *testing.T) {
+	restore := saveEngineType()
+	defer restore()
+	SetEngineType("")
+
+	if err := Init(&PoolConfig{
+		DictPath:       "",
+		MinSize:        1,
+		MaxSize:        1,
+		IdleTimeout:    5 * time.Second,
+		AcquireTimeout: 5 * time.Second,
+	}); err != nil {
+		t.Fatalf("Failed to initialize pool: %v", err)
+	}
+	defer Close()
+
+	// Index-side folding must be Unicode-aware: the Russian stemmer only
+	// accepts lower-case input, so an upper-case word would otherwise reach
+	// the suffix table unchanged while the query side folds it with
+	// strings.ToLower.
+	var want string
+	for _, form := range []string{"ДОГОВОРАМИ", "Договора", "договорами", "договор"} {
+		got, err := New("Russian").Tokenize(form)
+		if err != nil {
+			t.Fatalf("Tokenize(Russian, %q) unexpected error: %v", form, err)
+		}
+		if want == "" {
+			want = got
+			continue
+		}
+		if got != want {
+			t.Errorf("Tokenize(Russian, %q) = %q, want the shared stem %q", form, got, want)
+		}
+	}
+	if want != "договор" {
+		t.Errorf("Russian stem for the договор forms = %q, want %q", want, "договор")
+	}
+}
+
+func findEnglishDutchDifferentiator(t *testing.T) languageDifferentiator {
+	t.Helper()
+
+	candidates := []string{
+		"running",
+		"jumps",
+		"ponies",
+		"studies",
+		"wolves",
+		"relational",
+		"conditionally",
+	}
+
+	for _, input := range candidates {
+		english, err := New("English").Tokenize(input)
+		if err != nil {
+			t.Fatalf("Tokenize(English, %q) unexpected error: %v", input, err)
+		}
+		dutch, err := New("Dutch").Tokenize(input)
+		if err != nil {
+			t.Fatalf("Tokenize(Dutch, %q) unexpected error: %v", input, err)
+		}
+		if english != dutch {
+			return languageDifferentiator{
+				input:   input,
+				english: english,
+				dutch:   dutch,
+			}
+		}
+	}
+
+	t.Skip("no differentiating tokenizer sample found for English vs Dutch")
+	return languageDifferentiator{}
+}
+
+// ---------------------------------------------------------------------------
+// Global state tests
+// ---------------------------------------------------------------------------
+
+func TestGetPoolStats_Nil(t *testing.T) {
+	// Note: globalPool is nil by default in unit tests (pool not initialized)
+	stats := GetPoolStats()
+	if stats == nil {
+		t.Fatal("GetPoolStats returned nil")
+	}
+	init, ok := stats["initialized"]
+	if !ok {
+		t.Fatal("missing 'initialized' key")
+	}
+	if init.(bool) {
+		t.Error("expected initialized=false when pool is nil")
+	}
+}
+
+func TestIsInitialized_Default(t *testing.T) {
+	if IsInitialized() {
+		t.Error("expected IsInitialized() = false when pool is not initialized")
+	}
+}
+
+func TestClose_Nil(t *testing.T) {
+	// Close should be safe to call with nil globalPool
+	Close() // no panic = pass
+}
+
+func TestClose_NilGlobalPool(t *testing.T) {
+	// Call Close directly after ensuring globalPool is nil
+	// (concurrent test may have initialized it, so handle gracefully)
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("Close() panicked: %v", r)
+		}
+	}()
+	Close()
+}

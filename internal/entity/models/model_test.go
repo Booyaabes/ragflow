@@ -1,0 +1,1058 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
+package models
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"io/fs"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"testing"
+
+	"ragflow/internal/tokenizer"
+)
+
+// joinModelNames extracts model names from a ListModelResponse slice and
+// joins them with sep, for use in test assertions.
+func joinModelNames(models []ListModelResponse, sep string) string {
+	names := make([]string, len(models))
+	for i, m := range models {
+		names[i] = m.Name
+	}
+	return strings.Join(names, sep)
+}
+
+func readProviderConfig(t *testing.T, fileName string) []byte {
+	t.Helper()
+
+	for _, candidate := range []string{
+		filepath.Join("..", "..", "..", "conf", "models", fileName),
+		filepath.Join("conf", "models", fileName),
+	} {
+		data, err := os.ReadFile(candidate)
+		if err == nil {
+			return data
+		}
+	}
+
+	t.Fatalf("could not locate conf/models/%s", fileName)
+	return nil
+}
+
+// A provider that supports rerank must declare its rerank url_suffix. Without it
+// the request is posted to the base URL (".../") instead of "/rerank", which the
+// server answers with a generic 500 — the failure reported in #16033.
+func TestOpenAIAPICompatibleDeclaresRerankSuffix(t *testing.T) {
+	var cfg struct {
+		URLSuffix URLSuffix `json:"url_suffix"`
+	}
+	if err := json.Unmarshal(readProviderConfig(t, "openai-api-compatible.json"), &cfg); err != nil {
+		t.Fatalf("parse openai-api-compatible.json: %v", err)
+	}
+	if strings.TrimSpace(cfg.URLSuffix.Rerank) == "" {
+		t.Fatal("openai-api-compatible.json declares no rerank url_suffix")
+	}
+}
+
+// providerConfDir locates conf/models relative to the test's CWD.
+func providerConfDir(t *testing.T) string {
+	t.Helper()
+
+	for _, candidate := range []string{
+		filepath.Join("..", "..", "..", "conf", "models"),
+		filepath.Join("conf", "models"),
+	} {
+		if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+			return candidate
+		}
+	}
+
+	t.Fatal("could not locate conf/models")
+	return ""
+}
+
+// A provider keeps the API version either in its base URL (OpenAI-compatible
+// shape: base ".../v1" + suffix "chat/completions") or in url_suffix (MiniMax
+// shape: base "https://api.minimaxi.com" + suffix "v1/text/chatcompletion_v2").
+// url_hint is the example endpoint shown in the base URL field, so a hint that
+// carries the version the suffix already supplies makes every request 404 on a
+// doubled "/v1/v1/..." as soon as the user pastes it. GPUStack shipped exactly
+// that hint before joinURL deduplicated the segment.
+func TestProviderConfURLHintsFollowVersionConvention(t *testing.T) {
+	dir := providerConfDir(t)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s: %v", dir, err)
+	}
+
+	checked := 0
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", entry.Name(), err)
+		}
+
+		var cfg struct {
+			Name      string         `json:"name"`
+			URLHint   string         `json:"url_hint"`
+			URLSuffix map[string]any `json:"url_suffix"`
+		}
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			t.Fatalf("parse %s: %v", entry.Name(), err)
+		}
+		if cfg.URLHint == "" {
+			continue
+		}
+
+		trimmed := strings.TrimRight(strings.TrimSpace(cfg.URLHint), "/")
+		idx := strings.LastIndex(trimmed, "/")
+		if idx < 0 {
+			continue
+		}
+		hintVersion := apiVersionSegment(trimmed[idx+1:])
+		if hintVersion == "" {
+			continue
+		}
+
+		checked++
+		for key, value := range cfg.URLSuffix {
+			suffix, ok := value.(string)
+			if !ok {
+				continue
+			}
+			if apiVersionSegment(firstPathSegment(suffix)) == hintVersion {
+				t.Errorf("%s: url_hint %q ends with %q but url_suffix.%s also starts with it; "+
+					"the version must live in one place only",
+					entry.Name(), cfg.URLHint, hintVersion, key)
+			}
+		}
+	}
+
+	if checked == 0 {
+		t.Fatal("no provider url_hint was checked; conf/models layout changed")
+	}
+}
+
+// setupProviderTestDir creates a temporary directory populated with provider
+// config files and conf/all_models.json, then changes the working directory to
+// it. InitProviderManager hardcodes a read of conf/all_models.json relative to
+// CWD, so the test must run from a directory that contains conf/all_models.json.
+//
+// Provider configs MUST be copied before the chdir because readProviderConfig
+// resolves file paths relative to the test binary's original CWD.
+//
+// Caller must defer the returned restore function.
+func setupProviderTestDir(t *testing.T, configFileNames ...string) (dir string, restore func()) {
+	t.Helper()
+	dir = t.TempDir()
+
+	// Copy provider configs first — readProviderConfig uses relative paths
+	// that are only valid from the original CWD.
+	for _, fileName := range configFileNames {
+		if err := os.WriteFile(filepath.Join(dir, fileName), readProviderConfig(t, fileName), 0o600); err != nil {
+			t.Fatalf("write %s config: %v", fileName, err)
+		}
+	}
+
+	confDir := filepath.Join(dir, "conf")
+	if err := os.MkdirAll(confDir, 0o755); err != nil {
+		t.Fatalf("create conf dir: %v", err)
+	}
+
+	allModelsSrc := filepath.Join("..", "..", "..", "conf", "all_models.json")
+	data, err := os.ReadFile(allModelsSrc)
+	if err != nil {
+		t.Fatalf("read all_models.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(confDir, "all_models.json"), data, 0o600); err != nil {
+		t.Fatalf("write all_models.json: %v", err)
+	}
+
+	orig, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	return dir, func() { os.Chdir(orig) }
+}
+
+func TestHostedProviderConfigsLoadSharedDrivers(t *testing.T) {
+	dir, restore := setupProviderTestDir(t, "mineru.json", "paddleocr.json")
+	defer restore()
+
+	err := InitProviderManager(dir)
+	if err != nil {
+		t.Fatalf("InitProviderManager: %v", err)
+	}
+
+	pm := GetProviderManager()
+
+	minerU := pm.FindProvider("MinerU.Net")
+	if minerU == nil {
+		t.Fatal("MinerU.Net provider not found")
+	}
+	if _, ok := minerU.ModelDriver.(*MinerUModel); !ok {
+		t.Fatalf("MinerU.Net ModelDriver=%T, want *models.MinerUModel", minerU.ModelDriver)
+	}
+	if minerU.Class != "mineru.net" {
+		t.Errorf("MinerU.Net class=%q", minerU.Class)
+	}
+	if minerU.URLSuffix.DocumentParse != "v4/extract/task" {
+		t.Errorf("MinerU.Net doc_parse suffix=%q", minerU.URLSuffix.DocumentParse)
+	}
+
+	paddleOCR := pm.FindProvider("PaddleOCR")
+	if paddleOCR == nil {
+		t.Fatal("PaddleOCR provider not found")
+	}
+	if _, ok := paddleOCR.ModelDriver.(*PaddleOCRModel); !ok {
+		t.Fatalf("PaddleOCR ModelDriver=%T, want *models.PaddleOCRModel", paddleOCR.ModelDriver)
+	}
+	if paddleOCR.Class != "paddleocr" {
+		t.Errorf("PaddleOCR class=%q", paddleOCR.Class)
+	}
+	if paddleOCR.URLSuffix.OCR != "v2/ocr/jobs" {
+		t.Errorf("PaddleOCR OCR suffix=%q", paddleOCR.URLSuffix.OCR)
+	}
+}
+
+func TestBedrockConfigPreservesEmbeddingMaxTokens(t *testing.T) {
+	dir, restore := setupProviderTestDir(t, "bedrock.json")
+	defer restore()
+
+	if err := InitProviderManager(dir); err != nil {
+		t.Fatalf("InitProviderManager: %v", err)
+	}
+
+	model, err := GetProviderManager().GetModelByName("Bedrock", "cohere.embed-english-v3")
+	if err != nil {
+		t.Fatalf("GetModelByName: %v", err)
+	}
+	if model.MaxTokens == nil || *model.MaxTokens != 512 {
+		t.Fatalf("MaxTokens = %v, want 512", model.MaxTokens)
+	}
+}
+
+func TestLocalOCRProviderConfigsLoadLocalDrivers(t *testing.T) {
+	dir, restore := setupProviderTestDir(t, "mineru_local.json", "monkeyocr.json", "monkeyocrv2.json", "paddleocr_local.json")
+	defer restore()
+
+	err := InitProviderManager(dir)
+	if err != nil {
+		t.Fatalf("InitProviderManager: %v", err)
+	}
+
+	pm := GetProviderManager()
+
+	minerU := pm.FindProvider("MinerU")
+	if minerU == nil {
+		t.Fatal("MinerU provider not found")
+	}
+	if _, ok := minerU.ModelDriver.(*MinerULocalModel); !ok {
+		t.Fatalf("MinerU ModelDriver=%T, want *models.MinerULocalModel", minerU.ModelDriver)
+	}
+	if minerU.URLSuffix.DocumentParse != "file_parse" {
+		t.Errorf("MinerU doc_parse suffix=%q", minerU.URLSuffix.DocumentParse)
+	}
+
+	monkeyOCR := pm.FindProvider("MonkeyOCR")
+	if monkeyOCR == nil {
+		t.Fatal("MonkeyOCR provider not found")
+	}
+	if _, ok := monkeyOCR.ModelDriver.(*MonkeyOCRModel); !ok {
+		t.Fatalf("MonkeyOCR ModelDriver=%T, want *models.MonkeyOCRModel", monkeyOCR.ModelDriver)
+	}
+	if monkeyOCR.ModelDriver.Name() != "monkeyocr" {
+		t.Fatalf("MonkeyOCR Name()=%q, want monkeyocr", monkeyOCR.ModelDriver.Name())
+	}
+	if monkeyOCR.URLSuffix.DocumentParse != "file_parse" {
+		t.Errorf("MonkeyOCR doc_parse suffix=%q", monkeyOCR.URLSuffix.DocumentParse)
+	}
+
+	monkeyOCRv2 := pm.FindProvider("MonkeyOCRv2")
+	if monkeyOCRv2 == nil {
+		t.Fatal("MonkeyOCRv2 provider not found")
+	}
+	if _, ok := monkeyOCRv2.ModelDriver.(*MonkeyOCRv2Model); !ok {
+		t.Fatalf("MonkeyOCRv2 ModelDriver=%T, want *models.MonkeyOCRv2Model", monkeyOCRv2.ModelDriver)
+	}
+	if monkeyOCRv2.URLSuffix.DocumentParse != "parse" {
+		t.Errorf("MonkeyOCRv2 doc_parse suffix=%q", monkeyOCRv2.URLSuffix.DocumentParse)
+	}
+
+	paddleOCR := pm.FindProvider("PaddleOCR.local")
+	if paddleOCR == nil {
+		t.Fatal("PaddleOCR.local provider not found")
+	}
+	if _, ok := paddleOCR.ModelDriver.(*PaddleOCRLocalModel); !ok {
+		t.Fatalf("PaddleOCR.local ModelDriver=%T, want *models.PaddleOCRLocalModel", paddleOCR.ModelDriver)
+	}
+	if paddleOCR.URLSuffix.OCR != "layout-parsing" {
+		t.Errorf("PaddleOCR.local OCR suffix=%q", paddleOCR.URLSuffix.OCR)
+	}
+}
+
+func TestModelFactoryCreatesMonkeyOCRDriver(t *testing.T) {
+	driver, err := NewModelFactory().CreateModelDriver("MonkeyOCR", map[string]string{"default": "http://localhost:7861"}, URLSuffix{DocumentParse: "file_parse"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if driver.Name() != "monkeyocr" {
+		t.Fatalf("driver.Name()=%q", driver.Name())
+	}
+	cloned := driver.NewInstance(map[string]string{"default": "http://cloned"})
+	if cloned.Name() != "monkeyocr" {
+		t.Fatalf("NewInstance().Name()=%q", cloned.Name())
+	}
+	if _, ok := driver.(*MonkeyOCRModel); !ok {
+		t.Fatalf("driver=%T, want *MonkeyOCRModel", driver)
+	}
+}
+
+func TestModelFactoryCreatesMonkeyOCRv2Driver(t *testing.T) {
+	driver, err := NewModelFactory().CreateModelDriver("MonkeyOCRv2", map[string]string{"default": "http://localhost:8000"}, URLSuffix{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if driver.Name() != "monkeyocrv2" {
+		t.Fatalf("driver.Name()=%q", driver.Name())
+	}
+}
+
+func TestMonkeyOCRv2DriverVerifiesNativeParseEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/openapi.json" {
+			t.Fatalf("path=%q", request.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"paths":{"/parse":{}}}`))
+	}))
+	defer server.Close()
+
+	driver := NewMonkeyOCRv2Model(map[string]string{"default": server.URL}, URLSuffix{})
+	if _, err := driver.OCRFile(context.Background(), nil, nil, nil, &APIConfig{}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	driver = NewMonkeyOCRv2Model(nil, URLSuffix{})
+	apiKey := `{"MONKEYOCRV2_SERVER_URL":"` + server.URL + `"}`
+	if err := driver.CheckConnection(context.Background(), &APIConfig{ApiKey: &apiKey}); err != nil {
+		t.Fatalf("environment-provisioned API config: %v", err)
+	}
+}
+
+func TestProviderConfigsLoadURLSuffixKeys(t *testing.T) {
+	dir, restore := setupProviderTestDir(t, "cohere.json", "xai.json")
+	defer restore()
+
+	err := InitProviderManager(dir)
+	if err != nil {
+		t.Fatalf("InitProviderManager: %v", err)
+	}
+
+	pm := GetProviderManager()
+	cohere := pm.FindProvider("Cohere")
+	if cohere == nil {
+		t.Fatal("Cohere provider not found")
+	}
+	if cohere.URLSuffix.Embedding != "v2/embed" {
+		t.Errorf("Cohere embedding suffix=%q", cohere.URLSuffix.Embedding)
+	}
+
+	xAI := pm.FindProvider("xAI")
+	if xAI == nil {
+		t.Fatal("xAI provider not found")
+	}
+	if xAI.URLSuffix.ASR != "stt" {
+		t.Errorf("xAI ASR suffix=%q", xAI.URLSuffix.ASR)
+	}
+}
+
+// url_hint is a display-only example endpoint: every self-hosted provider
+// advertises one so the UI can hint a base URL, and hosted providers must not
+// (their fixed endpoint comes from `url`).
+func TestProviderConfigsLoadURLHint(t *testing.T) {
+	dir, restore := setupProviderTestDir(t, "cohere.json", "ollama.json")
+	defer restore()
+
+	if err := InitProviderManager(dir); err != nil {
+		t.Fatalf("InitProviderManager: %v", err)
+	}
+
+	pm := GetProviderManager()
+
+	ollama := pm.FindProvider("Ollama")
+	if ollama == nil {
+		t.Fatal("Ollama provider not found")
+	}
+	if ollama.URLHint == "" {
+		t.Error("Ollama url_hint is empty, want an example endpoint")
+	}
+
+	cohere := pm.FindProvider("Cohere")
+	if cohere == nil {
+		t.Fatal("Cohere provider not found")
+	}
+	if cohere.URLHint != "" {
+		t.Errorf("Cohere url_hint=%q, want empty", cohere.URLHint)
+	}
+}
+
+func TestProviderConfigRejectsUnknownURLSuffixKey(t *testing.T) {
+	dir := t.TempDir()
+	config := []byte(`{
+  "name": "OpenAI",
+  "url": {
+    "default": "https://example.com"
+  },
+  "url_suffix": {
+    "chat": "chat/completions",
+    "unknown_suffix": "ignored"
+  },
+  "models": [
+    {
+      "name": "test-model",
+      "max_tokens": 4096,
+      "model_types": ["chat"]
+    }
+  ]
+}`)
+	if err := os.WriteFile(filepath.Join(dir, "unknown_suffix.json"), config, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	err := InitProviderManager(dir)
+	if err == nil {
+		t.Fatal("InitProviderManager succeeded with unknown url_suffix key")
+	}
+	if !strings.Contains(err.Error(), `unknown field "unknown_suffix"`) {
+		t.Fatalf("error=%q, want unknown_suffix field", err)
+	}
+	if !strings.Contains(err.Error(), "unknown_suffix.json") {
+		t.Fatalf("error=%q, want config file context", err)
+	}
+}
+
+func TestPPIOProviderConfigLoadsIntoProviderManager(t *testing.T) {
+	withSSRFBypass(t)
+	dir, restore := setupProviderTestDir(t, "ppio.json")
+	defer restore()
+
+	err := InitProviderManager(dir)
+	if err != nil {
+		t.Fatalf("InitProviderManager: %v", err)
+	}
+
+	pm := GetProviderManager()
+	provider := pm.FindProvider("ppio")
+	if provider == nil {
+		t.Fatal("PPIO provider not found")
+	}
+	if provider.Name != "PPIO" {
+		t.Errorf("provider.Name=%q", provider.Name)
+	}
+	if provider.URL["default"] != "https://api.ppio.com/openai/v1" {
+		t.Errorf("default URL=%q", provider.URL["default"])
+	}
+	if provider.URL["us"] != "https://api.ppinfra.com/v3/openai" {
+		t.Errorf("us URL=%q", provider.URL["us"])
+	}
+	if provider.URLSuffix.Chat != "chat/completions" {
+		t.Errorf("chat suffix=%q", provider.URLSuffix.Chat)
+	}
+	if provider.URLSuffix.Models != "models" {
+		t.Errorf("models suffix=%q", provider.URLSuffix.Models)
+	}
+	if _, ok := provider.ModelDriver.(*PPIOModel); !ok {
+		t.Fatalf("ModelDriver=%T, want *models.PPIOModel", provider.ModelDriver)
+	}
+	if provider.ModelDriver.Name() != "ppio" {
+		t.Errorf("ModelDriver.Name()=%q", provider.ModelDriver.Name())
+	}
+	if len(provider.Models) != 25 {
+		t.Fatalf("PPIO model count=%d, want 25", len(provider.Models))
+	}
+	for _, model := range provider.Models {
+		if len(model.ModelTypes) == 0 {
+			t.Errorf("model %q missing model types", model.Name)
+		}
+		if model.Class == nil || *model.Class != "PPIO" {
+			t.Errorf("model %q class=%v", model.Name, model.Class)
+		}
+	}
+
+	models, err := pm.ListModels("PPIO")
+	if err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+	if len(models) != 25 {
+		t.Errorf("ListModels count=%d, want 25", len(models))
+	}
+
+	model, err := pm.GetModelByName("ppio", "deepseek/deepseek-r1")
+	if err != nil {
+		t.Fatalf("GetModelByName: %v", err)
+	}
+	if *model.MaxOutput != 32768 || *model.ContextLength != 131072 {
+		t.Errorf("deepseek/deepseek-r1 max_output=%d context_length=%d", *model.MaxOutput, *model.ContextLength)
+	}
+	model, err = pm.GetModelByName("ppio", "deepseek/deepseek-v4-pro")
+	if err != nil {
+		t.Fatalf("GetModelByName v4 pro: %v", err)
+	}
+	if *model.MaxOutput != 393216 || *model.ContextLength != 1048576 {
+		t.Errorf("deepseek/deepseek-v4-pro max_output=%d context_length=%d", *model.MaxOutput, *model.ContextLength)
+	}
+	model, err = pm.GetModelByName("ppio", "deepseek/deepseek-v4-flash")
+	if err != nil {
+		t.Fatalf("GetModelByName v4 flash: %v", err)
+	}
+	if *model.MaxOutput != 393216 || *model.ContextLength != 1048576 {
+		t.Errorf("deepseek/deepseek-v4-flash max_output=%d context_length=%d", *model.MaxOutput, *model.ContextLength)
+	}
+	if !model.ModelTypeMap["chat"] {
+		t.Errorf("deepseek/deepseek-v4-flash missing chat type map")
+	}
+	model, err = pm.GetModelByName("ppio", "qwen/qwen3-embedding-8b")
+	if err != nil {
+		t.Fatalf("GetModelByName qwen/qwen3-embedding-8b: %v", err)
+	}
+	if !model.ModelTypeMap["embedding"] {
+		t.Errorf("qwen/qwen3-embedding-8b missing embedding type map")
+	}
+	model, err = pm.GetModelByName("ppio", "baai/bge-reranker-v2-m3")
+	if err != nil {
+		t.Fatalf("GetModelByName baai/bge-reranker-v2-m3: %v", err)
+	}
+	if !model.ModelTypeMap["rerank"] {
+		t.Errorf("baai/bge-reranker-v2-m3 missing rerank type map")
+	}
+
+	resp := pm.SearchByType("chat")
+	if resp.Code != 0 {
+		t.Fatalf("SearchByType code=%d message=%q", resp.Code, resp.Message)
+	}
+	if len(resp.Data) != 21 {
+		t.Errorf("SearchByType data count=%d, want 21", len(resp.Data))
+	}
+}
+
+func TestSiliconFlowProviderConfigLoadsCNAndIntlModelUnion(t *testing.T) {
+	dir, restore := setupProviderTestDir(t, "siliconflow.json")
+	defer restore()
+
+	err := InitProviderManager(dir)
+	if err != nil {
+		t.Fatalf("InitProviderManager: %v", err)
+	}
+
+	pm := GetProviderManager()
+	provider := pm.FindProvider("SILICONFLOW")
+	if provider == nil {
+		t.Fatal("SILICONFLOW provider not found")
+	}
+	if provider.URL["default"] != "https://api.siliconflow.cn/v1" {
+		t.Errorf("default URL=%q", provider.URL["default"])
+	}
+	if provider.URL["intl"] != "https://api.siliconflow.com/v1" {
+		t.Errorf("intl URL=%q", provider.URL["intl"])
+	}
+	if provider.URLSuffix.Chat != "chat/completions" {
+		t.Errorf("chat suffix=%q", provider.URLSuffix.Chat)
+	}
+	if _, ok := provider.ModelDriver.(*SiliconflowModel); !ok {
+		t.Fatalf("ModelDriver=%T, want *models.SiliconflowModel", provider.ModelDriver)
+	}
+	if provider.ModelDriver.Name() != "SILICONFLOW" {
+		t.Errorf("ModelDriver.Name()=%q", provider.ModelDriver.Name())
+	}
+	if len(provider.Models) != 111 {
+		t.Fatalf("SILICONFLOW model count=%d, want 111", len(provider.Models))
+	}
+
+	for _, modelName := range []string{
+		"tencent/Hy4-preview",
+		"XingChenAGI/XingChenASR-V3.2",
+		"Qwen/Qwen3-Reranker-8B",
+		"IndexTeam/IndexTTS-2",
+	} {
+		if _, err := pm.GetModelByName("SILICONFLOW", modelName); err != nil {
+			t.Errorf("GetModelByName %q: %v", modelName, err)
+		}
+	}
+
+	asrModel, err := pm.GetModelByName("SILICONFLOW", "XingChenAGI/XingChenASR-V3.2")
+	if err != nil {
+		t.Fatalf("GetModelByName XingChenASR: %v", err)
+	}
+	if !asrModel.ModelTypeMap["asr"] {
+		t.Errorf("XingChenASR model types=%v, want asr", asrModel.ModelTypes)
+	}
+
+	rerankModel, err := pm.GetModelByName("SILICONFLOW", "Qwen/Qwen3-Reranker-8B")
+	if err != nil {
+		t.Fatalf("GetModelByName Qwen3-Reranker: %v", err)
+	}
+	if !rerankModel.ModelTypeMap["rerank"] {
+		t.Errorf("Qwen3-Reranker model types=%v, want rerank", rerankModel.ModelTypes)
+	}
+
+	ttsModel, err := pm.GetModelByName("SILICONFLOW", "IndexTeam/IndexTTS-2")
+	if err != nil {
+		t.Fatalf("GetModelByName IndexTTS: %v", err)
+	}
+	if !ttsModel.ModelTypeMap["tts"] {
+		t.Errorf("IndexTTS model types=%v, want tts", ttsModel.ModelTypes)
+	}
+
+	visionModel, err := pm.GetModelByName("SILICONFLOW", "Qwen/Qwen3.6-27B")
+	if err != nil {
+		t.Fatalf("GetModelByName Qwen3.6: %v", err)
+	}
+	if !visionModel.ModelTypeMap["chat"] || !visionModel.ModelTypeMap["vision"] {
+		t.Errorf("Qwen3.6 model types=%v, want chat+vision", visionModel.ModelTypes)
+	}
+
+	glm53, err := pm.GetModelByName("SILICONFLOW", "zai-org/GLM-5.3")
+	if err != nil {
+		t.Fatalf("GetModelByName GLM-5.3: %v", err)
+	}
+	if glm53.ContextLength == nil || *glm53.ContextLength != 1048576 || glm53.MaxOutput == nil || *glm53.MaxOutput != 128000 {
+		t.Errorf("GLM-5.3 context_length=%v max_output=%v, want 1048576 and 128000", glm53.ContextLength, glm53.MaxOutput)
+	}
+	if glm53.Tools == nil || !glm53.Tools.Support || glm53.Thinking == nil || !glm53.Thinking.DefaultValue || !glm53.Thinking.ClearThinking {
+		t.Errorf("GLM-5.3 tools=%+v thinking=%+v, want tools and default/clear thinking support", glm53.Tools, glm53.Thinking)
+	}
+
+	qwen38, err := pm.GetModelByName("SILICONFLOW", "Qwen/Qwen3.8-27B")
+	if err != nil {
+		t.Fatalf("GetModelByName Qwen3.8-27B: %v", err)
+	}
+	if qwen38.ContextLength == nil || *qwen38.ContextLength != 262144 {
+		t.Errorf("Qwen3.8-27B context_length=%v, want 262144", qwen38.ContextLength)
+	}
+	if !qwen38.ModelTypeMap["chat"] || !qwen38.ModelTypeMap["vision"] {
+		t.Errorf("Qwen3.8-27B model types=%v, want chat+vision", qwen38.ModelTypes)
+	}
+
+	for _, limits := range []struct {
+		name        string
+		contextSize int
+		maxOutput   int
+	}{
+		{"moonshotai/Kimi-K2.5", 262144, 262144},
+		{"moonshotai/Kimi-K2.6", 262144, 262144},
+		{"Qwen/Qwen3-14B", 131072, 131072},
+		{"Qwen/Qwen3-30B-A3B-Instruct-2507", 262144, 262144},
+		{"Qwen/Qwen3-32B", 131072, 131072},
+		{"Qwen/Qwen3-VL-30B-A3B-Instruct", 262144, 262144},
+		{"Qwen/Qwen3-VL-30B-A3B-Thinking", 262144, 262144},
+		{"Qwen/Qwen3.5-35B-A3B", 262144, 262144},
+		{"Qwen/Qwen3.6-27B", 262144, 262144},
+		{"zai-org/GLM-5.2", 1048576, 262144},
+		{"zai-org/GLM-5V-Turbo", 204800, 131072},
+	} {
+		model, err := pm.GetModelByName("SILICONFLOW", limits.name)
+		if err != nil {
+			t.Errorf("GetModelByName %q: %v", limits.name, err)
+			continue
+		}
+		if model.ContextLength == nil || *model.ContextLength != limits.contextSize || model.MaxOutput == nil || *model.MaxOutput != limits.maxOutput {
+			t.Errorf("%s context_length=%v max_output=%v, want %d and %d", limits.name, model.ContextLength, model.MaxOutput, limits.contextSize, limits.maxOutput)
+		}
+	}
+
+	qwen25, err := pm.GetModelByName("SILICONFLOW", "Qwen/Qwen2.5-7B-Instruct")
+	if err != nil {
+		t.Fatalf("GetModelByName Qwen2.5-7B: %v", err)
+	}
+	if qwen25.ContextLength == nil || *qwen25.ContextLength != 32768 || qwen25.MaxOutput == nil || *qwen25.MaxOutput != 4096 {
+		t.Errorf("Qwen2.5-7B context_length=%v max_output=%v, want 32768 and 4096", qwen25.ContextLength, qwen25.MaxOutput)
+	}
+
+	if _, err := pm.GetModelByName("SILICONFLOW", "black-forest-labs/FLUX.2-pro"); err == nil {
+		t.Error("FLUX.2-pro should not be listed because it has no supported RAGFlow model type")
+	}
+
+	for _, model := range provider.Models {
+		if model.ModelTypeMap["chat"] && model.ContextLength == nil {
+			t.Errorf("chat model %q has no context_length", model.Name)
+		}
+	}
+
+	deepSeekV4Pro, err := pm.GetModelByName("SILICONFLOW", "Pro/deepseek-ai/DeepSeek-V4-Pro")
+	if err != nil {
+		t.Fatalf("GetModelByName DeepSeek-V4-Pro: %v", err)
+	}
+	if *deepSeekV4Pro.MaxOutput != 393216 || *deepSeekV4Pro.ContextLength != 1048576 {
+		t.Errorf("DeepSeek-V4-Pro max_output=%d context_length=%d", *deepSeekV4Pro.MaxOutput, *deepSeekV4Pro.ContextLength)
+	}
+	if !deepSeekV4Pro.ModelTypeMap["chat"] {
+		t.Errorf("DeepSeek-V4-Pro model types=%v, want chat", deepSeekV4Pro.ModelTypes)
+	}
+
+	kimiK26, err := pm.GetModelByName("SILICONFLOW", "Pro/moonshotai/Kimi-K2.6")
+	if err != nil {
+		t.Fatalf("GetModelByName Kimi-K2.6: %v", err)
+	}
+	if *kimiK26.MaxOutput != 65536 || *kimiK26.ContextLength != 262144 {
+		t.Errorf("Kimi-K2.6 max_output=%d context_length=%d", *kimiK26.MaxOutput, *kimiK26.ContextLength)
+	}
+	if !kimiK26.ModelTypeMap["chat"] || !kimiK26.ModelTypeMap["vision"] {
+		t.Errorf("Kimi-K2.6 model types=%v, want chat+vision", kimiK26.ModelTypes)
+	}
+
+	glm51, err := pm.GetModelByName("SiliconFlow", "Pro/zai-org/GLM-5.1")
+	if err != nil {
+		t.Fatalf("GetModelByName GLM-5.1: %v", err)
+	}
+	if *glm51.MaxOutput != 128000 || *glm51.ContextLength != 200000 {
+		t.Errorf("GLM-5.1 max_output=%d context_length=%d", *glm51.MaxOutput, *glm51.ContextLength)
+	}
+}
+
+// TestAllModelsCatalogHasNoDuplicateKeys walks conf/all_models.json as a token stream and
+// fails on any object key that occurs twice in the same object.
+//
+// encoding/json keeps only the last occurrence of a duplicated key, so a catalog that
+// writes a field twice loads fine and behaves exactly as if it were written once - the
+// duplicate is invisible to every test that goes through the parsed structs, which is how
+// thirteen duplicated "tokenizer" fields got into this file and survived review. Only the
+// raw token stream can see them, so the check lives here rather than in a schema validator.
+func TestAllModelsCatalogHasNoDuplicateKeys(t *testing.T) {
+	// Control: the detector has to report a duplicate on input that has one, otherwise the
+	// catalog check below is a no-op that passes on anything. That is not hypothetical -
+	// the first version of the detector drove its state machine off the commas between
+	// members, and json.Decoder.Token does not emit them, so it recognised at most the
+	// first key of each object and reported zero duplicates for this very sample.
+	// The sample also pins that array elements are not mistaken for keys ("p", "p").
+	control := []byte(`{"a": 1, "a": 2, "b": {"c": "x", "c": "y"}, "d": ["p", "p", {"e": 1, "e": 2}]}`)
+	if dups := duplicateJSONKeys(t, control); len(dups) != 3 {
+		t.Fatalf("detector control: got %d duplicates (%v), want 3 (a, c, e)", len(dups), dups)
+	}
+
+	target := filepath.Join(findRepoRoot(), "conf", "all_models.json")
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read %s: %v", target, err)
+	}
+	for _, dup := range duplicateJSONKeys(t, data) {
+		t.Errorf("%s:%d: object key %q appears twice (byte %d); encoding/json keeps only the last one, so the file means something other than it says",
+			target, dup.line, dup.key, dup.offset)
+	}
+}
+
+type duplicateKey struct {
+	key    string
+	offset int64
+	line   int
+}
+
+// duplicateJSONKeys returns every key that occurs twice inside the same JSON object.
+func duplicateJSONKeys(t *testing.T, data []byte) []duplicateKey {
+	t.Helper()
+
+	// One frame per open object or array. expectKey means "the next string in this object
+	// is a key": inside an object Decoder.Token yields key, value, key, value ... because
+	// the commas are not tokens, so after every value one has to expect a key again.
+	type frame struct {
+		object    bool
+		expectKey bool
+		keys      map[string]bool
+	}
+	var (
+		stack []frame
+		dups  []duplicateKey
+	)
+
+	// afterValue marks that the frame on top of the stack has just received a value.
+	afterValue := func() {
+		if n := len(stack); n > 0 {
+			stack[n-1].expectKey = true
+		}
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(data))
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("decode catalog: %v", err)
+		}
+		switch v := tok.(type) {
+		case json.Delim:
+			switch v {
+			case '{', '[':
+				// The enclosing object just received a value: whatever follows it is a key,
+				// not a value. The nested frame tracks its own keys from here.
+				if n := len(stack); n > 0 {
+					stack[n-1].expectKey = false
+				}
+				stack = append(stack, frame{object: v == '{', expectKey: v == '{', keys: map[string]bool{}})
+			case '}', ']':
+				if len(stack) > 0 {
+					stack = stack[:len(stack)-1]
+				}
+				afterValue()
+			}
+			continue
+		case string:
+			if n := len(stack); n > 0 && stack[n-1].object && stack[n-1].expectKey {
+				top := &stack[n-1]
+				if top.keys[v] {
+					offset := dec.InputOffset()
+					dups = append(dups, duplicateKey{key: v, offset: offset, line: lineAtOffset(data, offset)})
+				}
+				top.keys[v] = true
+				top.expectKey = false
+				continue
+			}
+		}
+		afterValue()
+	}
+	return dups
+}
+
+// lineAtOffset reports the 1-based line that holds a byte offset.
+func lineAtOffset(data []byte, offset int64) int {
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > int64(len(data)) {
+		offset = int64(len(data))
+	}
+	return 1 + bytes.Count(data[:offset], []byte{'\n'})
+}
+
+// TestConfFilesHaveNoDuplicateKeys applies the duplicate-key check to every JSON file
+// under conf/.
+//
+// A definition written into a file that already had one does not win: the parser keeps the
+// last occurrence, so the older copy stays in force and the newer one is silently ignored.
+// That is not hypothetical - conf/infinity_mapping.json carried two deleted_doc_id
+// definitions, and the duplicate key meant the column the doc-delete fix (#17685) added -
+// with its analyzer - never took effect.
+func TestConfFilesHaveNoDuplicateKeys(t *testing.T) {
+	confDir := filepath.Join(findRepoRoot(), "conf")
+	var files []string
+	err := filepath.WalkDir(confDir, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() && strings.HasSuffix(path, ".json") {
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", confDir, err)
+	}
+	if len(files) == 0 {
+		t.Fatalf("no JSON file under %s; the check would pass vacuously", confDir)
+	}
+	for _, path := range files {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Errorf("read %s: %v", path, err)
+			continue
+		}
+		for _, dup := range duplicateJSONKeys(t, data) {
+			t.Errorf("%s:%d: object key %q appears twice (byte %d); encoding/json keeps only the last one, so the file means something other than it says",
+				path, dup.line, dup.key, dup.offset)
+		}
+	}
+	t.Logf("checked %d JSON files under conf/", len(files))
+}
+
+// TestAllModelsCatalogTokenizerTagsAreKnown checks the catalog's half of the tokenizer
+// link: every "tokenizer" value it declares has to name a counter the Go side knows.
+//
+// A tag that names nothing fails nowhere. ResolveCounter falls back to cl100k_base, the
+// ingest path counts with the calibrated estimate, and the only trace is a lower-precision
+// count - which is the degradation this field exists to prevent. So a typo in a
+// hand-edited catalog is invisible unless the two lists are compared, which is this.
+//
+// The known ids come from CounterStatuses, not from CounterByID: the bool CounterByID
+// returns means "this counter is available", so on a checkout that has not downloaded the
+// tokenizer assets it is false even for a valid tag. Keying this test off it would fail on
+// every machine without the assets - for the wrong reason. CounterStatuses enumerates the
+// ids whether or not their assets are present.
+func TestAllModelsCatalogTokenizerTagsAreKnown(t *testing.T) {
+	known := map[string]bool{}
+	for _, status := range tokenizer.CounterStatuses() {
+		known[status.ID] = true
+	}
+	if len(known) == 0 {
+		t.Fatal("tokenizer.CounterStatuses reports no counters; the check would pass vacuously")
+	}
+
+	target := filepath.Join(findRepoRoot(), "conf", "all_models.json")
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read %s: %v", target, err)
+	}
+	var catalog map[string]any
+	if err := json.Unmarshal(data, &catalog); err != nil {
+		t.Fatalf("parse %s: %v", target, err)
+	}
+
+	knownIDs := sortedKeys(known)
+	tags, declared := map[string]int{}, 0
+	for _, section := range catalog {
+		entries, ok := section.([]any)
+		if !ok {
+			continue
+		}
+		for _, entry := range entries {
+			model, ok := entry.(map[string]any)
+			if !ok {
+				continue
+			}
+			tag, ok := model["tokenizer"].(string)
+			if !ok || tag == "" {
+				continue
+			}
+			declared++
+			tags[tag]++
+			if !known[tag] {
+				t.Errorf("%s: model %v declares tokenizer %q, which is not a counter id %v; ingest will silently count it with the calibrated estimate",
+					target, model["name"], tag, knownIDs)
+			}
+		}
+	}
+	if declared == 0 {
+		t.Fatalf("%s declares no tokenizer for any model; the check would pass vacuously", target)
+	}
+	t.Logf("catalog tokenizer tags: %v", tags)
+}
+
+func TestChatModelWithDefaults(t *testing.T) {
+	thinkingDefault := true
+	model := &ChatModel{info: &ModelInfo{
+		ModelClass: "chat",
+		Thinking:   &ModelThinking{DefaultValue: thinkingDefault},
+	}}
+	config := model.withDefaults(nil)
+	if config.ModelClass == nil || *config.ModelClass != "chat" {
+		t.Fatalf("ModelClass = %v, want chat", config.ModelClass)
+	}
+	if config.Thinking == nil || !*config.Thinking {
+		t.Fatalf("Thinking = %v, want true", config.Thinking)
+	}
+
+	modelClass := "custom"
+	thinking := false
+	config = model.withDefaults(&ChatConfig{ModelClass: &modelClass, Thinking: &thinking})
+	if config.ModelClass != &modelClass || config.Thinking != &thinking {
+		t.Fatal("explicit chat config values should not be overwritten by model defaults")
+	}
+}
+
+func TestChatModelValidateMaxOutput(t *testing.T) {
+	maxOutput := 128
+	maxTokens := func(n int) *int { return &n }
+	model := &ChatModel{info: &ModelInfo{MaxOutput: maxOutput}}
+
+	tests := []struct {
+		name    string
+		config  *ChatConfig
+		wantErr bool
+	}{
+		{name: "below limit", config: &ChatConfig{MaxTokens: maxTokens(127)}},
+		{name: "at limit", config: &ChatConfig{MaxTokens: maxTokens(128)}},
+		{name: "above limit", config: &ChatConfig{MaxTokens: maxTokens(129)}, wantErr: true},
+		{name: "unset max tokens", config: &ChatConfig{}},
+		{name: "nil config"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := model.validateMaxOutput(tt.config)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateMaxOutput() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+
+	unknownLimitModel := &ChatModel{info: &ModelInfo{}}
+	if err := unknownLimitModel.validateMaxOutput(&ChatConfig{MaxTokens: maxTokens(1000)}); err != nil {
+		t.Fatalf("unknown model output limit should not reject config: %v", err)
+	}
+}
+
+// sortedKeys returns the keys of a set, sorted, for a deterministic message.
+func sortedKeys(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for key := range set {
+		out = append(out, key)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestProviderManagerPublishIsVisibleToConcurrentReaders pins the publication
+// contract: InitProviderManager hands the catalog to an atomic pointer, so a
+// reader running while a publish is in flight observes a complete catalog
+// instead of racing on the field. Run with -race to catch a regression back to
+// a plain package variable.
+func TestProviderManagerPublishIsVisibleToConcurrentReaders(t *testing.T) {
+	saved := GetProviderManager()
+	published := &ProviderManager{Providers: []Provider{{Name: "atomic-fixture"}}}
+	setProviderManager(published)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				setProviderManager(published)
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		close(stop)
+		wg.Wait()
+		setProviderManager(saved)
+	})
+
+	for i := 0; i < 1000; i++ {
+		got := GetProviderManager()
+		if got == nil {
+			t.Fatal("GetProviderManager returned nil while a catalog was published")
+		}
+		if len(got.Providers) != 1 || got.Providers[0].Name != "atomic-fixture" {
+			t.Fatalf("reader observed a catalog that was never published: %+v", got)
+		}
+	}
+}

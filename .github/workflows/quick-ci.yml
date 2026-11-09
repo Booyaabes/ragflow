@@ -1,9 +1,9 @@
 name: quick-ci
 
 # Lightweight checks that run on stock GitHub-hosted ubuntu-latest runners,
-# unlike sep-tests.yml/serenedb.yml which require Infiniflow's self-hosted
-# ragflow-test runners and pre-seeded testdata. This workflow covers: Python
-# lint + tests, and frontend lint.
+# unlike sep-tests.yml/release.yml/serenedb.yml which require Infiniflow's
+# self-hosted ragflow-test/ragflow-release runners and pre-seeded native
+# libs/testdata. This workflow covers: Go build + unit tests, and frontend lint.
 
 on:
   push:
@@ -15,11 +15,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  python-test:
-    name: Python lint + tests
+  go-test:
+    name: Go build + unit tests
     runs-on: ubuntu-latest
+    env:
+      # onnxruntime_go is an org mirror that is not in the public Go checksum
+      # database, so Go must resolve it directly from GitHub.
+      GOPRIVATE: github.com/infiniflow/onnxruntime_go
+      GOPROXY: https://proxy.golang.org,direct
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
 
       - uses: actions/setup-python@v5
         with:
@@ -27,33 +37,40 @@ jobs:
 
       - uses: astral-sh/setup-uv@v3
 
-      - name: Install dependencies
+      - name: Install native build toolchain (clang-20, lld-20, pcre2)
         run: |
-          uv sync --python 3.13 --group test --frozen
-          uv pip install -e sdk/python
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libpcre2-dev clang-20 lld-20
+          sudo ln -sf /usr/bin/clang++-20 /usr/bin/clang++
+          sudo ln -sf /usr/bin/clang-20 /usr/bin/clang
+          sudo ln -sf /usr/bin/ld.lld-20 /usr/bin/ld.lld
 
-      # ruff isn't a project dependency (not in [dependency-groups]), so `uv
-      # run ruff` fails with "Failed to spawn: ruff". `uvx` runs it as an
-      # isolated tool instead, matching the bare `ruff check`/`ruff format`
-      # commands documented in AGENTS.md. Pin an exact version: an unpinned
-      # `uvx ruff` resolves whatever is newest on PyPI at invocation time,
-      # and a newer release enabled a much broader default rule set here
-      # (9535 errors vs. 0 on 0.15.8, the version this repo's [tool.ruff]
-      # config was actually written against).
-      #
-      # `ruff format --check` is intentionally not run here: 4 pre-existing
-      # files on main fail it, unrelated to this branch — same reasoning as
-      # dropping oxfmt's format:check from the frontend job above.
-      - name: Ruff check
-        run: uvx ruff@0.15.8 check .
+      # internal/binding/cpp/CMakeLists.txt requires CMake >= 4.0; ubuntu-latest
+      # ships 3.x. The `cmake` PyPI wheel tracks current upstream releases.
+      - name: Install CMake >= 4.0
+        run: pip install "cmake>=4.0"
 
-      # pytest's default testpaths (test/) are HTTP/SDK/web-API integration
-      # suites that expect a live docker-compose'd RAGFlow instance plus real
-      # LLM credentials (see sep-tests.yml) — they cannot run standalone on
-      # ubuntu-latest. ragflow_deps/test_download_go_deps.py is the one
-      # genuinely self-contained unit test outside that tree.
-      - name: Run standalone unit tests
-        run: uv run pytest ragflow_deps/test_download_go_deps.py -q --durations=100
+      - name: Cache native static libs and dev resources
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/ragflow-native-libs
+            deps
+          key: ragflow-dev-deps-${{ hashFiles('tools/scripts/download_dev_deps.py', 'go.mod') }}
+
+      # Native static libs (pdfium/pdf_oxide/office_oxide/onnxruntime) plus the
+      # cl100k BPE table and tokenizer assets the unit tests read from deps/.
+      - name: Download Go dev deps
+        run: uv run tools/scripts/download_dev_deps.py
+
+      # `--test` does not build the C++ tokenizer static library that CGO links
+      # against; build it with the toolchain installed above.
+      - name: Build C++ static library
+        run: bash build.sh --cpp
+
+      - name: Run Go unit tests
+        run: bash build.sh --test ./...
 
   frontend-test:
     name: Frontend lint
@@ -75,10 +92,3 @@ jobs:
 
       - name: Lint (oxlint)
         run: npm run lint
-
-      # Neither `tsc --noEmit` nor `npm run test` (jest) are run here:
-      # ~20 pre-existing type errors (memory/skills/chat pages mid-refactor)
-      # and 19 pre-existing failing jest tests across 12 suites exist on main
-      # already — no workflow in this repo has ever gated on either — and
-      # fixing that dette is out of scope for this CI-setup branch. Same
-      # reasoning as dropping oxfmt's format:check above.

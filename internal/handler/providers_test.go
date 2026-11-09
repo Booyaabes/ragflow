@@ -1,0 +1,427 @@
+package handler
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
+	"github.com/glebarez/sqlite"
+	"gorm.io/gorm"
+
+	"ragflow/internal/common"
+	"ragflow/internal/dao"
+	"ragflow/internal/entity"
+	modelModule "ragflow/internal/entity/models"
+	"ragflow/internal/permission"
+	"ragflow/internal/permission/testsupport"
+	"ragflow/internal/service"
+)
+
+func TestDropProviderInstanceRequestRequiresNonEmptyInstances(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		valid   bool
+	}{
+		{name: "missing", payload: `{}`, valid: false},
+		{name: "empty", payload: `{"instances":[]}`, valid: false},
+		{name: "empty element", payload: `{"instances":[""]}`, valid: false},
+		{name: "instance", payload: `{"instances":["instance-a"]}`, valid: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var req service.DropProviderInstanceRequest
+			if err := json.Unmarshal([]byte(tt.payload), &req); err != nil {
+				t.Fatal(err)
+			}
+			err := binding.Validator.ValidateStruct(&req)
+			if (err == nil) != tt.valid {
+				t.Fatalf("validation error = %v, valid = %v", err, tt.valid)
+			}
+		})
+	}
+}
+
+func setupProviderHandlerTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{TranslateError: true})
+	if err != nil {
+		t.Fatalf("failed to open sqlite: %v", err)
+	}
+	if err := db.AutoMigrate(
+		&entity.User{},
+		&entity.UserTenant{},
+		&entity.TenantModelProvider{},
+		&entity.TenantModelInstance{},
+		&entity.TenantModel{},
+	); err != nil {
+		t.Fatalf("failed to migrate provider handler tables: %v", err)
+	}
+	return db
+}
+
+func useProviderHandlerTestDB(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	orig := dao.DB
+	dao.DB = db
+	t.Cleanup(func() { dao.DB = orig })
+}
+
+func seedProviderHandlerModel(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	activeStatus := "1"
+	rows := []interface{}{
+		// The enterprise policy resolves the tenant role through the user row.
+		&entity.User{ID: "user-1", Nickname: "user", Email: "user-1@test.local", IsAuthenticated: "1", IsActive: "1", IsAnonymous: "0"},
+		&entity.UserTenant{ID: "user-tenant-1", UserID: "user-1", TenantID: "tenant-1", Role: "owner", InvitedBy: "user-1", Status: &activeStatus},
+		&entity.TenantModelProvider{ID: "provider-1", UserID: "user-1", TenantID: "tenant-1", ProviderName: "OpenAI"},
+		&entity.TenantModelInstance{ID: "instance-1", ProviderID: "provider-1", InstanceName: "default", APIKey: "sk-test", Status: "active", Extra: "{}"},
+		&entity.TenantModel{ID: "model-1", ProviderID: "provider-1", InstanceID: "instance-1", ModelName: "gpt-test", ModelType: int(entity.ModelTypeChat), Status: "active"},
+	}
+	for _, row := range rows {
+		if err := db.Create(row).Error; err != nil {
+			t.Fatalf("failed to seed %T: %v", row, err)
+		}
+	}
+}
+
+func newProviderHandlerRequest(t *testing.T, body map[string]interface{}, params ...gin.Param) (*gin.Context, *httptest.ResponseRecorder) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+
+	payload, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal body: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPatch, "/providers/OpenAI/instances/default/models/gpt-test", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+	ctx.Params = params
+	ctx.Set("user_id", "user-1")
+	ctx.Request = ctx.Request.WithContext(permission.WithIdentity(ctx.Request.Context(),
+		"user-1", "tenant-1",
+	))
+	return ctx, recorder
+}
+
+func decodeProviderHandlerResponse(t *testing.T, recorder *httptest.ResponseRecorder) map[string]interface{} {
+	t.Helper()
+	var body map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response %q: %v", recorder.Body.String(), err)
+	}
+	return body
+}
+
+func TestFilterUnsupportedProviders(t *testing.T) {
+	providers := []map[string]interface{}{
+		{"name": "OpenAI"},
+		{"name": "MinerU.Net"},
+		{"name": "MinerU"},
+	}
+
+	got := filterUnsupportedProviders(providers)
+
+	names := make([]string, 0, len(got))
+	for _, provider := range got {
+		name, ok := provider["name"].(string)
+		if !ok {
+			t.Fatalf("provider without name: %v", provider)
+		}
+		names = append(names, name)
+	}
+	want := []string{"OpenAI", "MinerU"}
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("names = %v, want %v", names, want)
+	}
+}
+
+// indexProviderModels keys a merged list by its normalized name.
+func indexProviderModels(t *testing.T, list []map[string]interface{}) map[string]map[string]interface{} {
+	t.Helper()
+	indexed := make(map[string]map[string]interface{}, len(list))
+	for _, m := range list {
+		name, ok := m["name"].(string)
+		if !ok {
+			t.Fatalf("model without name: %v", m)
+		}
+		key := providerModelKey(name)
+		if _, dup := indexed[key]; dup {
+			t.Fatalf("duplicate model %q in merged list", name)
+		}
+		indexed[key] = m
+	}
+	return indexed
+}
+
+func TestMergeProviderModelsMatchesNamesCaseInsensitively(t *testing.T) {
+	static := []map[string]interface{}{
+		{"name": "gpt-4o", "model_types": []string{"chat"}, "max_tokens": 4096},
+		{"name": "text-embedding", "model_types": []string{"embedding"}},
+	}
+	remote := []map[string]interface{}{
+		{"name": "GPT-4o", "model_types": []string{"chat"}, "max_tokens": 128000},
+		{"name": "gpt-4o-mini ", "model_types": []string{"chat"}, "max_tokens": 16384},
+	}
+
+	got := indexProviderModels(t, mergeProviderModels(static, remote))
+	if len(got) != 3 {
+		t.Fatalf("merged %d models, want 3: %v", len(got), got)
+	}
+
+	merged := got["gpt-4o"]
+	if name := merged["name"]; name != "gpt-4o" {
+		t.Errorf("name = %v, want the catalog spelling gpt-4o", name)
+	}
+	if maxTokens := merged["max_tokens"]; maxTokens != 4096 {
+		t.Errorf("max_tokens = %v, want the catalog value 4096", maxTokens)
+	}
+
+	trimmed, ok := got["gpt-4o-mini"]
+	if !ok {
+		t.Fatalf("remote-only model not kept: %v", got)
+	}
+	if name := trimmed["name"]; name != "gpt-4o-mini" {
+		t.Errorf("name = %v, want trimmed gpt-4o-mini", name)
+	}
+}
+
+func TestMergeProviderModelsDoesNotUseMaxOutputAsContextWindow(t *testing.T) {
+	static := []map[string]interface{}{
+		{"name": "chat-model", "model_types": []string{"chat"}, "context_length": 128000, "max_output": 4096},
+	}
+	remote := []map[string]interface{}{
+		{"name": "CHAT-MODEL", "model_types": []string{"chat"}, "context_length": 256000, "max_output": 8192},
+	}
+
+	got := indexProviderModels(t, mergeProviderModels(static, remote))
+	model := got["chat-model"]
+	if model["max_tokens"] != 128000 {
+		t.Fatalf("legacy max_tokens = %v, want catalog context length 128000", model["max_tokens"])
+	}
+	if model["max_output"] != 8192 {
+		t.Fatalf("max_output = %v, want remote output ceiling 8192", model["max_output"])
+	}
+}
+
+func TestMergeProviderModelsInheritsCatalogTypesOnConflict(t *testing.T) {
+	static := []map[string]interface{}{
+		{"name": "rerank-1", "model_types": []string{"rerank"}, "max_tokens": 1024},
+	}
+	remote := []map[string]interface{}{{"name": "Rerank-1"}}
+
+	got := indexProviderModels(t, mergeProviderModels(static, remote))
+	merged, ok := got["rerank-1"]
+	if !ok {
+		t.Fatalf("merged = %v, want a single rerank-1 entry", got)
+	}
+	if types := providerModelMapTypes(merged); !reflect.DeepEqual(types, []string{"rerank"}) {
+		t.Errorf("model_types = %v, want [rerank]", types)
+	}
+	if maxTokens := merged["max_tokens"]; maxTokens != 1024 {
+		t.Errorf("max_tokens = %v, want 1024", maxTokens)
+	}
+}
+
+func TestValidateInstanceName(t *testing.T) {
+	tests := []struct {
+		name  string
+		valid bool
+	}{
+		{name: "my_instance", valid: true},
+		{name: "Instance123", valid: true},
+		{name: "_123", valid: true},
+		{name: "my-instance", valid: true},
+		{name: "-my-instance-1", valid: true},
+		{name: "", valid: false},
+		{name: "my instance", valid: false},
+		{name: "实例", valid: true},
+		{name: "实例_name123", valid: true},
+		{name: "instância", valid: false},
+		{name: "instance!", valid: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := service.ValidateProviderInstanceName(tt.name); (err == nil) != tt.valid {
+				t.Fatalf("ValidateProviderInstanceName(%q) error = %v, valid = %v", tt.name, err, tt.valid)
+			}
+		})
+	}
+}
+
+func TestProviderHandlerCreateProviderInstanceRejectsInvalidInstanceName(t *testing.T) {
+	ctx, recorder := newProviderHandlerRequest(
+		t,
+		map[string]interface{}{"instance_name": "my instance!"},
+		gin.Param{Key: "provider_id_or_name", Value: "OpenAI"},
+	)
+
+	NewProviderHandler(nil, service.NewModelProviderService(), service.NewModelCallService()).CreateProviderInstance(ctx)
+
+	body := decodeProviderHandlerResponse(t, recorder)
+	if common.ErrorCode(body["code"].(float64)) != common.CodeBadRequest {
+		t.Fatalf("code = %v, want %v", body["code"], common.CodeBadRequest)
+	}
+}
+
+func TestProviderHandlerAlterModelRejectsMissingModelSelector(t *testing.T) {
+	ctx, recorder := newProviderHandlerRequest(
+		t,
+		map[string]interface{}{"status": "active"},
+		gin.Param{Key: "provider_id_or_name", Value: "OpenAI"},
+		gin.Param{Key: "instance_id_or_name", Value: "default"},
+	)
+
+	NewProviderHandler(nil, service.NewModelProviderService(), service.NewModelCallService()).AlterModel(ctx)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	}
+	body := decodeProviderHandlerResponse(t, recorder)
+	if common.ErrorCode(body["code"].(float64)) != common.CodeBadRequest {
+		t.Fatalf("code = %v, want %v", body["code"], common.CodeBadRequest)
+	}
+}
+
+type providerModelListProbe struct {
+	*modelModule.DummyModel
+	apiKey string
+	region string
+	calls  int
+}
+
+func (p *providerModelListProbe) ListModels(_ context.Context, config *modelModule.APIConfig) ([]modelModule.ListModelResponse, error) {
+	p.calls++
+	if config.ApiKey != nil {
+		p.apiKey = *config.ApiKey
+	}
+	if config.Region != nil {
+		p.region = *config.Region
+	}
+	return []modelModule.ListModelResponse{{Name: "gpt-live-test", ModelTypes: []string{"chat"}}}, nil
+}
+
+func (p *providerModelListProbe) NewInstance(map[string]string) modelModule.ModelDriver {
+	return p
+}
+
+func TestListModelsSavedCredentialsUsesProviderCatalogMerge(t *testing.T) {
+	db := setupProviderHandlerTestDB(t)
+	useProviderHandlerTestDB(t, db)
+	seedProviderHandlerModel(t, db)
+	// The enterprise policy also reads group, role and grant tables; the
+	// fixture migrates and seeds them, and is a no-op in the community build.
+	if err := testsupport.PrepareEnterprisePermissionFixture(db, "tenant-1", "user-1"); err != nil {
+		t.Fatalf("prepare provider permission fixture: %v", err)
+	}
+
+	provider := dao.GetModelProviderManager().FindProvider("OpenAI")
+	if provider == nil {
+		t.Fatal("OpenAI provider is not configured")
+	}
+	probe := &providerModelListProbe{DummyModel: modelModule.NewDummyModel(nil, modelModule.URLSuffix{})}
+	originalDriver := provider.ModelDriver
+	provider.ModelDriver = probe
+	t.Cleanup(func() { provider.ModelDriver = originalDriver })
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/providers/OpenAI/models?use_saved_credentials=true&instance_name=default", nil)
+	ctx.Params = gin.Params{{Key: "provider_id_or_name", Value: "OpenAI"}}
+	ctx.Set("user_id", "user-1")
+	ctx.Request = ctx.Request.WithContext(permission.WithIdentity(ctx.Request.Context(),
+		"user-1", "tenant-1",
+	))
+
+	NewProviderHandler(nil, service.NewModelProviderService(), service.NewModelCallService()).ListModels(ctx)
+	body := decodeProviderHandlerResponse(t, recorder)
+	if common.ErrorCode(body["code"].(float64)) != common.CodeSuccess {
+		t.Fatalf("ListModels() response = %v, want success", body)
+	}
+	if probe.calls != 1 || probe.apiKey != "sk-test" || probe.region != "default" {
+		t.Fatalf("provider list calls=%d region=%q, want one call with saved key and default region", probe.calls, probe.region)
+	}
+
+	models, ok := body["data"].([]interface{})
+	if !ok {
+		t.Fatalf("ListModels() data = %T, want model list", body["data"])
+	}
+	modelNames := make(map[string]bool, len(models))
+	for _, item := range models {
+		model, ok := item.(map[string]interface{})
+		if !ok {
+			t.Fatalf("model entry = %T, want object", item)
+		}
+		name, _ := model["name"].(string)
+		modelNames[name] = true
+	}
+	if !modelNames["gpt-live-test"] || !modelNames["gpt-5.6"] {
+		t.Fatalf("ListModels() names = %v, want live model and catalog model", modelNames)
+	}
+}
+
+func TestProviderHandlerAlterModelRejectsInvalidStatus(t *testing.T) {
+	ctx, recorder := newProviderHandlerRequest(
+		t,
+		map[string]interface{}{"status": "disabled"},
+		gin.Param{Key: "provider_id_or_name", Value: "OpenAI"},
+		gin.Param{Key: "instance_id_or_name", Value: "default"},
+		gin.Param{Key: "model_name", Value: "gpt-test"},
+	)
+
+	NewProviderHandler(nil, service.NewModelProviderService(), service.NewModelCallService()).AlterModel(ctx)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	}
+	body := decodeProviderHandlerResponse(t, recorder)
+	if common.ErrorCode(body["code"].(float64)) != common.CodeBadRequest {
+		t.Fatalf("code = %v, want %v", body["code"], common.CodeBadRequest)
+	}
+}
+
+func TestProviderHandlerAlterModelUpdatesStatus(t *testing.T) {
+	db := setupProviderHandlerTestDB(t)
+	useProviderHandlerTestDB(t, db)
+	seedProviderHandlerModel(t, db)
+	if err := testsupport.PrepareEnterprisePermissionFixture(db, "tenant-1", "user-1"); err != nil {
+		t.Fatalf("prepare provider permission fixture: %v", err)
+	}
+
+	ctx, recorder := newProviderHandlerRequest(
+		t,
+		map[string]interface{}{"status": "inactive"},
+		gin.Param{Key: "provider_id_or_name", Value: "OpenAI"},
+		gin.Param{Key: "instance_id_or_name", Value: "default"},
+		gin.Param{Key: "model_name", Value: "gpt-test"},
+	)
+
+	NewProviderHandler(nil, service.NewModelProviderService(), service.NewModelCallService()).AlterModel(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	body := decodeProviderHandlerResponse(t, recorder)
+	if common.ErrorCode(body["code"].(float64)) != common.CodeSuccess {
+		t.Fatalf("code = %v, want %v", body["code"], common.CodeSuccess)
+	}
+
+	var got entity.TenantModel
+	if err := db.Where("id = ?", "model-1").First(&got).Error; err != nil {
+		t.Fatalf("failed to reload model: %v", err)
+	}
+	if got.Status != "inactive" {
+		t.Fatalf("status = %q, want inactive", got.Status)
+	}
+}

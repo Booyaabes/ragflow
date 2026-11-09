@@ -1,0 +1,532 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
+package sandbox
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"ragflow/internal/common"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestLocalOutputCapture_DrainsBeyondLimit(t *testing.T) {
+	var output localOutputCapture
+	output.limit = 32
+	for range 100 {
+		if n, err := output.Write([]byte(strings.Repeat("x", 1024))); err != nil || n != 1024 {
+			t.Fatalf("Write = (%d, %v), want (1024, nil)", n, err)
+		}
+	}
+	if output.buffer.Len() > 32 {
+		t.Errorf("captured %d bytes, want at most 32", output.buffer.Len())
+	}
+	if output.total != 102400 {
+		t.Errorf("total = %d, want 102400", output.total)
+	}
+}
+
+func TestLocal_ExecuteCode_OutputLimit(t *testing.T) {
+	pythonPath, err := findBinary("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	p := newLocalForTest(t)
+	p.pythonBin = pythonPath
+	p.maxOutputBytes = 1024
+	inst, err := p.CreateInstance(t.Context(), "python")
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	defer p.DestroyInstance(t.Context(), inst)
+
+	for _, size := range []string{"65536", "600"} {
+		t.Run(size, func(t *testing.T) {
+			code := "import sys\n\ndef main():\n    sys.stdout.write('x' * " + size + ")\n    sys.stderr.write('y' * " + size + ")\n    return 1"
+			result, err := p.ExecuteCode(t.Context(), inst, code, "python", 10, nil)
+			if result != nil || err == nil || !strings.Contains(err.Error(), "local: output exceeds 1024 bytes (got ") {
+				t.Fatalf("ExecuteCode returned result=%t, err=%v; want output limit error", result != nil, err)
+			}
+		})
+	}
+}
+
+func TestLocal_ExecuteCode_NonzeroExitWithinOutputLimit(t *testing.T) {
+	pythonPath, err := findBinary("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	p := newLocalForTest(t)
+	p.pythonBin = pythonPath
+	p.maxOutputBytes = 1024
+	inst, err := p.CreateInstance(t.Context(), "python")
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	defer p.DestroyInstance(t.Context(), inst)
+
+	code := "import sys\n\ndef main():\n    print('hello')\n    sys.stderr.write('failure\\n')\n    raise SystemExit(7)"
+	result, err := p.ExecuteCode(t.Context(), inst, code, "python", 10, nil)
+	if err != nil {
+		t.Fatalf("ExecuteCode: %v", err)
+	}
+	if result.ExitCode != 7 || result.Stdout != "hello\n" || result.Stderr != "failure\n" {
+		t.Errorf("result = (%d, %q, %q), want (7, hello, failure)", result.ExitCode, result.Stdout, result.Stderr)
+	}
+}
+
+// newLocalForTest builds a LocalProvider pointing at a temp
+// work_dir so tests don't pollute the operator's filesystem.
+func newLocalForTest(t *testing.T) *LocalProvider {
+	t.Helper()
+	workDir := t.TempDir()
+	p := &LocalProvider{
+		pythonBin:        localDefaultPythonBin,
+		nodeBin:          localDefaultNodeBin,
+		workDir:          workDir,
+		timeout:          5,
+		maxMemoryMB:      512,
+		maxOutputBytes:   1 << 20,
+		maxArtifacts:     20,
+		maxArtifactBytes: 10 << 20,
+		instances:        map[string]string{},
+	}
+	ctx := t.Context()
+	if err := p.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	return p
+}
+
+func TestLocal_ProviderTypeAndLanguages(t *testing.T) {
+	t.Parallel()
+	p := newLocalProviderFromEnv()
+	if p.ProviderType() != ProviderLocal {
+		t.Errorf("ProviderType = %q, want %q", p.ProviderType(), ProviderLocal)
+	}
+	langs := p.SupportedLanguages()
+	want := map[string]bool{"python": true, "nodejs": true, "javascript": true}
+	for _, l := range langs {
+		if !want[l] {
+			t.Errorf("unexpected language: %q", l)
+		}
+	}
+}
+
+func TestLocal_EnvDefaults(t *testing.T) {
+	for _, k := range []string{
+		"LOCAL_PYTHON_BIN", "LOCAL_NODE_BIN", "LOCAL_WORK_DIR",
+		"LOCAL_TIMEOUT", "LOCAL_MAX_MEMORY_MB", "LOCAL_MAX_OUTPUT_BYTES",
+		"LOCAL_MAX_ARTIFACTS", "LOCAL_MAX_ARTIFACT_BYTES",
+	} {
+		t.Setenv(k, "")
+	}
+	p := newLocalProviderFromEnv()
+	if p.pythonBin != localDefaultPythonBin {
+		t.Errorf("pythonBin = %q, want %q", p.pythonBin, localDefaultPythonBin)
+	}
+	if p.workDir != localDefaultWorkDir {
+		t.Errorf("workDir = %q, want %q", p.workDir, localDefaultWorkDir)
+	}
+	if p.timeout != localDefaultTimeout {
+		t.Errorf("timeout = %d, want %d", p.timeout, localDefaultTimeout)
+	}
+}
+
+func TestLocal_EnvOverride(t *testing.T) {
+	workDir := t.TempDir()
+	t.Setenv("LOCAL_WORK_DIR", workDir)
+	t.Setenv("LOCAL_TIMEOUT", "12")
+	t.Setenv("LOCAL_MAX_OUTPUT_BYTES", "4096")
+	p := newLocalProviderFromEnv()
+	if p.workDir != workDir {
+		t.Errorf("workDir = %q, want %q", p.workDir, workDir)
+	}
+	if p.timeout != 12 {
+		t.Errorf("timeout = %d, want 12", p.timeout)
+	}
+	if p.maxOutputBytes != 4096 {
+		t.Errorf("maxOutputBytes = %d, want 4096", p.maxOutputBytes)
+	}
+}
+
+func TestLocal_ConfigUsesCanonicalLowercaseKeys(t *testing.T) {
+	p := newLocalProviderFromConfig(map[string]any{
+		"python_bin": "/custom/python", "work_dir": "/custom/work", "timeout": 12,
+	})
+	if p.pythonBin != "/custom/python" || p.workDir != "/custom/work" || p.timeout != 12 {
+		t.Fatalf("lowercase config was not applied: %#v", p)
+	}
+	legacy := newLocalProviderFromConfig(map[string]any{"PYTHON_BIN": "/legacy"})
+	if legacy.pythonBin == "/legacy" {
+		t.Fatal("uppercase configuration unexpectedly accepted")
+	}
+}
+
+func TestLocal_Initialize_CreatesWorkDir(t *testing.T) {
+	workDir := filepath.Join(t.TempDir(), "nested", "workdir")
+	if _, err := os.Stat(workDir); !os.IsNotExist(err) {
+		t.Fatalf("workDir unexpectedly exists: %v", err)
+	}
+	t.Setenv("LOCAL_WORK_DIR", workDir)
+	p := newLocalProviderFromEnv()
+	ctx := t.Context()
+	if err := p.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	info, err := os.Stat(workDir)
+	if err != nil {
+		t.Fatalf("workDir not created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Errorf("workDir is not a directory: %v", info)
+	}
+}
+
+func TestLocal_Initialize_OutputLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		limit     any
+		wantError bool
+	}{
+		{"default", nil, false},
+		{"positive", 1024, false},
+		{"positive_below_schema_minimum", 1, false},
+		{"zero", 0, true},
+		{"negative", -1, true},
+		{"string_zero", "0", true},
+		{"string_negative", "-1", true},
+		{"json_zero", float64(0), true},
+		{"json_negative", float64(-1), true},
+		{"json_number_zero", json.Number("0"), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newLocalProviderFromConfig(map[string]any{
+				"work_dir":         t.TempDir(),
+				"max_output_bytes": tc.limit,
+			})
+			err := p.Initialize(t.Context())
+			if (err != nil) != tc.wantError {
+				t.Fatalf("Initialize = %v, wantError = %v", err, tc.wantError)
+			}
+			if err != nil && !strings.Contains(err.Error(), "max_output_bytes") {
+				t.Fatalf("Initialize error does not identify invalid limit: %v", err)
+			}
+			if p.isInitialized() == tc.wantError {
+				t.Fatalf("initialized = %v, want %v", p.isInitialized(), !tc.wantError)
+			}
+		})
+	}
+}
+
+func TestLocal_CreateInstance_CreatesArtifactsDir(t *testing.T) {
+	p := newLocalForTest(t)
+	ctx := t.Context()
+	inst, err := p.CreateInstance(ctx, "python")
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	if inst.Provider != ProviderLocal {
+		t.Errorf("provider = %q, want %q", inst.Provider, ProviderLocal)
+	}
+	artifactsDir := filepath.Join(p.workDir, inst.InstanceID, "artifacts")
+	info, err := os.Stat(artifactsDir)
+	if err != nil {
+		t.Fatalf("artifacts dir not created: %v", err)
+	}
+	if !info.IsDir() {
+		t.Errorf("artifacts path is not a directory: %v", info)
+	}
+}
+
+func TestLocal_CreateInstance_RejectsBadLanguage(t *testing.T) {
+	p := newLocalForTest(t)
+	ctx := t.Context()
+	if _, err := p.CreateInstance(ctx, "ruby"); err == nil {
+		t.Errorf("CreateInstance(ruby): got nil error, want one")
+	}
+}
+
+func TestLocal_AllOps_BeforeInit(t *testing.T) {
+	t.Parallel()
+	p := &LocalProvider{}
+	ctx := t.Context()
+	inst := &SandboxInstance{InstanceID: "x", Provider: ProviderLocal}
+	if _, err := p.CreateInstance(ctx, "python"); err == nil {
+		t.Errorf("CreateInstance before init: got nil error, want one")
+	}
+	if _, err := p.ExecuteCode(ctx, inst, "x", "python", 5, nil); err == nil {
+		t.Errorf("ExecuteCode before init: got nil error, want one")
+	}
+	if err := p.DestroyInstance(ctx, inst); err == nil {
+		t.Errorf("DestroyInstance before init: got nil error, want one")
+	}
+	if err := p.HealthCheck(ctx); err == nil {
+		t.Errorf("HealthCheck before init: got nil error, want one")
+	}
+}
+
+// TestLocal_ExecuteCode_Python_RoundTrip runs a real Python
+// subprocess via the local provider. Skipped if python3 is not
+// on PATH (CI without python).
+func TestLocal_ExecuteCode_Python_RoundTrip(t *testing.T) {
+	pythonPath, err := findBinary("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH — skipping local subprocess test")
+	}
+	p := newLocalForTest(t)
+	ctx := t.Context()
+	p.pythonBin = pythonPath
+	inst, err := p.CreateInstance(ctx, "python")
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	defer p.DestroyInstance(ctx, inst)
+
+	code := "def main(): return {'value': 7, 'type': 'json'}"
+	result, err := p.ExecuteCode(ctx, inst, code, "python", 10, nil)
+	if err != nil {
+		t.Fatalf("ExecuteCode: %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Errorf("ExitCode = %d, want 0; stderr=%q", result.ExitCode, result.Stderr)
+	}
+	if sr, ok := result.Metadata["structured_result"].(map[string]any); !ok {
+		t.Errorf("structured_result missing or wrong type: %v", result.Metadata["structured_result"])
+	} else if v, _ := sr["value"].(map[string]any)["value"].(float64); v != 7 {
+		t.Errorf("structured_result[value].value = %v, want 7", sr)
+	}
+}
+
+func TestLocal_ExecuteCode_RejectsBadInputs(t *testing.T) {
+	p := newLocalForTest(t)
+	p.initialized = true
+	ctx := t.Context()
+	cases := []struct {
+		name string
+		fn   func() error
+		want string
+	}{
+		{
+			name: "empty instance id",
+			fn: func() error {
+				_, err := p.ExecuteCode(ctx,
+					&SandboxInstance{InstanceID: ""}, "x", "python", 5, nil)
+				return err
+			},
+			want: "instance id",
+		},
+		{
+			name: "unsupported language",
+			fn: func() error {
+				_, err := p.ExecuteCode(ctx,
+					&SandboxInstance{InstanceID: "x"}, "x", "ruby", 5, nil)
+				return err
+			},
+			want: "unsupported language",
+		},
+		{
+			name: "timeout too small",
+			fn: func() error {
+				_, err := p.ExecuteCode(ctx,
+					&SandboxInstance{InstanceID: "x"}, "x", "python", 0, nil)
+				return err
+			},
+			want: "timeout",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.fn()
+			if err == nil {
+				t.Fatalf("got nil error, want one containing %q", tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %v, want to contain %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestLocal_DestroyInstance_RemovesDir(t *testing.T) {
+	p := newLocalForTest(t)
+	ctx := t.Context()
+	inst, err := p.CreateInstance(ctx, "python")
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	dir := filepath.Join(p.workDir, inst.InstanceID)
+	if _, err = os.Stat(dir); err != nil {
+		t.Fatalf("instance dir not created: %v", err)
+	}
+	if err = p.DestroyInstance(ctx, inst); err != nil {
+		t.Errorf("DestroyInstance: %v", err)
+	}
+	if _, err = os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("instance dir still exists after destroy: %v", err)
+	}
+	// Idempotent: second call should be a no-op.
+	if err = p.DestroyInstance(ctx, inst); err != nil {
+		t.Errorf("DestroyInstance (idempotent): %v", err)
+	}
+}
+
+func TestLocal_HealthCheck(t *testing.T) {
+	p := newLocalForTest(t)
+	ctx := t.Context()
+	if err := p.HealthCheck(ctx); err != nil {
+		t.Errorf("HealthCheck: %v", err)
+	}
+	// Removing the work dir should make health check fail.
+	if err := os.RemoveAll(p.workDir); err != nil {
+		t.Fatalf("remove work dir: %v", err)
+	}
+	if err := p.HealthCheck(ctx); err == nil {
+		t.Errorf("HealthCheck after remove: got nil error, want one")
+	}
+}
+
+func TestLocal_CollectArtifacts_RejectsBadExtension(t *testing.T) {
+	p := newLocalForTest(t)
+	ctx := t.Context()
+	inst, err := p.CreateInstance(ctx, "python")
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	defer p.DestroyInstance(ctx, inst)
+	// Drop an unsupported extension into the artifacts dir.
+	artDir := filepath.Join(p.workDir, inst.InstanceID, "artifacts")
+	if err = os.WriteFile(filepath.Join(artDir, "evil.exe"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("write artifact: %v", err)
+	}
+	_, err = p.collectArtifacts(p.workDir + "/" + inst.InstanceID)
+	if err == nil {
+		t.Errorf("collectArtifacts(.exe): got nil error, want one")
+	}
+	if !strings.Contains(err.Error(), "unsupported artifact type") {
+		t.Errorf("err = %v, want to mention 'unsupported artifact type'", err)
+	}
+}
+
+func TestLocal_CollectArtifacts_AllowsCSVRoundTrip(t *testing.T) {
+	p := newLocalForTest(t)
+	ctx := t.Context()
+	inst, err := p.CreateInstance(ctx, "python")
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	defer p.DestroyInstance(ctx, inst)
+	artDir := filepath.Join(p.workDir, inst.InstanceID, "artifacts")
+	if err = os.WriteFile(filepath.Join(artDir, "out.csv"), []byte("a,b\n1,2\n"), 0o600); err != nil {
+		t.Fatalf("write artifact: %v", err)
+	}
+	artifacts, err := p.collectArtifacts(p.workDir + "/" + inst.InstanceID)
+	if err != nil {
+		t.Fatalf("collectArtifacts: %v", err)
+	}
+	if len(artifacts) != 1 {
+		t.Fatalf("got %d artifacts, want 1", len(artifacts))
+	}
+	got := artifacts[0]
+	if got["name"] != "out.csv" {
+		t.Errorf("name = %v, want out.csv", got["name"])
+	}
+	// "a,b\n1,2\n" is 8 bytes (a, comma, b, \n, 1, comma, 2, \n).
+	if got["size"].(int64) != 8 {
+		t.Errorf("size = %v, want 8", got["size"])
+	}
+	decoded, _ := base64.StdEncoding.DecodeString(got["content_b64"].(string))
+	// "a,b\n1,2\n" is 8 bytes (a, comma, b, \n, 1, comma, 2, \n).
+	if got["size"].(int64) != 8 {
+		t.Errorf("size = %v, want 8", got["size"])
+	}
+	if string(decoded) != "a,b\n1,2\n" {
+		t.Errorf("content mismatch: %q", decoded)
+	}
+}
+
+func TestShq(t *testing.T) {
+	t.Parallel()
+	// shq uses the POSIX single-quote escape sequence for embedded apostrophes.
+	// "o'clock" -> 'o'\''clock'.
+	cases := []struct {
+		in, want string
+	}{
+		{"foo", "'foo'"},
+		{"o'clock", `'o'\''clock'`},
+		{"a b c", "'a b c'"},
+		{"", "''"},
+	}
+	for _, tc := range cases {
+		if got := shq(tc.in); got != tc.want {
+			t.Errorf("shq(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestStatusFromExitCode(t *testing.T) {
+	if got := statusFromExitCode(0); got != "ok" {
+		t.Errorf("0 -> %q, want ok", got)
+	}
+	if got := statusFromExitCode(1); got != "error" {
+		t.Errorf("1 -> %q, want error", got)
+	}
+}
+
+func TestEnvOr(t *testing.T) {
+	t.Setenv(common.EnvRAGFlowTestEnvOr, "x")
+	if got := envOr(common.EnvRAGFlowTestEnvOr, "fallback"); got != "x" {
+		t.Errorf("got %q, want x", got)
+	}
+	if got := envOr(common.EnvRAGFlowTestEnvOrUnset, "fallback"); got != "fallback" {
+		t.Errorf("got %q, want fallback", got)
+	}
+}
+
+func TestEnvIntOr(t *testing.T) {
+	t.Setenv(common.EnvRAGFlowTestEnvIntOr, "42")
+	if got := envIntOr(common.EnvRAGFlowTestEnvIntOr, 10); got != 42 {
+		t.Errorf("got %d, want 42", got)
+	}
+	if got := envIntOr(common.EnvRAGFlowTestEnvIntOrUnset, 10); got != 10 {
+		t.Errorf("got %d, want 10", got)
+	}
+	t.Setenv(common.EnvRAGFlowTestEnvIntOr, "garbage")
+	if got := envIntOr(common.EnvRAGFlowTestEnvIntOr, 10); got != 10 {
+		t.Errorf("garbage value: got %d, want fallback 10", got)
+	}
+}
+
+// findBinary searches PATH for a binary. Used by tests that
+// skip on missing runtime dependencies.
+func findBinary(name string) (string, error) {
+	paths := strings.Split(common.GetEnv(common.EnvPath), string(os.PathListSeparator))
+	for _, dir := range paths {
+		candidate := filepath.Join(dir, name)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			return candidate, nil
+		}
+	}
+	return "", os.ErrNotExist
+}
+
+// ensure time.Duration is referenced (avoid unused import if
+// we later remove other test helpers).
+var _ = time.Second

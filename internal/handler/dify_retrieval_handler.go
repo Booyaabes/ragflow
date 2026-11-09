@@ -1,0 +1,414 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
+package handler
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+
+	"ragflow/internal/dao"
+	"ragflow/internal/permission"
+	"strconv"
+	"strings"
+
+	"ragflow/internal/common"
+	"ragflow/internal/engine"
+	"ragflow/internal/entity"
+	modelModule "ragflow/internal/entity/models"
+	"ragflow/internal/service"
+	"ragflow/internal/service/graph"
+	"ragflow/internal/service/nlp"
+
+	"go.uber.org/zap"
+	"gorm.io/gorm"
+
+	"github.com/gin-gonic/gin"
+)
+
+// --- Interfaces (for testability) ---
+
+// KBServiceIface abstracts KnowledgebaseService for the Dify handler.
+type KBServiceIface interface {
+	GetKnowledgebaseByID(ctx context.Context, kbID string) (*entity.Knowledgebase, error)
+}
+
+// ModelCreator supplies typed model instances to Dify retrieval.
+type ModelCreator interface {
+	NewEmbeddingModel(ctx context.Context, modelRef string) (*modelModule.EmbeddingModel, error)
+	NewDefaultChatModel(ctx context.Context) (*modelModule.ChatModel, error)
+}
+
+// MetadataServiceIface abstracts MetadataService for the Dify handler.
+type MetadataServiceIface interface {
+	GetFlattedMetaByKBs(ctx context.Context, kbIDs []string) (common.MetaData, error)
+	SearchMetadataByKBs(ctx context.Context, kbIDs []string, size int) (*service.SearchMetadataResponse, error)
+	LabelQuestion(ctx context.Context, question string, kbs []*entity.Knowledgebase) map[string]float64
+}
+
+// RetrievalServiceIface abstracts RetrievalService for the Dify handler.
+type RetrievalServiceIface interface {
+	Retrieval(ctx context.Context, req *nlp.RetrievalRequest) (*nlp.RetrievalResult, error)
+}
+
+// DocumentDAOIface abstracts DocumentDAO for the Dify handler.
+type DocumentDAOIface interface {
+	GetByIDs(ctx context.Context, db *gorm.DB, ids []string) ([]*entity.Document, error)
+}
+
+// --- Request / Response types ---
+
+// difyRetrievalRequest is the JSON body / query params for the Dify retrieval endpoint.
+type difyRetrievalRequest struct {
+	KnowledgeID       string                 `json:"knowledge_id" form:"knowledge_id"`
+	Query             string                 `json:"query" form:"query"`
+	UseKG             bool                   `json:"use_kg" form:"use_kg"`
+	RetrievalSetting  *difyRetrievalSetting  `json:"retrieval_setting"`
+	MetadataCondition *difyMetadataCondition `json:"metadata_condition"`
+}
+
+type difyRetrievalSetting struct {
+	TopK           *int     `json:"top_k" form:"top_k"`
+	ScoreThreshold *float64 `json:"score_threshold" form:"score_threshold"`
+}
+
+// difyCondition is a Dify-format metadata filter condition.
+// Dify uses "name"/"comparison_operator" instead of MetaFilterCondition's "key"/"op".
+type difyCondition struct {
+	Name               string      `json:"name"`
+	ComparisonOperator string      `json:"comparison_operator"`
+	Value              interface{} `json:"value"`
+}
+
+type difyMetadataCondition struct {
+	Conditions []difyCondition `json:"conditions"`
+	Logic      string          `json:"logic"`
+}
+
+// toMetaFilterConditions converts Dify-format conditions to internal MetaFilterConditions.
+func (c difyMetadataCondition) toMetaFilterConditions() []service.MetaFilterCondition {
+	if len(c.Conditions) == 0 {
+		return nil
+	}
+	result := make([]service.MetaFilterCondition, len(c.Conditions))
+	for i, dc := range c.Conditions {
+		v := ""
+		if dc.Value != nil {
+			v = fmt.Sprint(dc.Value)
+		}
+		result[i] = service.MetaFilterCondition{
+			Key:   dc.Name,
+			Op:    dc.ComparisonOperator,
+			Value: v,
+		}
+	}
+	return result
+}
+
+// difyRecord is one item in the response records array.
+type difyRecord struct {
+	Content  string                 `json:"content"`
+	Score    float64                `json:"score"`
+	Title    string                 `json:"title"`
+	Metadata map[string]interface{} `json:"metadata"`
+}
+
+// --- Handler ---
+
+type resourcePermissionChecker interface {
+	CheckResource(context.Context, permission.ResourceRef, permission.Operation) error
+}
+
+// DifyRetrievalHandler handles Dify-compatible retrieval requests.
+type DifyRetrievalHandler struct {
+	kbSvc             KBServiceIface
+	permissionChecker resourcePermissionChecker
+	modelFactory      ModelCreator
+	metadataSvc       MetadataServiceIface
+	retrievalSvc      RetrievalServiceIface
+	docDAO            DocumentDAOIface
+	docEngine         engine.DocEngine
+}
+
+// NewDifyRetrievalHandler creates a new DifyRetrievalHandler.
+// The KG pipeline is created inline when use_kg=true to avoid injecting
+// a pipeline that depends on per-request model configuration.
+func NewDifyRetrievalHandler(
+	kbSvc KBServiceIface,
+	modelFactory ModelCreator,
+	metadataSvc MetadataServiceIface,
+	retrievalSvc RetrievalServiceIface,
+	docDAO DocumentDAOIface,
+	docEngine engine.DocEngine,
+) *DifyRetrievalHandler {
+	return &DifyRetrievalHandler{
+		kbSvc:             kbSvc,
+		permissionChecker: permission.NewDatabaseChecker(dao.DB),
+		modelFactory:      modelFactory,
+		metadataSvc:       metadataSvc,
+		retrievalSvc:      retrievalSvc,
+		docDAO:            docDAO,
+		docEngine:         docEngine,
+	}
+}
+
+// Retrieval handles POST/GET /api/v1/dify/retrieval.
+// Matches Python: api/apps/restful_apis/dify_retrieval_api.py::retrieval()
+func (h *DifyRetrievalHandler) Retrieval(c *gin.Context) {
+	_, errCode, errMsg := GetUser(c)
+	if errCode != common.CodeSuccess {
+		common.Respond(c, http.StatusUnauthorized, errCode, nil, errMsg)
+		return
+	}
+
+	var req difyRetrievalRequest
+	if c.Request.Method == http.MethodGet {
+		if err := c.ShouldBindQuery(&req); err != nil {
+			common.Respond(c, http.StatusBadRequest, common.CodeArgumentError, nil, "invalid query parameters")
+			return
+		}
+		// Manually extract top_k and score_threshold from query (flat params, not nested)
+		if v := c.Query("top_k"); v != "" {
+			if parsed, err := strconv.Atoi(v); err == nil {
+				if req.RetrievalSetting == nil {
+					req.RetrievalSetting = &difyRetrievalSetting{}
+				}
+				req.RetrievalSetting.TopK = &parsed
+			}
+		}
+		if v := c.Query("score_threshold"); v != "" {
+			if parsed, err := strconv.ParseFloat(v, 64); err == nil {
+				if req.RetrievalSetting == nil {
+					req.RetrievalSetting = &difyRetrievalSetting{}
+				}
+				req.RetrievalSetting.ScoreThreshold = &parsed
+			}
+		}
+	} else {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			common.Respond(c, http.StatusBadRequest, common.CodeArgumentError, nil, "invalid request body")
+			return
+		}
+	}
+
+	if req.KnowledgeID == "" || req.Query == "" {
+		common.Respond(c, http.StatusBadRequest, common.CodeArgumentError, nil, "knowledge_id and query are required")
+		return
+	}
+
+	ctx := c.Request.Context()
+	kb, err := h.kbSvc.GetKnowledgebaseByID(ctx, req.KnowledgeID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			common.Respond(c, http.StatusNotFound, common.CodeNotFound, nil, "Knowledge base not found!")
+		} else {
+			common.Respond(c, http.StatusInternalServerError, common.CodeServerError, nil, "failed to query knowledge base")
+		}
+		return
+	}
+
+	if err := h.permissionChecker.CheckResource(ctx, permission.ResourceRef{Kind: permission.ResourceKindDataset, ID: req.KnowledgeID}, permission.OperationUse); err != nil {
+		respondHTTPPermissionError(c, err, false)
+		return
+	}
+
+	// Parse retrieval options (nil means service uses defaults)
+	var topK *int
+	if req.RetrievalSetting != nil && req.RetrievalSetting.TopK != nil {
+		topK = req.RetrievalSetting.TopK
+	}
+	var scoreThreshold *float64
+	if req.RetrievalSetting != nil && req.RetrievalSetting.ScoreThreshold != nil {
+		scoreThreshold = req.RetrievalSetting.ScoreThreshold
+	}
+	pageSize := 1024
+	if topK != nil {
+		if *topK < 1 || *topK > 1024 {
+			common.Respond(c, http.StatusBadRequest, common.CodeArgumentError, nil, "top_k must be between 1 and 1024")
+			return
+		}
+		pageSize = *topK
+	}
+
+	// Get embedding model
+	ctx = permission.WithTenantID(ctx, kb.TenantID)
+	embModel, err := h.modelFactory.NewEmbeddingModel(ctx, kb.EmbdID)
+	if err != nil {
+		common.Respond(c, http.StatusInternalServerError, common.CodeServerError, nil, fmt.Sprintf("failed to get embedding model: %v", err))
+		return
+	}
+
+	// Metadata filter. An empty conditions list means no metadata filtering,
+	// the same as the dataset retrieval path. Only conditions that were
+	// actually supplied, and matched nothing, narrow the search to the
+	// no-match sentinel.
+	metas, metaErr := h.metadataSvc.GetFlattedMetaByKBs(ctx, []string{req.KnowledgeID})
+	docIDs := make([]string, 0)
+	if metaErr == nil && req.MetadataCondition != nil && len(req.MetadataCondition.Conditions) > 0 {
+		logic := req.MetadataCondition.Logic
+		if logic == "" {
+			logic = "and"
+		}
+		filteredIDs := service.ApplyMetaFilter(metas, req.MetadataCondition.toMetaFilterConditions(), logic)
+		docIDs = append(docIDs, filteredIDs...)
+		if len(docIDs) == 0 {
+			docIDs = []string{service.NoMatchDocIDSentinel}
+		}
+	}
+
+	// Hand the label result over unconditionally: an empty map says "issue no
+	// rank-feature clause", while a nil pointer would let the nlp layer substitute
+	// its {pagerank_fea: 10} default and add a clause the reference never sends.
+	kbs := []*entity.Knowledgebase{kb}
+	rankFeature := h.metadataSvc.LabelQuestion(ctx, req.Query, kbs)
+
+	// Chunk retrieval. Without RerankCandidatesCount the service defaults the
+	// window to 64 and rejects any top_k above it, including the 1024 default.
+	// Keep 64 as the floor so a small top_k still ranks the same candidates.
+	rerankWindow := max(pageSize, 64)
+	sr := &nlp.RetrievalRequest{
+		Question:              req.Query,
+		TenantIDs:             []string{kb.TenantID},
+		KbIDs:                 []string{req.KnowledgeID},
+		DocIDs:                docIDs,
+		Page:                  1,
+		PageSize:              pageSize,
+		RerankCandidatesCount: &rerankWindow,
+		KNNTopK:               topK,
+		SimilarityThreshold:   scoreThreshold,
+		EmbeddingModel:        embModel,
+		Language:              entity.KnowledgebasesLanguage(kbs),
+	}
+	sr.RankFeature = &rankFeature
+
+	result, err := h.retrievalSvc.Retrieval(c.Request.Context(), sr)
+	if err != nil {
+		if strings.Contains(err.Error(), "not_found") {
+			common.Respond(c, http.StatusNotFound, common.CodeNotFound, nil, "No chunk found! Check the chunk status please!")
+			return
+		}
+		common.Respond(c, http.StatusInternalServerError, common.CodeServerError, nil, err.Error())
+		return
+	}
+
+	// Enrich with child chunks
+	chunks := nlp.RetrievalByChildren(result.Chunks, []string{kb.TenantID}, h.docEngine, c.Request.Context())
+
+	// KG retrieval (optional)
+	if req.UseKG {
+		chatModel, kgErr := h.modelFactory.NewDefaultChatModel(ctx)
+		if kgErr != nil {
+			common.Warn("KG retrieval: failed to get chat model", zap.String("kbID", req.KnowledgeID), zap.Error(kgErr))
+		} else if chatModel != nil {
+			kgPipeline := graph.NewPipeline(
+				h.docEngine,
+				[]string{req.KnowledgeID},
+				[]string{kb.TenantID},
+				req.Query,
+			)
+			kgPipeline.SetChatModel(chatModel)
+			kgPipeline.SetEmbModel(embModel)
+			if kgResult, kgErr := kgPipeline.Retrieval(c.Request.Context()); kgErr == nil {
+				if content, ok := kgResult["content_with_weight"].(string); ok && content != "" {
+					chunks = append([]map[string]interface{}{kgResult}, chunks...)
+				}
+			}
+		}
+	}
+
+	// Collect doc IDs and fetch documents
+	docIDSet := make(map[string]struct{})
+	for _, ch := range chunks {
+		if docID, ok := ch["doc_id"].(string); ok && docID != "" {
+			docIDSet[docID] = struct{}{}
+		}
+	}
+	allDocIDs := make([]string, 0, len(docIDSet))
+	for id := range docIDSet {
+		allDocIDs = append(allDocIDs, id)
+	}
+
+	docMap := make(map[string]*entity.Document)
+	if len(allDocIDs) > 0 {
+		var docs []*entity.Document
+		docs, err = h.docDAO.GetByIDs(ctx, dao.DB, allDocIDs)
+		if err != nil {
+			common.Respond(c, http.StatusInternalServerError, common.CodeServerError, nil, fmt.Sprintf("failed to load documents: %v", err))
+			return
+		}
+		for _, d := range docs {
+			docMap[d.ID] = d
+		}
+	}
+
+	metaMap := make(map[string]map[string]interface{})
+	metaResult, err := h.metadataSvc.SearchMetadataByKBs(ctx, []string{kb.ID}, 10000)
+	if err == nil {
+		for _, metadata := range metaResult.MetadataRecords {
+			docID, ok := service.ExtractDocumentID(metadata)
+			if !ok {
+				continue
+			}
+			metaFields, err := service.ExtractMetaFields(metadata)
+			if err == nil {
+				metaMap[docID] = metaFields
+			}
+		}
+	}
+
+	// Build response
+	records := make([]difyRecord, 0, len(chunks))
+	for _, ch := range chunks {
+		docID, _ := ch["doc_id"].(string)
+		doc := docMap[docID]
+		if doc == nil {
+			continue
+		}
+
+		// Remove vector to reduce response size
+		delete(ch, "vector")
+
+		meta := make(map[string]interface{})
+		if metaFields := metaMap[docID]; metaFields != nil {
+			for k, v := range metaFields {
+				meta[k] = v
+			}
+		}
+
+		meta["doc_id"] = docID
+		meta["document_id"] = docID
+
+		score, _ := ch["similarity"].(float64)
+		title, _ := ch["docnm_kwd"].(string)
+		content, _ := ch["content_with_weight"].(string)
+
+		records = append(records, difyRecord{
+			Content:  content,
+			Score:    score,
+			Title:    title,
+			Metadata: meta,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{"records": records})
+}
+
+// HealthCheck Health check returns a simple health check response.
+func (h *DifyRetrievalHandler) HealthCheck(c *gin.Context) {
+	common.RespondSuccess(c, nil, "success")
+}

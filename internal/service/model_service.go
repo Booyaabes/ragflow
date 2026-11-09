@@ -1,0 +1,3126 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
+package service
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"image"
+	"image/color"
+	"image/png"
+	"os"
+
+	"ragflow/internal/common"
+	"ragflow/internal/dao"
+	"ragflow/internal/entity"
+	modelModule "ragflow/internal/entity/models"
+	"ragflow/internal/permission"
+	permissionresponse "ragflow/internal/permission/response"
+	"regexp"
+	"sort"
+	"strings"
+
+	"go.uber.org/zap"
+	"gorm.io/gorm"
+)
+
+// errModelConfigUnavailable marks model configuration failures that cannot be
+// repaired by retrying the same task.
+var errModelConfigUnavailable = errors.New("model configuration unavailable")
+
+func newModelDriverForBaseURL(driver modelModule.ModelDriver, providerName, region, baseURL string) (modelModule.ModelDriver, error) {
+	if driver == nil {
+		return nil, fmt.Errorf("provider %s driver not found", providerName)
+	}
+
+	if strings.TrimSpace(baseURL) == "" {
+		return driver, nil
+	}
+
+	baseURLByRegion := map[string]string{
+		region: baseURL,
+	}
+	if region == "" {
+		baseURLByRegion["default"] = baseURL
+	}
+
+	newDriver := driver.NewInstance(baseURLByRegion)
+	if newDriver == nil {
+		return nil, fmt.Errorf("provider %s does not support custom base_url", providerName)
+	}
+
+	return newDriver, nil
+}
+
+func NewModelProviderService() *ModelProviderService {
+	return &ModelProviderService{
+		modelProviderDAO: dao.NewTenantModelProviderDAO(),
+		modelInstanceDAO: dao.NewTenantModelInstanceDAO(),
+		modelDAO:         dao.NewTenantModelDAO(),
+		tenantDAO:        dao.NewTenantDAO(),
+		userTenantDAO:    dao.NewUserTenantDAO(),
+		modelGroupDAO:    dao.NewTenantModelGroupDAO(),
+		modelGroupMapDAO: dao.NewTenantModelGroupMapDAO(),
+	}
+}
+
+type ModelProviderService struct {
+	modelProviderDAO *dao.TenantModelProviderDAO
+	modelInstanceDAO *dao.TenantModelInstanceDAO
+	modelDAO         *dao.TenantModelDAO
+	tenantDAO        *dao.TenantDAO
+	userTenantDAO    *dao.UserTenantDAO
+	modelGroupDAO    *dao.TenantModelGroupDAO
+	modelGroupMapDAO *dao.TenantModelGroupMapDAO
+}
+
+// CheckConnectionModelInfo describes a model whose provider connectivity is
+// being verified.
+type CheckConnectionModelInfo struct {
+	ModelName  string                 `json:"model_name"`
+	ModelTypes []string               `json:"model_type"`
+	MaxTokens  int                    `json:"max_tokens"`
+	Extra      map[string]interface{} `json:"extra"`
+}
+
+// CheckConnectionRequest carries credentials and optional instance settings
+// for checking provider connectivity without creating a new model instance.
+type CheckConnectionRequest struct {
+	APIKey              json.RawMessage            `json:"api_key"`
+	ClearAPIKey         bool                       `json:"clear_api_key"`
+	UseSavedCredentials bool                       `json:"use_saved_credentials"`
+	APIKeyConfig        json.RawMessage            `json:"api_key_config"`
+	Region              string                     `json:"region"`
+	BaseURL             string                     `json:"base_url"`
+	InstanceID          string                     `json:"instance_id"`
+	ModelInfo           []CheckConnectionModelInfo `json:"model_info"`
+}
+
+func (m *ModelProviderService) AddModelProvider(ctx context.Context, providerName string) (common.ErrorCode, error) {
+	providerName = strings.TrimSpace(providerName)
+	userID := permission.UserIDFromContext(ctx)
+	if err := permission.NewDatabaseChecker(dao.DB).CheckFeature(ctx, "model_provider", permission.ActionEnable); err != nil {
+		code, normalizedErr := permissionresponse.NormalizeHidden(err)
+		return code, normalizedErr
+	}
+	tenantID, err := requireCurrentTenantID(ctx)
+	if err != nil {
+		code, normalizedErr := permissionresponse.NormalizeHidden(err)
+		return code, normalizedErr
+	}
+
+	existing, err := m.modelProviderDAO.GetByTenantIDAndUserIDAndProviderName(ctx, dao.DB, tenantID, userID, providerName)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return common.CodeServerError, err
+	}
+	if existing != nil {
+		return common.CodeSuccess, nil
+	}
+
+	providerID := common.GenerateToken()
+
+	tenantModelProvider := &entity.TenantModelProvider{
+		ID:           providerID,
+		UserID:       userID,
+		ProviderName: providerName,
+		TenantID:     tenantID,
+	}
+	err = m.modelProviderDAO.Create(ctx, dao.DB, tenantModelProvider)
+	if err != nil {
+		return common.CodeServerError, fmt.Errorf("fail to create model provider: %w", err)
+	}
+	return common.CodeSuccess, nil
+}
+
+func (m *ModelProviderService) ListProvidersOfTenant(ctx context.Context) ([]map[string]interface{}, common.ErrorCode, error) {
+	userID := permission.UserIDFromContext(ctx)
+	ownedTenantID, err := requireCurrentTenantID(ctx)
+	if err != nil {
+		if errors.Is(err, permission.ErrMembershipNotFound) {
+			return []map[string]interface{}{}, common.CodeSuccess, nil
+		}
+		code, normalizedErr := permissionresponse.NormalizeHidden(err)
+		return nil, code, normalizedErr
+	}
+	providerRows, err := m.modelProviderDAO.ListByTenantIDAndUserID(ctx, dao.DB, ownedTenantID, userID)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+	providerRefs := make([]permission.ResourceRef, 0, len(providerRows))
+	providerByID := make(map[string]*entity.TenantModelProvider, len(providerRows))
+	for _, provider := range providerRows {
+		providerRefs = append(providerRefs, permission.ResourceRef{Kind: permission.ResourceKindModelProvider, ID: provider.ID})
+		providerByID[provider.ID] = provider
+	}
+	accessibleProviders, err := permission.NewDatabaseChecker(dao.DB).FilterResources(
+		ctx,
+
+		providerRefs,
+		permission.OperationRead,
+	)
+	if err != nil {
+		code, normalizedErr := permissionresponse.NormalizeHidden(err)
+		return nil, code, normalizedErr
+	}
+
+	type listedProvider struct {
+		id   string
+		info map[string]interface{}
+	}
+	listed := make([]listedProvider, 0, len(accessibleProviders))
+	seenProviderNames := make(map[string]struct{}, len(accessibleProviders))
+	for _, providerRef := range accessibleProviders {
+		providerRow := providerByID[providerRef.ID]
+		if providerRow == nil {
+			continue
+		}
+		providerName := providerRow.ProviderName
+		// Mirror Python's list_providers tenant branch: silently skip system-excluded
+		// factory names (e.g. "Builtin", "Youdao", "FastEmbed", "BAAI",
+		// "siliconflow_intl") and any stale entries whose factory is no longer in
+		// the system pool. See api/apps/services/provider_api_service.py:108.
+		if isExcludedTenantProvider(providerName) {
+			continue
+		}
+		providerKey := strings.ToLower(providerName)
+		if _, exists := seenProviderNames[providerKey]; exists {
+			continue
+		}
+		provider, err := dao.GetModelProviderManager().GetProviderByName(providerName)
+		if err != nil {
+			// Treat "provider not found in system pool" as a stale tenant entry
+			// rather than a 500. Mirrors Python's factory_info_mapping.get(name)
+			// truthy gate in api/apps/services/provider_api_service.py:108.
+			if strings.Contains(err.Error(), "not found") {
+				continue
+			}
+			return nil, common.CodeServerError, err
+		}
+		// provider["name"] is the catalog name from GetProviderByName (e.g.,
+		// "SILICONFLOW"), which matches Python's factory_info["name"]. Do NOT
+		// override it with providerName (the DB value), which may differ in
+		// case from historical ToLower writes.
+
+		listed = append(listed, listedProvider{id: providerRow.ID, info: provider})
+		seenProviderNames[providerKey] = struct{}{}
+	}
+	providerIDs := make([]string, 0, len(listed))
+	for _, provider := range listed {
+		providerIDs = append(providerIDs, provider.id)
+	}
+	providersWithInstances, err := m.modelInstanceDAO.ListProviderIDsWithInstances(ctx, dao.DB, providerIDs)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+	hasInstance := make(map[string]bool, len(providerIDs))
+	for _, providerID := range providersWithInstances {
+		hasInstance[providerID] = true
+	}
+	result := make([]map[string]interface{}, 0, len(listed))
+	for _, provider := range listed {
+		provider.info["has_instance"] = hasInstance[provider.id]
+		result = append(result, provider.info)
+	}
+
+	return result, common.CodeSuccess, nil
+}
+
+// isExcludedTenantProvider returns true for system-pool names that the Python
+// implementation (api/apps/services/provider_api_service.py:108) intentionally
+// filters out when listing a tenant's providers.
+func isExcludedTenantProvider(name string) bool {
+	switch name {
+	case "Youdao", "FastEmbed", "BAAI", "Builtin", "siliconflow_intl":
+		return true
+	}
+	return false
+}
+
+func (m *ModelProviderService) DeleteModelProvider(ctx context.Context, providerName string) (common.ErrorCode, error) {
+	provider, err := m.resolveProviderInTenant(ctx, providerName, permission.OperationDelete)
+	if err != nil {
+		if permissionresponse.IsPermissionError(err) {
+			code, normalizedErr := permissionresponse.NormalizeHidden(err)
+			return code, normalizedErr
+		}
+		return common.CodeNotFound, fmt.Errorf("provider %s not found", providerName)
+	}
+
+	// Delete all models and instances under this provider.
+	instances, err := m.modelInstanceDAO.GetAllInstancesByProviderID(ctx, dao.DB, provider.ID)
+	if err != nil {
+		return common.CodeServerError, err
+	}
+	for _, instance := range instances {
+		if err = permission.NewDatabaseChecker(dao.DB).CheckResource(
+			ctx,
+			permission.ResourceRef{Kind: permission.ResourceKindModelInstance, ID: instance.ID},
+			permission.OperationDelete,
+		); err != nil {
+			code, normalizedErr := permissionresponse.NormalizeHidden(err)
+			return code, normalizedErr
+		}
+		models, modelErr := m.modelDAO.GetModelsByInstanceID(ctx, dao.DB, instance.ID)
+		if modelErr != nil {
+			return common.CodeServerError, modelErr
+		}
+		for _, model := range models {
+			if err = permission.NewDatabaseChecker(dao.DB).CheckResource(
+				ctx,
+				permission.ResourceRef{Kind: permission.ResourceKindModel, ID: model.ID},
+				permission.OperationDelete,
+			); err != nil {
+				code, normalizedErr := permissionresponse.NormalizeHidden(err)
+				return code, normalizedErr
+			}
+		}
+	}
+	if len(instances) > 0 {
+		instanceIDs := make([]string, len(instances))
+		for i, inst := range instances {
+			instanceIDs[i] = inst.ID
+		}
+		if _, err = m.modelDAO.DeleteByInstanceIDs(ctx, dao.DB, instanceIDs); err != nil {
+			return common.CodeServerError, err
+		}
+		if _, err = m.modelInstanceDAO.DeleteByProviderID(ctx, dao.DB, provider.ID); err != nil {
+			return common.CodeServerError, err
+		}
+	}
+
+	deleted, err := m.modelProviderDAO.DeleteByID(ctx, dao.DB, provider.ID)
+	if err != nil {
+		return common.CodeServerError, err
+	}
+	if deleted != 1 {
+		return common.CodeNotFound, fmt.Errorf("provider %s not found", providerName)
+	}
+
+	return common.CodeSuccess, nil
+}
+
+// SavedProviderModelOptions contains owner-only overrides for a saved
+// provider instance's endpoint and non-secret configuration.
+type SavedProviderModelOptions struct {
+	APIKeyConfig json.RawMessage
+	BaseURL      *string
+	Region       *string
+}
+
+// SavedProviderModelConfig contains the credentials and endpoint to use when
+// discovering models through a saved provider instance.
+type SavedProviderModelConfig struct {
+	APIKey  string
+	BaseURL string
+	Region  string
+}
+
+// ResolveSavedProviderModelConfig validates access to a saved provider
+// instance and returns the credentials and endpoint for model discovery.
+func (m *ModelProviderService) ResolveSavedProviderModelConfig(ctx context.Context, providerName, instanceName string, options SavedProviderModelOptions) (SavedProviderModelConfig, error) {
+	providerName = strings.TrimSpace(providerName)
+
+	provider, err := m.resolveProviderInTenant(ctx, providerName, permission.OperationRead)
+	if err != nil {
+		if permissionresponse.IsPermissionError(err) {
+			_, normalizedErr := permissionresponse.NormalizeHidden(err)
+			return SavedProviderModelConfig{}, normalizedErr
+		}
+		return SavedProviderModelConfig{}, err
+	}
+
+	instance, err := m.resolveInstance(ctx, provider, instanceName)
+	if err != nil {
+		if errors.Is(err, errInstanceProviderMismatch) {
+			return SavedProviderModelConfig{}, instanceLookupError(provider, instanceName, err)
+		}
+		return SavedProviderModelConfig{}, err
+	}
+	access, err := permission.NewDatabaseChecker(dao.DB).ResolveAccess(ctx, permission.ResourceRef{
+		Kind: permission.ResourceKindModelInstance,
+		ID:   instance.ID,
+	})
+	if err != nil || !access.Allows(permission.OperationUse) {
+		if err == nil {
+			err = permission.ErrPermissionDenied
+		}
+		_, normalizedErr := permissionresponse.NormalizeHidden(err)
+		return SavedProviderModelConfig{}, normalizedErr
+	}
+	if access.Source != permission.AccessSourceOwner && hasSavedProviderInstanceOverrides(options.APIKeyConfig, options.BaseURL, options.Region) {
+		_, normalizedErr := permissionresponse.NormalizeHidden(permission.ErrPermissionDenied)
+		return SavedProviderModelConfig{}, normalizedErr
+	}
+
+	var extra map[string]string
+	err = json.Unmarshal([]byte(instance.Extra), &extra)
+	if err != nil {
+		return SavedProviderModelConfig{}, err
+	}
+
+	apiKey := instance.APIKey
+	if len(bytes.TrimSpace(options.APIKeyConfig)) > 0 && !bytes.Equal(bytes.TrimSpace(options.APIKeyConfig), []byte("null")) {
+		apiKey, err = mergeSavedProviderAPIKeyConfig(instance.APIKey, options.APIKeyConfig)
+		if err != nil {
+			return SavedProviderModelConfig{}, err
+		}
+	}
+	region := extra["region"]
+	if options.Region != nil {
+		region = strings.TrimSpace(*options.Region)
+		if region == "" {
+			region = "default"
+		}
+	}
+	baseURL := extra["base_url"]
+	if options.BaseURL != nil {
+		baseURL = strings.TrimSpace(*options.BaseURL)
+	}
+	if region == "" {
+		region = "default"
+	}
+
+	return SavedProviderModelConfig{
+		APIKey:  apiKey,
+		BaseURL: baseURL,
+		Region:  region,
+	}, nil
+}
+
+type CreateInstanceModelInfo struct {
+	ModelName  string                 `json:"model_name"`
+	ModelTypes []string               `json:"model_type"`
+	MaxTokens  int                    `json:"max_tokens"`
+	Extra      map[string]interface{} `json:"extra"`
+}
+
+var providerInstanceNamePattern = regexp.MustCompile(`^[0-9A-Za-z_\p{Han}-]+$`)
+
+// ValidateProviderInstanceName checks the name accepted by provider APIs.
+func ValidateProviderInstanceName(instanceName string) error {
+	if strings.TrimSpace(instanceName) == "" {
+		return errors.New("instance name is required")
+	}
+	if !providerInstanceNamePattern.MatchString(instanceName) {
+		return errors.New("instance name may only contain digits, letters, underscores, hyphens, and Chinese characters")
+	}
+	return nil
+}
+
+type CreateProviderInstanceRequest struct {
+	InstanceName string                    `json:"instance_name" binding:"required"`
+	APIKey       json.RawMessage           `json:"api_key"`
+	BaseURL      string                    `json:"base_url"`
+	Region       string                    `json:"region"`
+	ModelInfo    []CreateInstanceModelInfo `json:"model_info"`
+}
+
+type AlterProviderInstanceRequest struct {
+	InstanceName string                     `json:"instance_name"`
+	APIKey       json.RawMessage            `json:"api_key"`
+	ClearAPIKey  bool                       `json:"clear_api_key"`
+	BaseURL      string                     `json:"base_url"`
+	Region       string                     `json:"region"`
+	ModelInfo    *[]CreateInstanceModelInfo `json:"model_info" binding:"required"`
+}
+
+type DropProviderInstanceRequest struct {
+	Instances []string `json:"instances" binding:"required,min=1,dive,required"`
+}
+
+type AlterModelRequest struct {
+	ModelID   string      `json:"model_id"`
+	Status    string      `json:"status"`
+	MaxTokens int         `json:"max_tokens"`
+	ModelType interface{} `json:"model_type"`
+	Extra     interface{} `json:"extra"`
+}
+
+type DropInstanceModelRequest struct {
+	ModelNames []string `json:"model_name"`
+}
+
+func NormalizeAPIKey(raw json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return ""
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err == nil {
+		return value
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, raw); err != nil {
+		return trimmed
+	}
+	return compact.String()
+}
+
+var providerAPIKeyConfigFields = map[string]struct{}{
+	"api_version":              {},
+	"auth_mode":                {},
+	"aws_role_arn":             {},
+	"bedrock_region":           {},
+	"fish_audio_refid":         {},
+	"google_project_id":        {},
+	"google_region":            {},
+	"group_id":                 {},
+	"mineru_apiserver":         {},
+	"mineru_backend":           {},
+	"mineru_delete_output":     {},
+	"mineru_output_dir":        {},
+	"mineru_server_url":        {},
+	"opendataloader_apiserver": {},
+	"paddleocr_algorithm":      {},
+	"paddleocr_api_url":        {},
+	"provider_order":           {},
+}
+
+var safeProviderAPIKeyConfigFields = map[string]struct{}{
+	"api_version":              {},
+	"auth_mode":                {},
+	"bedrock_region":           {},
+	"fish_audio_refid":         {},
+	"google_project_id":        {},
+	"google_region":            {},
+	"group_id":                 {},
+	"mineru_apiserver":         {},
+	"mineru_backend":           {},
+	"mineru_delete_output":     {},
+	"mineru_output_dir":        {},
+	"mineru_server_url":        {},
+	"opendataloader_apiserver": {},
+	"paddleocr_algorithm":      {},
+	"paddleocr_api_url":        {},
+	"provider_order":           {},
+}
+
+func hasSavedProviderAPIKeyConfig(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return false
+	}
+	var config map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &config); err != nil {
+		return true
+	}
+	return len(config) > 0
+}
+
+func hasSavedProviderInstanceOverrides(apiKeyConfig json.RawMessage, baseURL, region *string) bool {
+	return baseURL != nil || region != nil || hasSavedProviderAPIKeyConfig(apiKeyConfig)
+}
+
+func providerInstanceCredentialMetadata(apiKey string) (bool, map[string]interface{}, map[string]bool, map[string]string) {
+	originalAPIKey := apiKey
+	apiKey = strings.TrimSpace(apiKey)
+	config := make(map[string]interface{})
+	status := make(map[string]bool)
+	masks := make(map[string]string)
+	if apiKey == "" {
+		return false, config, status, masks
+	}
+
+	var values map[string]interface{}
+	if err := json.Unmarshal([]byte(apiKey), &values); err != nil || values == nil {
+		status["api_key"] = true
+		masks["api_key"] = maskProviderCredentialValue(originalAPIKey)
+		return true, config, status, masks
+	}
+
+	configured := false
+	for key, value := range values {
+		if _, safe := safeProviderAPIKeyConfigFields[key]; safe {
+			config[key] = value
+		}
+		if isProviderCredentialField(key) && hasProviderCredentialValue(value) {
+			status[key] = true
+			masks[key] = maskProviderCredentialValue(value)
+			configured = true
+		}
+		if key == "auth_mode" && value == "assume_role" {
+			configured = true
+		}
+	}
+	if roleARN, ok := values["aws_role_arn"].(string); ok && strings.TrimSpace(roleARN) != "" {
+		configured = true
+		status["aws_role_arn"] = true
+		masks["aws_role_arn"] = maskProviderCredentialValue(roleARN)
+	}
+	return configured, config, status, masks
+}
+
+func maskProviderCredentialValue(value interface{}) string {
+	secret, ok := value.(string)
+	if !ok {
+		return "********"
+	}
+	characters := []rune(secret)
+	if len(characters) <= 8 {
+		return strings.Repeat("*", len(characters))
+	}
+	return string(characters[:4]) + strings.Repeat("*", len(characters)-8) + string(characters[len(characters)-4:])
+}
+
+func isProviderCredentialField(name string) bool {
+	name = strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(name, "-", "_"), ".", "_"))
+	for _, marker := range []string{"api_key", "apikey", "secret", "token", "password", "credential", "private", "access_key"} {
+		if strings.Contains(name, marker) {
+			return true
+		}
+	}
+	return strings.HasSuffix(name, "_ak") || strings.HasSuffix(name, "_sk") || strings.HasSuffix(name, "_sid") || strings.HasSuffix(name, "_key")
+}
+
+func hasProviderCredentialValue(value interface{}) bool {
+	switch value := value.(type) {
+	case string:
+		return strings.TrimSpace(value) != ""
+	case []interface{}:
+		for _, item := range value {
+			if hasProviderCredentialValue(item) {
+				return true
+			}
+		}
+	case map[string]interface{}:
+		return len(value) > 0
+	case bool:
+		return value
+	case float64:
+		return value != 0
+	}
+	return false
+}
+
+func mergeProviderAPIKey(existing string, submitted json.RawMessage, clear bool) (string, error) {
+	if clear {
+		existing = ""
+	}
+
+	trimmed := bytes.TrimSpace(submitted)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return existing, nil
+	}
+
+	var submittedString string
+	if err := json.Unmarshal(trimmed, &submittedString); err == nil {
+		if strings.TrimSpace(submittedString) == "" {
+			return existing, nil
+		}
+		return submittedString, nil
+	}
+
+	var submittedConfig map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &submittedConfig); err != nil || submittedConfig == nil {
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, trimmed); err != nil {
+			return "", fmt.Errorf("invalid api_key value: %w", err)
+		}
+		return compact.String(), nil
+	}
+
+	merged := make(map[string]json.RawMessage)
+	if !clear && strings.TrimSpace(existing) != "" {
+		var existingConfig map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(existing), &existingConfig); err == nil && existingConfig != nil {
+			for key, value := range existingConfig {
+				merged[key] = value
+			}
+		} else {
+			plainKey, _ := json.Marshal(existing)
+			merged["api_key"] = plainKey
+		}
+	}
+	for key, value := range submittedConfig {
+		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			delete(merged, key)
+			continue
+		}
+		var textValue string
+		if err := json.Unmarshal(value, &textValue); err == nil && textValue == "" {
+			continue
+		}
+		merged[key] = value
+	}
+	if len(merged) == 0 {
+		return "", nil
+	}
+	encoded, err := json.Marshal(merged)
+	if err != nil {
+		return "", fmt.Errorf("marshal api_key configuration: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func mergeSavedProviderAPIKeyConfig(existing string, submitted json.RawMessage) (string, error) {
+	var submittedConfig map[string]json.RawMessage
+	if err := json.Unmarshal(submitted, &submittedConfig); err != nil || submittedConfig == nil {
+		return "", errors.New("saved credential requests must include a provider configuration object")
+	}
+
+	var merged map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(existing), &merged); err != nil || merged == nil {
+		merged = make(map[string]json.RawMessage)
+		if strings.TrimSpace(existing) != "" {
+			plainKey, _ := json.Marshal(existing)
+			merged["api_key"] = plainKey
+		}
+	}
+	updated := false
+	for key, value := range submittedConfig {
+		if _, safe := providerAPIKeyConfigFields[key]; safe {
+			updated = true
+			trimmed := bytes.TrimSpace(value)
+			if bytes.Equal(trimmed, []byte("null")) {
+				delete(merged, key)
+				continue
+			}
+			var textValue string
+			if err := json.Unmarshal(trimmed, &textValue); err == nil && strings.TrimSpace(textValue) == "" {
+				delete(merged, key)
+				continue
+			}
+			merged[key] = value
+		}
+	}
+	if !updated {
+		return existing, nil
+	}
+	if len(merged) == 0 {
+		return "", nil
+	}
+	encoded, err := json.Marshal(merged)
+	if err != nil {
+		return "", fmt.Errorf("marshal provider configuration: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func (m *ModelProviderService) findProviderByIDOrNameInCurrentTenant(ctx context.Context, providerIDOrName string, includeTenantOwner bool) (*entity.TenantModelProvider, error) {
+	userID := permission.UserIDFromContext(ctx)
+	tenantID, err := requireCurrentTenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	providerIDOrName = strings.TrimSpace(providerIDOrName)
+	if providerIDOrName == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+	provider, err := m.modelProviderDAO.GetByID(ctx, dao.DB, providerIDOrName)
+	if err == nil {
+		if provider.TenantID != tenantID {
+			return nil, gorm.ErrRecordNotFound
+		}
+		if provider.UserID != userID {
+			if !includeTenantOwner {
+				return nil, gorm.ErrRecordNotFound
+			}
+			owner, ownerErr := m.userTenantDAO.GetOwnerByTenantID(ctx, dao.DB, tenantID)
+			if ownerErr != nil {
+				return nil, ownerErr
+			}
+			if provider.UserID != owner.UserID {
+				return nil, gorm.ErrRecordNotFound
+			}
+		}
+		return provider, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	provider, err = m.modelProviderDAO.GetByTenantIDAndUserIDAndProviderName(ctx, dao.DB, tenantID, userID, providerIDOrName)
+	if err == nil || !errors.Is(err, gorm.ErrRecordNotFound) || !includeTenantOwner {
+		return provider, err
+	}
+	owner, err := m.userTenantDAO.GetOwnerByTenantID(ctx, dao.DB, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	if owner.UserID == userID {
+		return nil, gorm.ErrRecordNotFound
+	}
+	return m.modelProviderDAO.GetByTenantIDAndUserIDAndProviderName(ctx, dao.DB, tenantID, owner.UserID, providerIDOrName)
+}
+
+// resolveProviderInTenant resolves the caller's provider, or the active tenant
+// owner's provider for read-only use, then authorizes the requested operation.
+//
+// Provider names are only unique per tenant (idx_tenant_provider_user_unique),
+// so a lookup across every tenant a user belongs to can select a same-named
+// provider owned by another tenant.
+func (m *ModelProviderService) resolveProviderInTenant(ctx context.Context, providerIDOrName string, operation permission.Operation) (*entity.TenantModelProvider, error) {
+	provider, err := m.findProviderByIDOrNameInCurrentTenant(ctx, providerIDOrName, operation == permission.OperationRead)
+	if err != nil {
+		return nil, err
+	}
+	if err = permission.NewDatabaseChecker(dao.DB).CheckResource(
+		ctx,
+		permission.ResourceRef{Kind: permission.ResourceKindModelProvider, ID: provider.ID},
+		operation,
+	); err != nil {
+		return nil, err
+	}
+	return provider, nil
+}
+
+// errInstanceProviderMismatch reports an instance identifier that exists in the
+// caller's tenant but belongs to a different provider than the request
+// addressed. An instance owned by another tenant stays a plain miss so callers
+// cannot probe foreign identifiers.
+var errInstanceProviderMismatch = errors.New("model instance belongs to another provider")
+
+// resolveInstance resolves the instance segment of a provider route inside
+// provider: primary key first, then instance name.
+//
+// A primary key hit whose provider_id names another provider of the same tenant
+// is a mismatch rather than a miss, so callers never fall through to a name
+// lookup. A hit owned by another tenant is reported as a miss.
+func (m *ModelProviderService) resolveInstance(ctx context.Context, provider *entity.TenantModelProvider, instanceIDOrName string) (*entity.TenantModelInstance, error) {
+	instanceIDOrName = strings.TrimSpace(instanceIDOrName)
+	if instanceIDOrName == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+	instance, err := m.modelInstanceDAO.GetByID(ctx, dao.DB, instanceIDOrName)
+	if err == nil {
+		if instance.ProviderID == provider.ID {
+			return instance, nil
+		}
+		owner, ownerErr := m.modelProviderDAO.GetByID(ctx, dao.DB, instance.ProviderID)
+		if ownerErr != nil {
+			if errors.Is(ownerErr, gorm.ErrRecordNotFound) {
+				return nil, gorm.ErrRecordNotFound
+			}
+			return nil, ownerErr
+		}
+		if owner.TenantID != provider.TenantID {
+			return nil, gorm.ErrRecordNotFound
+		}
+		return nil, fmt.Errorf("%w: instance %q belongs to provider %q", errInstanceProviderMismatch, instanceIDOrName, instance.ProviderID)
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	return m.modelInstanceDAO.GetByProviderIDAndInstanceName(ctx, dao.DB, provider.ID, instanceIDOrName)
+}
+
+// instanceLookupError renders the caller-facing message for a failed instance
+// lookup. Callers keep their own error code.
+func instanceLookupError(provider *entity.TenantModelProvider, instanceIDOrName string, err error) error {
+	if errors.Is(err, errInstanceProviderMismatch) {
+		return fmt.Errorf("instance '%s' does not belong to provider '%s'", instanceIDOrName, provider.ProviderName)
+	}
+	return fmt.Errorf("no instance found for provider '%s' and instance '%s'", provider.ProviderName, instanceIDOrName)
+}
+
+func (m *ModelProviderService) CreateProviderInstance(ctx context.Context, providerIDOrName, instanceName, apiKey, baseURL, region string, modelInfo []CreateInstanceModelInfo) (common.ErrorCode, error) {
+	providerIDOrName = strings.TrimSpace(providerIDOrName)
+	apiKey = strings.TrimSpace(apiKey)
+	baseURL = strings.TrimSpace(baseURL)
+	region = strings.TrimSpace(region)
+
+	provider, err := m.resolveProviderInTenant(ctx, providerIDOrName, permission.OperationCreate)
+	if err != nil {
+		if permissionresponse.IsPermissionError(err) {
+			code, normalizedErr := permissionresponse.NormalizeHidden(err)
+			return code, normalizedErr
+		}
+		return common.CodeNotFound, fmt.Errorf("provider '%s' does not exist", providerIDOrName)
+	}
+	instanceID := common.GenerateToken()
+
+	extra := make(map[string]string)
+	extra["region"] = region
+	extra["base_url"] = baseURL
+	extraByte, err := json.Marshal(extra)
+	if err != nil {
+		return common.CodeServerError, errors.New("fail to marshal extra")
+	}
+	extraStr := string(extraByte)
+
+	tenantModelInstance := &entity.TenantModelInstance{
+		ID:           instanceID,
+		InstanceName: instanceName,
+		ProviderID:   provider.ID,
+		APIKey:       apiKey,
+		Status:       "active",
+		Extra:        extraStr,
+	}
+	err = dao.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := m.modelInstanceDAO.Create(ctx, tx, tenantModelInstance); err != nil {
+			return err
+		}
+		if err := permission.NewDatabaseChecker(tx).GrantResourceOwner(ctx, permission.ResourceRef{
+			Kind: permission.ResourceKindModelInstance, ID: tenantModelInstance.ID,
+		}); err != nil {
+			return err
+		}
+		return m.addModelsToNewInstance(ctx, tx, provider, tenantModelInstance, modelInfo)
+	})
+	if err != nil {
+		return common.CodeServerError, fmt.Errorf("fail to create model instance: %w", err)
+	}
+
+	return common.CodeSuccess, nil
+}
+
+// addModelsToNewInstance creates the models of a freshly created provider
+// instance, either the requested ones or the provider's factory defaults.
+func (m *ModelProviderService) addModelsToNewInstance(ctx context.Context, db *gorm.DB, provider *entity.TenantModelProvider, instance *entity.TenantModelInstance, modelInfo []CreateInstanceModelInfo) error {
+	if len(modelInfo) > 0 {
+		for _, model := range modelInfo {
+			if err := m.addModelToInstance(ctx, db, provider, instance, model); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	// model_info not provided — add all factory default models.
+	factoryProvider := dao.GetModelProviderManager().FindProvider(provider.ProviderName)
+	if factoryProvider == nil {
+		return nil
+	}
+	for _, llm := range factoryProvider.Models {
+		extraMap := make(map[string]interface{})
+		if llm.Tools != nil {
+			extraMap["is_tools"] = llm.Tools.Support
+		}
+		if llm.Thinking != nil {
+			extraMap["thinking"] = llm.Thinking.DefaultValue
+		}
+		contextLength := 0
+		if llm.ContextLength != nil {
+			contextLength = *llm.ContextLength
+		} else if llm.MaxTokens != nil {
+			contextLength = *llm.MaxTokens
+		}
+		if err := m.addModelToInstance(ctx, db, provider, instance, CreateInstanceModelInfo{
+			ModelName:  llm.Name,
+			ModelTypes: llm.ModelTypes,
+			MaxTokens:  contextLength,
+			Extra:      extraMap,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CreateNameOnlyProviderInstance creates a provider instance with only a name,
+// skipping API key validation and model creation.
+func (m *ModelProviderService) CreateNameOnlyProviderInstance(ctx context.Context, providerIDOrName, instanceName string) (common.ErrorCode, error) {
+	providerIDOrName = strings.TrimSpace(providerIDOrName)
+
+	if instanceName == "default" {
+		return common.CodeBadRequest, errors.New("instance name cannot be 'default'")
+	}
+
+	provider, err := m.resolveProviderInTenant(ctx, providerIDOrName, permission.OperationCreate)
+	if err != nil {
+		if permissionresponse.IsPermissionError(err) {
+			code, normalizedErr := permissionresponse.NormalizeHidden(err)
+			return code, normalizedErr
+		}
+		return common.CodeNotFound, fmt.Errorf("provider '%s' does not exist", providerIDOrName)
+	}
+	instanceID := common.GenerateToken()
+
+	tenantModelInstance := &entity.TenantModelInstance{
+		ID:           instanceID,
+		InstanceName: instanceName,
+		ProviderID:   provider.ID,
+		APIKey:       "",
+		Status:       "active",
+		Extra:        "{}",
+	}
+	err = dao.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := m.modelInstanceDAO.Create(ctx, tx, tenantModelInstance); err != nil {
+			return err
+		}
+		return permission.NewDatabaseChecker(tx).GrantResourceOwner(ctx, permission.ResourceRef{
+			Kind: permission.ResourceKindModelInstance, ID: tenantModelInstance.ID,
+		})
+	})
+	if err != nil {
+		return common.CodeServerError, fmt.Errorf("fail to create model instance: %w", err)
+	}
+
+	return common.CodeSuccess, nil
+}
+
+// addModelToInstance creates a single model under the given provider instance.
+func (m *ModelProviderService) addModelToInstance(ctx context.Context, db *gorm.DB, provider *entity.TenantModelProvider, instance *entity.TenantModelInstance, model CreateInstanceModelInfo) error {
+	// Check for duplicate model.
+	_, err := m.modelDAO.GetModelByProviderIDAndInstanceIDAndModelName(ctx, db, provider.ID, instance.ID, model.ModelName)
+	if err == nil {
+		return fmt.Errorf("model '%s' already exists for provider '%s' and instance '%s'", model.ModelName, provider.ProviderName, instance.InstanceName)
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+
+	// Compute model type bitmask.
+	combinedType := entity.ModelType(0)
+	for _, t := range model.ModelTypes {
+		combinedType |= entity.ModelTypeFromString(t)
+	}
+
+	// Build the model configuration.
+	extraFields := map[string]interface{}{
+		"max_tokens": model.MaxTokens,
+	}
+	if model.Extra != nil {
+		for k, v := range model.Extra {
+			extraFields[k] = v
+		}
+	}
+	if err = m.createModelRecord(ctx, db, provider.ID, instance.ID, model.ModelName, combinedType, "active", extraFields); err != nil {
+		return fmt.Errorf("fail to create model '%s': %w", model.ModelName, err)
+	}
+
+	return nil
+}
+
+func (m *ModelProviderService) createModelRecord(ctx context.Context, db *gorm.DB, providerID, instanceID, modelName string, modelType entity.ModelType, status string, extra map[string]interface{}) error {
+	extraBytes, err := json.Marshal(extra)
+	if err != nil {
+		return fmt.Errorf("fail to marshal model extra: %w", err)
+	}
+
+	model := &entity.TenantModel{
+		ID:         common.GenerateToken(),
+		ModelName:  modelName,
+		ModelType:  int(modelType),
+		ProviderID: providerID,
+		InstanceID: instanceID,
+		Status:     status,
+		Extra:      string(extraBytes),
+	}
+	return m.modelDAO.Create(ctx, db, model)
+}
+
+func (m *ModelProviderService) ListProviderInstances(ctx context.Context, providerIDOrName string) ([]map[string]interface{}, common.ErrorCode, error) {
+	providerIDOrName = strings.TrimSpace(providerIDOrName)
+
+	provider, err := m.resolveProviderInTenant(ctx, providerIDOrName, permission.OperationRead)
+	if err != nil {
+		if errors.Is(err, permission.ErrMembershipNotFound) {
+			return []map[string]interface{}{}, common.CodeSuccess, nil
+		}
+		if permissionresponse.IsPermissionError(err) {
+			code, normalizedErr := permissionresponse.NormalizeHidden(err)
+			return nil, code, normalizedErr
+		}
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, common.CodeDataError, fmt.Errorf("no provider found for provider '%s'", providerIDOrName)
+		}
+		return nil, common.CodeServerError, err
+	}
+	instances, err := m.modelInstanceDAO.GetAllInstancesByProviderID(ctx, dao.DB, provider.ID)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+	instanceRefs := make([]permission.ResourceRef, 0, len(instances))
+	for _, instance := range instances {
+		instanceRefs = append(instanceRefs, permission.ResourceRef{Kind: permission.ResourceKindModelInstance, ID: instance.ID})
+	}
+	checker := permission.NewDatabaseChecker(dao.DB)
+	instanceAccesses, err := checker.ResolveAccesses(ctx, instanceRefs)
+	if err != nil {
+		code, normalizedErr := permissionresponse.NormalizeHidden(err)
+		return nil, code, normalizedErr
+	}
+
+	// Always emit a non-nil slice so the JSON encoder serializes [] rather
+	// than null when the tenant has no instances on this provider. The
+	// front-end calls .map() / .forEach() on the response array (see
+	// web/src/pages/user-setting/setting-model/...) and would otherwise
+	// crash on a freshly created tenant.
+	result := make([]map[string]interface{}, 0, len(instances))
+	for _, instance := range instances {
+		access, ok := instanceAccesses[permission.ResourceRef{Kind: permission.ResourceKindModelInstance, ID: instance.ID}]
+		if !ok || !access.Allows(permission.OperationRead) {
+			continue
+		}
+		// Parse extra to extract region
+		var extraFields map[string]string
+		if instance.Extra != "" {
+			if err = json.Unmarshal([]byte(instance.Extra), &extraFields); err != nil {
+				return nil, common.CodeServerError, err
+			}
+		}
+		if extraFields == nil {
+			extraFields = make(map[string]string)
+		}
+
+		// Emit snake_case keys to match the Python
+		// list_provider_instances response shape
+		// (provider_api_service.py:563).
+		result = append(result, map[string]interface{}{
+			"id":                  instance.ID,
+			"instance_name":       instance.InstanceName,
+			"provider_id":         instance.ProviderID,
+			"region":              extraFields["region"],
+			"status":              instance.Status,
+			"operator_permission": access.PermissionMask,
+			"is_owner":            access.Source == permission.AccessSourceOwner,
+		})
+	}
+
+	return result, common.CodeSuccess, nil
+}
+
+func (m *ModelProviderService) ShowProviderInstance(ctx context.Context, providerName, instanceIDOrName string) (map[string]interface{}, common.ErrorCode, error) {
+	providerName = strings.TrimSpace(providerName)
+
+	provider, err := m.resolveProviderInTenant(ctx, providerName, permission.OperationRead)
+	if err != nil {
+		if permissionresponse.IsPermissionError(err) {
+			code, normalizedErr := permissionresponse.NormalizeHidden(err)
+			return nil, code, normalizedErr
+		}
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			code, normalizedErr := permissionresponse.NormalizeHidden(permission.ErrResourceNotFound)
+			return nil, code, normalizedErr
+		}
+		return nil, common.CodeServerError, err
+	}
+
+	instance, err := m.resolveInstance(ctx, provider, instanceIDOrName)
+	if err != nil {
+		if errors.Is(err, errInstanceProviderMismatch) {
+			return nil, common.CodeNotFound, instanceLookupError(provider, instanceIDOrName, err)
+		}
+		return nil, common.CodeNotFound, fmt.Errorf("no instance found for provider '%s' and instance '%s'", providerName, instanceIDOrName)
+	}
+	access, err := permission.NewDatabaseChecker(dao.DB).ResolveAccess(ctx, permission.ResourceRef{
+		Kind: permission.ResourceKindModelInstance,
+		ID:   instance.ID,
+	})
+	if err != nil || !access.Allows(permission.OperationRead) {
+		if err == nil {
+			err = permission.ErrPermissionDenied
+		}
+		code, normalizedErr := permissionresponse.NormalizeHidden(err)
+		return nil, code, normalizedErr
+	}
+
+	// Parse extra fields. Mirrors Python's:
+	//   extra_fields = json.loads(instance_obj.extra) if instance_obj.extra else {}
+	var extraFields map[string]string
+	if instance.Extra != "" {
+		if err := json.Unmarshal([]byte(instance.Extra), &extraFields); err != nil {
+			return nil, common.CodeServerError, err
+		}
+	}
+	if extraFields == nil {
+		extraFields = make(map[string]string)
+	}
+
+	result := map[string]interface{}{
+		"id":            instance.ID,
+		"instance_name": instance.InstanceName,
+		"provider_id":   provider.ID,
+		"region":        extraFields["region"],
+		"base_url":      extraFields["base_url"],
+		"status":        instance.Status,
+		"is_owner":      access.Source == permission.AccessSourceOwner,
+	}
+	if access.Source == permission.AccessSourceOwner || access.Allows(permission.OperationUpdate) {
+		configured, config, credentialStatus, credentialMasks := providerInstanceCredentialMetadata(instance.APIKey)
+		result["api_key_configured"] = configured
+		result["api_key_config"] = config
+		result["credential_status"] = credentialStatus
+		result["credential_masks"] = credentialMasks
+	}
+
+	return result, common.CodeSuccess, nil
+}
+
+// resolveAuthorizedInstance checks the provider route and the requested instance operation.
+func (m *ModelProviderService) resolveAuthorizedInstance(ctx context.Context, providerName, instanceName string, operation permission.Operation) (*entity.TenantModelProvider, *entity.TenantModelInstance, common.ErrorCode, error) {
+	provider, err := m.resolveProviderInTenant(ctx, providerName, permission.OperationRead)
+	if err != nil {
+		if permissionresponse.IsPermissionError(err) {
+			code, normalizedErr := permissionresponse.NormalizeHidden(err)
+			return nil, nil, code, normalizedErr
+		}
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil, common.CodeNotFound, fmt.Errorf("provider '%s' does not exist", providerName)
+		}
+		return nil, nil, common.CodeServerError, err
+	}
+
+	instance, err := m.resolveInstance(ctx, provider, instanceName)
+	if err != nil {
+		if errors.Is(err, errInstanceProviderMismatch) || errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil, common.CodeNotFound, instanceLookupError(provider, instanceName, err)
+		}
+		return nil, nil, common.CodeServerError, err
+	}
+	if err = permission.NewDatabaseChecker(dao.DB).CheckResource(
+		ctx,
+		permission.ResourceRef{Kind: permission.ResourceKindModelInstance, ID: instance.ID},
+		operation,
+	); err != nil {
+		code, normalizedErr := permissionresponse.NormalizeHidden(err)
+		return nil, nil, code, normalizedErr
+	}
+	return provider, instance, common.CodeSuccess, nil
+}
+
+func (m *ModelProviderService) ShowInstanceBalance(ctx context.Context, providerName, instanceName string) (map[string]interface{}, common.ErrorCode, error) {
+	provider, instance, code, err := m.resolveAuthorizedInstance(ctx, providerName, instanceName, permission.OperationUse)
+	if err != nil {
+		return nil, code, err
+	}
+	providerName = provider.ProviderName
+
+	providerInfo := dao.GetModelProviderManager().FindProvider(providerName)
+	if providerInfo == nil {
+		return nil, common.CodeServerError, fmt.Errorf("provider %s not found", providerName)
+	}
+
+	var extra map[string]string
+	err = json.Unmarshal([]byte(instance.Extra), &extra)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+
+	apiConfig := &modelModule.APIConfig{
+		ApiKey: nil,
+		Region: nil,
+	}
+
+	region := extra["region"]
+	baseURL := extra["base_url"]
+	apiConfig.Region = &region
+	apiConfig.ApiKey = &instance.APIKey
+	apiConfig.BaseURL = &baseURL
+
+	var result map[string]interface{}
+	result, err = providerInfo.ModelDriver.Balance(ctx, apiConfig)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+	return result, common.CodeSuccess, nil
+}
+
+// CheckConnection verifies provider connectivity. When saved credentials are
+// selected, only the instance owner may override their endpoint or config.
+func (m *ModelProviderService) CheckConnection(ctx context.Context, providerName string, req CheckConnectionRequest) (common.ErrorCode, error) {
+	providerName = strings.TrimSpace(providerName)
+	apiKey := strings.TrimSpace(NormalizeAPIKey(req.APIKey))
+	region := strings.TrimSpace(req.Region)
+	baseURL := strings.TrimSpace(req.BaseURL)
+	clearAPIKey := req.ClearAPIKey
+	useSavedCredentials := req.UseSavedCredentials
+	instanceID := strings.TrimSpace(req.InstanceID)
+	modelInfo := req.ModelInfo
+	var savedInstance *entity.TenantModelInstance
+	var instanceAccess permission.Access
+	if instanceID != "" {
+		instance, err := m.modelInstanceDAO.GetByID(ctx, dao.DB, instanceID)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return common.CodeNotFound, errors.New("model instance not found")
+			}
+			return common.CodeServerError, err
+		}
+		provider, err := m.modelProviderDAO.GetByID(ctx, dao.DB, instance.ProviderID)
+		if err != nil {
+			return common.CodeServerError, err
+		}
+		if provider == nil {
+			return common.CodeNotFound, errors.New("model provider not found")
+		}
+		if !strings.EqualFold(provider.ProviderName, providerName) {
+			return common.CodeNotFound, errors.New("model instance not found")
+		}
+		if err = permission.NewDatabaseChecker(dao.DB).CheckResource(
+			ctx,
+			permission.ResourceRef{Kind: permission.ResourceKindModelProvider, ID: provider.ID},
+			permission.OperationRead,
+		); err != nil {
+			code, normalizedErr := permissionresponse.NormalizeHidden(err)
+			return code, normalizedErr
+		}
+		instanceAccess, err = permission.NewDatabaseChecker(dao.DB).ResolveAccess(ctx, permission.ResourceRef{
+			Kind: permission.ResourceKindModelInstance,
+			ID:   instance.ID,
+		})
+		if err != nil || !instanceAccess.Allows(permission.OperationUpdate) {
+			if err == nil {
+				err = permission.ErrPermissionDenied
+			}
+			code, normalizedErr := permissionresponse.NormalizeHidden(err)
+			return code, normalizedErr
+		}
+		savedInstance = instance
+		providerName = provider.ProviderName
+	}
+
+	providerInfo := dao.GetModelProviderManager().FindProvider(providerName)
+	if providerInfo == nil {
+		return common.CodeServerError, fmt.Errorf("provider %s not found", providerName)
+	}
+
+	if savedInstance != nil {
+		extra := make(map[string]interface{})
+		if savedInstance.Extra != "" {
+			if err := json.Unmarshal([]byte(savedInstance.Extra), &extra); err != nil {
+				return common.CodeServerError, err
+			}
+		}
+		if useSavedCredentials {
+			if clearAPIKey || apiKey != "" {
+				return common.CodeBadRequest, errors.New("saved credentials cannot be combined with submitted credentials")
+			}
+			if instanceAccess.Source != permission.AccessSourceOwner && (region != "" || baseURL != "" || hasSavedProviderAPIKeyConfig(req.APIKeyConfig)) {
+				code, normalizedErr := permissionresponse.NormalizeHidden(permission.ErrPermissionDenied)
+				return code, normalizedErr
+			}
+			apiKey = savedInstance.APIKey
+			if hasSavedProviderAPIKeyConfig(req.APIKeyConfig) {
+				var err error
+				apiKey, err = mergeSavedProviderAPIKeyConfig(apiKey, req.APIKeyConfig)
+				if err != nil {
+					return common.CodeBadRequest, err
+				}
+			}
+			if region == "" {
+				region, _ = extra["region"].(string)
+			}
+			if baseURL == "" {
+				baseURL, _ = extra["base_url"].(string)
+			}
+		} else {
+			if hasSavedProviderAPIKeyConfig(req.APIKeyConfig) {
+				return common.CodeBadRequest, errors.New("api_key_config requires saved credentials")
+			}
+			if region == "" {
+				region, _ = extra["region"].(string)
+			}
+			if baseURL == "" {
+				baseURL, _ = extra["base_url"].(string)
+			}
+		}
+	} else if useSavedCredentials {
+		return common.CodeBadRequest, errors.New("saved credentials require an existing model instance")
+	} else if hasSavedProviderAPIKeyConfig(req.APIKeyConfig) {
+		return common.CodeBadRequest, errors.New("api_key_config requires saved credentials")
+	}
+	if region == "" {
+		region = "default"
+	}
+
+	driver := providerInfo.ModelDriver
+	if strings.EqualFold(providerInfo.Class, "local") {
+		if baseURL == "" {
+			return common.CodeDataError, fmt.Errorf("base_url is required for local provider %s", providerName)
+		}
+
+		var err error
+		driver, err = newModelDriverForBaseURL(driver, providerName, region, baseURL)
+		if err != nil {
+			return common.CodeServerError, err
+		}
+	}
+
+	apiConfig := &modelModule.APIConfig{
+		ApiKey:  &apiKey,
+		Region:  &region,
+		BaseURL: &baseURL,
+	}
+
+	modelVerifyResult, verifyErr := verifyProviderModel(ctx, driver, providerInfo.Models, apiConfig, modelInfo)
+
+	if instanceID != "" && len(modelVerifyResult) > 0 {
+		if dbErr := m.updateModelVerifyResults(ctx, providerName, instanceID, modelVerifyResult); dbErr != nil {
+			if permissionresponse.IsPermissionError(dbErr) {
+				code, normalizedErr := permissionresponse.NormalizeHidden(dbErr)
+				return code, normalizedErr
+			}
+			common.Logger.Error("failed to persist model verify results", zap.Error(dbErr))
+		}
+	}
+
+	if verifyErr != nil {
+		return common.CodeServerError, verifyErr
+	}
+
+	return common.CodeSuccess, nil
+}
+
+// updateModelVerifyResults persists the per-model verification status to the
+// tenant_model table.  It mirrors the Python update_model() called from the
+// /api/v1/providers/<name>/connection/verify endpoint when instance_id is
+// present in the request body.
+func (m *ModelProviderService) updateModelVerifyResults(ctx context.Context, providerName, instanceID string, modelVerifyResult map[string]string) error {
+	instance, err := m.modelInstanceDAO.GetByID(ctx, dao.DB, instanceID)
+	if err != nil {
+		return fmt.Errorf("instance %s not found: %w", instanceID, err)
+	}
+	if err = permission.NewDatabaseChecker(dao.DB).CheckResource(
+		ctx,
+		permission.ResourceRef{Kind: permission.ResourceKindModelInstance, ID: instance.ID},
+		permission.OperationUpdate,
+	); err != nil {
+		return err
+	}
+	provider, err := m.modelProviderDAO.GetByID(ctx, dao.DB, instance.ProviderID)
+	if err != nil {
+		return fmt.Errorf("provider for instance %s not found: %w", instanceID, err)
+	}
+	if !strings.EqualFold(provider.ProviderName, providerName) {
+		return permission.ErrResourceNotFound
+	}
+	if err = permission.NewDatabaseChecker(dao.DB).CheckResource(
+		ctx,
+		permission.ResourceRef{Kind: permission.ResourceKindModelProvider, ID: provider.ID},
+		permission.OperationRead,
+	); err != nil {
+		return err
+	}
+
+	for modelName, verifyStatus := range modelVerifyResult {
+		var modelObj *entity.TenantModel
+		modelObj, err = m.modelDAO.GetModelByProviderIDAndInstanceIDAndModelName(ctx, dao.DB, provider.ID, instanceID, modelName)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				// No existing row — nothing to update (default is active).
+				continue
+			}
+			return fmt.Errorf("failed to look up %s for verify update: %w", modelName, err)
+		}
+		if err = permission.NewDatabaseChecker(dao.DB).CheckResource(
+			ctx,
+			permission.ResourceRef{Kind: permission.ResourceKindModel, ID: modelObj.ID},
+			permission.OperationUpdate,
+		); err != nil {
+			return err
+		}
+
+		extra := make(map[string]interface{})
+		if modelObj.Extra != "" {
+			_ = json.Unmarshal([]byte(modelObj.Extra), &extra)
+		}
+		extra["verify"] = verifyStatus
+		var extraJSON []byte
+		extraJSON, err = json.Marshal(extra)
+		if err != nil {
+			return fmt.Errorf("failed to marshal extra for %s: %w", modelName, err)
+		}
+
+		if err = m.modelDAO.UpdateByID(ctx, dao.DB, modelObj.ID, map[string]interface{}{
+			"extra": string(extraJSON),
+		}); err != nil {
+			return fmt.Errorf("failed to update verify status for %s: %w", modelName, err)
+		}
+	}
+
+	return nil
+}
+
+// verifyProviderModel mirrors Python verify_api_key's model-level verification.
+// It tries each model and returns a map of modelName → verify status
+// ("success"/"fail") so the caller can persist the results to the database.
+// A nil error means at least one model passed verification.
+//
+// When modelInfo is provided (non-empty), it is used directly as the source of
+// models to verify — each entry carries model_name and model_type ([]string).
+// When modelInfo is empty, the function falls back to the provider's static
+// model catalog (providerModels).
+func verifyProviderModel(ctx context.Context, driver modelModule.ModelDriver, providerModels []*modelModule.Model, apiConfig *modelModule.APIConfig, modelInfo []CheckConnectionModelInfo) (map[string]string, error) {
+	modelVerifyResult := make(map[string]string)
+
+	// Determine which models to verify: prefer the caller-supplied modelInfo
+	// list; fall back to the full provider model catalog.  Mirrors Python’s
+	// verify_api_key ll. 656–671.
+	var modelsToVerify []*modelModule.Model
+	if len(modelInfo) > 0 {
+		for _, mi := range modelInfo {
+			modelName := strings.TrimSpace(mi.ModelName)
+			if modelName == "" {
+				continue
+			}
+			modelTypes := mi.ModelTypes
+			if len(modelTypes) == 0 {
+				// When the caller didn't supply model types, infer them from the
+				// model name using the same hint heuristics as Python's
+				// OpenAIAPICompatible._infer_model_types.
+				modelTypes = modelModule.InferModelTypes(modelName)
+			}
+			modelsToVerify = append(modelsToVerify, &modelModule.Model{
+				Name:       modelName,
+				ModelTypes: modelTypes,
+			})
+		}
+	} else {
+		modelsToVerify = providerModels
+	}
+
+	if len(modelsToVerify) == 0 {
+		// Third fallback: try to fetch remote models via the provider's API,
+		// mirroring Python's get_model_list() fallback in verify_api_key.
+		remoteModels, listErr := driver.ListModels(ctx, apiConfig)
+		if listErr == nil {
+			for _, rm := range remoteModels {
+				modelName := strings.TrimSpace(rm.Name)
+				if modelName == "" {
+					continue
+				}
+				modelTypes := rm.ModelTypes
+				if len(modelTypes) == 0 {
+					modelTypes = modelModule.InferModelTypes(modelName)
+				}
+				modelsToVerify = append(modelsToVerify, &modelModule.Model{
+					Name:         modelName,
+					ModelTypes:   modelTypes,
+					MaxDimension: rm.MaxDimension,
+					MaxBatchSize: rm.MaxBatchSize,
+					Dimensions:   append([]int(nil), rm.Dimensions...),
+				})
+			}
+		} else {
+			zap.L().Warn("failed to list remote models from provider",
+				zap.Error(listErr),
+			)
+			return modelVerifyResult, fmt.Errorf("failed to list models from provider: %w", listErr)
+		}
+
+		if len(modelsToVerify) == 0 {
+			return modelVerifyResult, fmt.Errorf("no models found for provider")
+		}
+	}
+
+	var errs []error
+	errSet := make(map[string]bool)
+	passedTypes := make(map[string]bool)
+	unverifiableTypes := make(map[string]bool)
+
+	for _, model := range modelsToVerify {
+		modelName := model.Name
+		anyPassed := false
+
+		for _, modelType := range model.ModelTypes {
+			mtLower := strings.ToLower(modelType)
+
+			// If a model type we've already verified successfully, skip.
+			if passedTypes[mtLower] {
+				continue
+			}
+
+			var err error
+
+			switch mtLower {
+			case "chat", "vision":
+				msg := []modelModule.Message{{Role: "user", Content: "Hi"}}
+				chatModel := modelModule.NewChatModel(driver, &modelName, apiConfig)
+				_, err = chatModel.ChatWithMessages(ctx, msg, nil, nil)
+			case "embedding":
+				// Provider discovery can return models without catalog limits. Apply
+				// the strict validator whenever the model has the metadata required
+				// to construct a valid verification request.
+				if model.MaxDimension != nil && model.MaxBatchSize != nil {
+					requestedDimension := *model.MaxDimension
+					if len(model.Dimensions) > 0 {
+						requestedDimension = model.Dimensions[0]
+					}
+					err = validateEmbeddingModel(model, requestedDimension, 1)
+				}
+				if err == nil {
+					maxTokens := 0
+					if model.MaxTokens != nil {
+						maxTokens = *model.MaxTokens
+					}
+					embeddingModel := modelModule.NewEmbeddingModel(driver, &modelName, apiConfig, maxTokens)
+					_, err = embeddingModel.Embed(ctx, modelModule.EmbedRequest{Texts: []string{"test"}}, nil, nil)
+				}
+			case "rerank":
+				rerankRequest := modelModule.RerankRequest{
+					Query:     "test",
+					Documents: []string{"test"},
+				}
+				rerankModel := modelModule.NewRerankModel(driver, &modelName, apiConfig, 0)
+				_, err = rerankModel.Rerank(ctx, rerankRequest, &modelModule.RerankConfig{}, nil)
+			case "tts":
+				content := "hello"
+				ttsModel := modelModule.NewTTSModel(driver, &modelName, apiConfig)
+				_, err = ttsModel.Speech(ctx, &content, nil, nil)
+			case "asr":
+				err = verifyASRModel(ctx, driver, modelName, apiConfig)
+			case "ocr":
+				err = verifyOCRModel(ctx, driver, modelName, apiConfig)
+			case "doc_parse":
+				err = driver.CheckConnection(ctx, apiConfig)
+			case "decision":
+				err = verifyDecisionModel(ctx, driver, modelName, apiConfig)
+			default:
+				unverifiableTypes[mtLower] = true
+				continue
+			}
+
+			if err == nil {
+				passedTypes[mtLower] = true
+				anyPassed = true
+				break
+			}
+
+			apiErr := extractAPIErrorMessage(err)
+			if !errSet[apiErr.Error()] {
+				errSet[apiErr.Error()] = true
+				errs = append(errs, apiErr)
+			}
+		}
+
+		if anyPassed {
+			modelVerifyResult[modelName] = entity.ModelVerifySuccess
+		} else {
+			modelVerifyResult[modelName] = entity.ModelVerifyFail
+		}
+	}
+
+	if len(passedTypes) == 0 {
+		// An empty errs must not reach %w: errors.Join over no arguments returns
+		// nil, and %w renders a nil error as "%!w(<nil>)". Nothing was attempted
+		// in that case, so there is no provider error to report — name the type
+		// that has no verifier instead, which is what the form reports to whoever
+		// is trying to add the model.
+		if len(errs) == 0 {
+			unverifiable := make([]string, 0, len(unverifiableTypes))
+			for modelType := range unverifiableTypes {
+				unverifiable = append(unverifiable, modelType)
+			}
+			sort.Strings(unverifiable)
+			if len(unverifiable) == 0 {
+				return modelVerifyResult, fmt.Errorf("model verification did not run: the requested models declare no model type")
+			}
+			return modelVerifyResult, fmt.Errorf("model verification did not run: %s has no verification in this build", strings.Join(unverifiable, ", "))
+		}
+		return modelVerifyResult, fmt.Errorf("model verification attempts failed: %w", errors.Join(errs...))
+	}
+
+	return modelVerifyResult, nil
+}
+
+// extractAPIErrorMessage tries to parse the `message` field from a JSON error
+// body embedded in a Go error string.  If the body is valid JSON with a
+// non-empty "message" key, the returned error contains only that message;
+// otherwise the original error is returned unchanged.
+func extractAPIErrorMessage(err error) error {
+	msg := err.Error()
+	// Look for the last '{'...'}' substring — that is typically the JSON body
+	// appended by API drivers like "API request failed with status 400: {...}".
+	start := strings.LastIndexByte(msg, '{')
+	if start < 0 {
+		return err
+	}
+	end := strings.LastIndexByte(msg, '}')
+	if end <= start {
+		return err
+	}
+	jsonStr := msg[start : end+1]
+
+	var body struct {
+		Message string `json:"message"`
+	}
+	if json.Unmarshal([]byte(jsonStr), &body) != nil || body.Message == "" {
+		return err
+	}
+	return fmt.Errorf("%s", body.Message)
+}
+
+// generateTestWAV creates a minimal silent WAV (16-bit mono PCM, 0.5 second,
+// 16000 Hz sample rate) as a byte slice. Mirrors Python
+// sequence2txt_model.py's _generate_test_wav: pure stdlib, no dependencies.
+func generateTestWAV() []byte {
+	const (
+		sampleRate      = 16000
+		durationSeconds = 0.5
+		numChannels     = 1
+		bitsPerSample   = 16
+	)
+	numSamples := int(sampleRate * durationSeconds)
+	dataSize := numSamples * numChannels * (bitsPerSample / 8)
+
+	var buf []byte
+
+	// RIFF header
+	buf = append(buf, []byte("RIFF")...)
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(36+dataSize))
+	buf = append(buf, []byte("WAVE")...)
+
+	// fmt sub-chunk
+	buf = append(buf, []byte("fmt ")...)
+	buf = binary.LittleEndian.AppendUint32(buf, 16)                  // sub-chunk size
+	buf = binary.LittleEndian.AppendUint16(buf, 1)                   // PCM
+	buf = binary.LittleEndian.AppendUint16(buf, uint16(numChannels)) // mono
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(sampleRate))
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(sampleRate*numChannels*bitsPerSample/8)) // byte rate
+	buf = binary.LittleEndian.AppendUint16(buf, uint16(numChannels*bitsPerSample/8))            // block align
+	buf = binary.LittleEndian.AppendUint16(buf, uint16(bitsPerSample))
+
+	// data sub-chunk
+	buf = append(buf, []byte("data")...)
+	buf = binary.LittleEndian.AppendUint32(buf, uint32(dataSize))
+	buf = append(buf, make([]byte, dataSize)...) // silence
+
+	return buf
+}
+
+// verifyASRModel mirrors Python sequence2txt_model.py's check_available:
+// generates a minimal test WAV, writes it to a temp file, calls
+// TranscribeAudio, and checks the result for errors.
+func verifyASRModel(ctx context.Context, driver modelModule.ModelDriver, modelName string, apiConfig *modelModule.APIConfig) error {
+	wavData := generateTestWAV()
+
+	tmpFile, err := os.CreateTemp("", "ragflow-asr-verify-*.wav")
+	if err != nil {
+		return fmt.Errorf("failed to create temp WAV for ASR verification: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err = tmpFile.Write(wavData); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("failed to write test WAV: %w", err)
+	}
+	tmpFile.Close()
+
+	asrModel := modelModule.NewASRModel(driver, &modelName, apiConfig)
+	resp, err := asrModel.Transcribe(ctx, &tmpPath, nil, nil)
+	if err != nil {
+		return err
+	}
+	if resp == nil {
+		return fmt.Errorf("ASR model %s returned no transcription", modelName)
+	}
+	return nil
+}
+
+// verifyOCRModel mirrors Python OCRModel.check_available by sending a
+// minimal PNG (1×1 pixel white) through the OCR pipeline.  Most OCR
+// providers return an error or empty text for such a trivial image;
+// we accept any non-error response as a successful connectivity check.
+func verifyOCRModel(ctx context.Context, driver modelModule.ModelDriver, modelName string, apiConfig *modelModule.APIConfig) error {
+	if verifier, ok := driver.(interface {
+		VerifyOCRConnection(context.Context, *modelModule.APIConfig) error
+	}); ok {
+		return verifier.VerifyOCRConnection(ctx, apiConfig)
+	}
+	// Send a minimal 1×1 white PNG through the OCR pipeline to verify
+	// connectivity. Most OCRModel drivers only check server reachability
+	// rather than performing full document parsing.
+	_, err := driver.OCRFile(ctx, &modelName, minimalPNG(), nil, apiConfig, nil, nil)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// decisionProbeQuestionID names the single question verification sends, whose
+// answer is discarded: Decide requires at least one question, and verification
+// asks nothing else.
+const decisionProbeQuestionID = "verification"
+
+// verifyDecisionModel asks the decision endpoint the verification question.
+//
+// It goes through Decide rather than CheckConnection: CheckConnection is the
+// models list, which the picker already called to offer this model, so reusing
+// it here would verify nothing that has not been verified. Decide exercises the
+// endpoint the product will call.
+//
+// The request mirrors what the judge sends (decision_judge.go — same state key,
+// same question type) so verification exercises the shape the product sends, and
+// so a deployment that answers verification answers the real thing too. Only the
+// instructions are synthetic, and deliberately so: no calibration depends on
+// them, which keeps the request cheap and independent of the judge's phrasing.
+func verifyDecisionModel(ctx context.Context, driver modelModule.ModelDriver, modelName string, apiConfig *modelModule.APIConfig) error {
+	request := &modelModule.DecideRequest{
+		State: map[string]string{"passage": ""},
+		Questions: map[string]modelModule.Question{
+			decisionProbeQuestionID: modelModule.Noul{Instructions: "Is this passage relevant to the query?"},
+		},
+	}
+	if _, err := driver.Decide(ctx, &modelName, request, apiConfig, nil); err != nil {
+		return err
+	}
+	return nil
+}
+
+// minimalPNG returns a 1×1 white PNG for OCR verification. OCR services decode
+// it before recognizing anything, so it has to be a well-formed image.
+func minimalPNG() []byte {
+	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	img.Set(0, 0, color.White)
+	var buf bytes.Buffer
+	// Encoding an in-memory image into a bytes.Buffer cannot fail.
+	_ = png.Encode(&buf, img)
+	return buf.Bytes()
+}
+
+func taskDriverConfig(provider *entity.TenantModelProvider, instance *entity.TenantModelInstance) (modelModule.ModelDriver, *modelModule.APIConfig, error) {
+	providerName := provider.ProviderName
+
+	providerInfo := dao.GetModelProviderManager().FindProvider(providerName)
+	if providerInfo == nil {
+		return nil, nil, fmt.Errorf("provider %s not found", providerName)
+	}
+
+	var extra map[string]string
+	err := json.Unmarshal([]byte(instance.Extra), &extra)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	apiConfig := &modelModule.APIConfig{
+		ApiKey: nil,
+		Region: nil,
+	}
+
+	region := extra["region"]
+	apiConfig.Region = &region
+	apiConfig.ApiKey = &instance.APIKey
+
+	driver := providerInfo.ModelDriver
+	if baseURL, ok := extra["base_url"]; ok && baseURL != "" {
+		driver, err = newModelDriverForBaseURL(driver, providerName, region, baseURL)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	return driver, apiConfig, nil
+}
+
+func (m *ModelProviderService) ListTasks(ctx context.Context, providerName, instanceName string) ([]modelModule.ListTaskStatus, common.ErrorCode, error) {
+	provider, instance, code, err := m.resolveAuthorizedInstance(ctx, providerName, instanceName, permission.OperationUse)
+	if err != nil {
+		return nil, code, err
+	}
+	driver, apiConfig, err := taskDriverConfig(provider, instance)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+	var listTaskResponse []modelModule.ListTaskStatus
+	listTaskResponse, err = driver.ListTasks(ctx, apiConfig)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+	return listTaskResponse, common.CodeSuccess, nil
+}
+
+func (m *ModelProviderService) ShowTask(ctx context.Context, providerName, instanceName, taskID string) (*modelModule.TaskResponse, common.ErrorCode, error) {
+	provider, instance, code, err := m.resolveAuthorizedInstance(ctx, providerName, instanceName, permission.OperationUse)
+	if err != nil {
+		return nil, code, err
+	}
+	driver, apiConfig, err := taskDriverConfig(provider, instance)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+	var taskResponse *modelModule.TaskResponse
+	taskResponse, err = driver.ShowTask(ctx, taskID, apiConfig)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+	return taskResponse, common.CodeSuccess, nil
+}
+
+// ListModelsForUserInTenant returns models available to the current user in the requested
+// tenant context, filtered by the user's resource permissions. Provider and
+// instance configuration comes from the tenant owner.
+func (m *ModelProviderService) ListModelsForUserInTenant(ctx context.Context, requestedTenantID, modelTypeFilter string) ([]map[string]interface{}, common.ErrorCode, error) {
+	tenant, code, err := m.resolveModelListTenant(ctx, requestedTenantID)
+	if err != nil {
+		return nil, code, err
+	}
+	if tenant == nil {
+		return []map[string]interface{}{}, common.CodeSuccess, nil
+	}
+	tenantID := tenant.ID
+	tenantName := ""
+	if tenant.Name != nil {
+		tenantName = *tenant.Name
+	}
+
+	if modelTypeFilter != "" {
+		modelTypeFilter = strings.ToLower(strings.TrimSpace(modelTypeFilter))
+	}
+
+	// Mirror Python's ensure_*_from_env calls.
+	if permission.NewDatabaseChecker(dao.DB).CheckTenant(ctx, tenantID, permission.TenantOwner) == nil {
+		_ = m.ensureMineruFromEnv(ctx, tenantID)
+		_ = m.ensureMonkeyOCRv2FromEnv(ctx, tenantID)
+		_ = m.ensureMonkeyOCRFromEnv(ctx, tenantID)
+		_ = m.ensurePaddleOCREnabledFromEnv(ctx, tenantID)
+		_ = m.ensureOpenDataLoaderFromEnv(ctx, tenantID)
+	}
+
+	var modelTypeFilterBin entity.ModelType
+	if modelTypeFilter != "" {
+		modelTypeFilterBin = entity.ModelTypeFromString(modelTypeFilter)
+	}
+
+	checker := permission.NewDatabaseChecker(dao.DB)
+	tenantOwner, err := m.userTenantDAO.GetOwnerByTenantID(ctx, dao.DB, tenantID)
+	if err != nil {
+		return nil, common.CodeServerError, fmt.Errorf("get tenant owner for model listing: %w", err)
+	}
+	providerScope, err := checker.QueryScope(ctx, permission.ScopeQuery{
+		Kind:      permission.ResourceKindModelProvider,
+		Operation: permission.OperationRead,
+	})
+	if err != nil {
+		code, normalizedErr := permissionresponse.NormalizeHidden(err)
+		return nil, code, normalizedErr
+	}
+	providerQuery := providerScope.Apply(dao.DB.Model(&entity.TenantModelProvider{}))
+	providers, err := m.modelProviderDAO.ListByTenantIDAndUserID(ctx, providerQuery, tenantID, tenantOwner.UserID)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+	if len(providers) == 0 {
+		return []map[string]interface{}{}, common.CodeSuccess, nil
+	}
+
+	providerIDs := make([]string, 0, len(providers))
+	providerInfoByID := make(map[string]*entity.TenantModelProvider, len(providers))
+	for _, p := range providers {
+		providerIDs = append(providerIDs, p.ID)
+		providerInfoByID[p.ID] = p
+	}
+
+	instances, err := m.modelInstanceDAO.ListSummariesByProviderIDs(ctx, dao.DB, providerIDs)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+	if len(instances) == 0 {
+		return []map[string]interface{}{}, common.CodeSuccess, nil
+	}
+
+	instanceInfoByID := make(map[string]*dao.TenantModelInstanceSummary, len(instances))
+	for _, inst := range instances {
+		instanceInfoByID[inst.ID] = inst
+	}
+
+	// Apply model visibility in SQL so hidden model rows are never loaded into
+	// the service layer. Model access for a tenant is limited to its owner's
+	// provider configuration; personal model settings remain in the provider
+	// management endpoints.
+	modelScope, err := checker.QueryScope(ctx, permission.ScopeQuery{
+		Kind:      permission.ResourceKindModel,
+		Operation: permission.OperationRead,
+	})
+	if err != nil {
+		code, normalizedErr := permissionresponse.NormalizeHidden(err)
+		return nil, code, normalizedErr
+	}
+	modelRecords, err := m.modelDAO.ListByTenantIDAndModelType(ctx, dao.DB, tenantID, int(modelTypeFilterBin), modelScope.Apply)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+
+	// Derive model types for legacy zero-type rows in this response. Before the
+	// ModelTypeFromString fix added "asr" support, models using the canonical
+	// catalog name were stored with model_type = 0. Keep this compatibility
+	// repair read-only; schema/data repair does not belong in a list request.
+	providerManager := dao.GetModelProviderManager()
+	for _, rec := range modelRecords {
+		if rec.ModelType != 0 {
+			continue
+		}
+		provInfo := providerInfoByID[rec.ProviderID]
+		if provInfo == nil {
+			continue
+		}
+		factoryModel, lookupErr := providerManager.GetModelByName(provInfo.ProviderName, rec.ModelName)
+		if lookupErr != nil || factoryModel == nil || len(factoryModel.ModelTypes) == 0 {
+			continue
+		}
+		combinedType := entity.ModelType(0)
+		for _, t := range factoryModel.ModelTypes {
+			combinedType |= entity.ModelTypeFromString(t)
+		}
+		if combinedType != 0 {
+			rec.ModelType = int(combinedType)
+		}
+	}
+
+	var targetRecords []*entity.TenantModel
+	if modelTypeFilterBin != 0 {
+		for _, rec := range modelRecords {
+			if entity.ModelType(rec.ModelType)&modelTypeFilterBin != 0 {
+				targetRecords = append(targetRecords, rec)
+			}
+		}
+	} else {
+		targetRecords = modelRecords
+	}
+	// Build model rank map from factory catalog (mirrors Python's model_rank_map).
+	modelRankMap := make(map[string]int) // key: "providerName@modelName"
+	factoryRankMapping := make(map[string]int)
+	for i := range providerManager.Providers {
+		factory := &providerManager.Providers[i]
+		factoryRankMapping[factory.Name] = -factory.Rank
+		for _, llm := range factory.Models {
+			rank := 500
+			if llm.Rank != nil {
+				rank = *llm.Rank
+			}
+			modelRankMap[factory.Name+"@"+llm.Name] = rank
+		}
+	}
+
+	added := make([]map[string]interface{}, 0, len(targetRecords))
+	for _, modelRecord := range targetRecords {
+		provInfo, provOK := providerInfoByID[modelRecord.ProviderID]
+		instInfo, instOK := instanceInfoByID[modelRecord.InstanceID]
+		if !provOK || !instOK {
+			continue
+		}
+		rank := modelRankMap[provInfo.ProviderName+"@"+modelRecord.ModelName]
+		if rank == 0 {
+			rank = 500
+		}
+		added = append(added, map[string]interface{}{
+			"model_id":        modelRecord.ID,
+			"status":          modelRecord.Status,
+			"instance_status": instInfo.Status,
+			"tenant_id":       provInfo.TenantID,
+			"tenant_name":     tenantName,
+			"model_type":      entity.ModelType(modelRecord.ModelType).HumanReadable(),
+			"name":            modelRecord.ModelName,
+			"provider_id":     modelRecord.ProviderID,
+			"provider_name":   provInfo.ProviderName,
+			"instance_id":     modelRecord.InstanceID,
+			"instance_name":   instInfo.InstanceName,
+			"rank":            rank,
+		})
+	}
+
+	// Add TEI Builtin embedding model if configured (mirrors Python).
+	composeProfiles := common.GetEnv(common.EnvComposeProfiles)
+	teiModel := common.GetEnv(common.EnvTEIModel)
+	if strings.Contains(composeProfiles, "tei-") && teiModel != "" {
+		if modelTypeFilter == "" || modelTypeFilter == "embedding" {
+			teiAlreadyAdded := false
+			for _, m := range added {
+				if pn, _ := m["provider_name"].(string); pn == "Builtin" {
+					if n, _ := m["name"].(string); n == teiModel {
+						teiAlreadyAdded = true
+						break
+					}
+				}
+			}
+			if !teiAlreadyAdded {
+				rank := modelRankMap["Builtin@"+teiModel]
+				if rank == 0 {
+					rank = 500
+				}
+				added = append(added, map[string]interface{}{
+					"model_id":      "",
+					"tenant_id":     tenant.ID,
+					"tenant_name":   tenantName,
+					"model_type":    []string{"embedding"},
+					"name":          teiModel,
+					"provider_id":   "",
+					"provider_name": "Builtin",
+					"instance_id":   "",
+					"instance_name": "default",
+					"rank":          rank,
+				})
+			}
+		}
+	}
+
+	// Sort by factory rank desc, provider_name, instance_name, model rank desc, name.
+	sort.Slice(added, func(i, j int) bool {
+		pi, _ := added[i]["provider_name"].(string)
+		pj, _ := added[j]["provider_name"].(string)
+		fi := factoryRankMapping[pi]
+		fj := factoryRankMapping[pj]
+		if fi != fj {
+			return fi < fj // factory rank: smaller (more negative) = higher priority
+		}
+		if pi != pj {
+			return pi < pj
+		}
+		ini, _ := added[i]["instance_name"].(string)
+		inj, _ := added[j]["instance_name"].(string)
+		if ini != inj {
+			return ini < inj
+		}
+		ri, _ := added[i]["rank"].(int)
+		rj, _ := added[j]["rank"].(int)
+		if ri != rj {
+			return ri > rj // model rank desc
+		}
+		ni, _ := added[i]["name"].(string)
+		nj, _ := added[j]["name"].(string)
+		return ni < nj
+	})
+
+	return added, common.CodeSuccess, nil
+}
+
+func (m *ModelProviderService) resolveModelListTenant(ctx context.Context, requestedTenantID string) (*entity.Tenant, common.ErrorCode, error) {
+	tenantID := requestedTenantID
+	if tenantID == "" {
+		var err error
+		tenantID, err = requireCurrentTenantID(ctx)
+		if err != nil {
+			if errors.Is(err, permission.ErrMembershipNotFound) {
+				return nil, common.CodeSuccess, nil
+			}
+			code, normalizedErr := permissionresponse.NormalizeHidden(err)
+			return nil, code, normalizedErr
+		}
+	} else {
+		if err := permission.NewDatabaseChecker(dao.DB).CheckTenant(ctx, tenantID, permission.TenantMember); err != nil {
+			code, normalizedErr := permissionresponse.NormalizeHidden(err)
+			return nil, code, normalizedErr
+		}
+	}
+
+	tenant, err := m.tenantDAO.GetByID(ctx, dao.DB, tenantID)
+	if err != nil {
+		if dao.IsNotFoundErr(err) {
+			return nil, common.CodeNotFound, fmt.Errorf("tenant %s not found", tenantID)
+		}
+		return nil, common.CodeServerError, err
+	}
+	return tenant, common.CodeSuccess, nil
+}
+
+// ensureMineruFromEnv mirrors Python's ensure_mineru_from_env.
+// It ensures a MinerU OCR provider instance exists when env vars are configured.
+func (m *ModelProviderService) ensureMineruFromEnv(ctx context.Context, tenantID string) error {
+	config := collectEnvConfig(mineruEnvKeys, mineruDefaultConfig)
+	return m.ensureOCRProviderFromEnv(ctx, tenantID, "MinerU", "mineru-from-env", config)
+}
+
+// ensurePaddleOCREnabledFromEnv mirrors Python's ensure_paddleocr_from_env.
+func (m *ModelProviderService) ensurePaddleOCREnabledFromEnv(ctx context.Context, tenantID string) error {
+	config := collectEnvConfig(paddleOCREnvKeys, paddleOCRDefaultConfig)
+	return m.ensureOCRProviderFromEnv(ctx, tenantID, "PaddleOCR", "paddleocr-from-env", config)
+}
+
+// ensureOpenDataLoaderFromEnv mirrors Python's ensure_opendataloader_from_env.
+func (m *ModelProviderService) ensureOpenDataLoaderFromEnv(ctx context.Context, tenantID string) error {
+	config := collectEnvConfig(openDataLoaderEnvKeys, openDataLoaderDefaultConfig)
+	return m.ensureOCRProviderFromEnv(ctx, tenantID, "OpenDataLoader", "opendataloader-from-env", config)
+}
+
+// ensureMonkeyOCRv2FromEnv mirrors Python's ensure_monkeyocrv2_from_env.
+func (m *ModelProviderService) ensureMonkeyOCRv2FromEnv(ctx context.Context, tenantID string) error {
+	config := collectEnvConfig(monkeyOCRv2EnvKeys, monkeyOCRv2DefaultConfig)
+	return m.ensureOCRProviderFromEnv(ctx, tenantID, "MonkeyOCRv2", "monkeyocrv2-from-env", config)
+}
+
+// ensureMonkeyOCRFromEnv mirrors Python's ensure_monkeyocr_from_env.
+func (m *ModelProviderService) ensureMonkeyOCRFromEnv(ctx context.Context, tenantID string) error {
+	config := collectEnvConfig(monkeyOCREnvKeys, monkeyOCRDefaultConfig)
+	if config == nil {
+		return nil
+	}
+	apiserver, _ := config[common.EnvMonkeyOCRAPIServer].(string)
+	if strings.TrimSpace(apiserver) == "" {
+		return nil
+	}
+	return m.ensureOCRProviderFromEnv(ctx, tenantID, "MonkeyOCR", "monkeyocr-from-env", config)
+}
+
+// Environment-key/default tables mirror the Python OCR provider settings.
+var (
+	mineruEnvKeys = []string{
+		common.EnvMineruAPIServer,
+		"MINERU_OUTPUT_DIR",
+		common.EnvMineruBackend,
+		"MINERU_SERVER_URL",
+		"MINERU_DELETE_OUTPUT",
+	}
+	mineruDefaultConfig = map[string]interface{}{
+		common.EnvMineruAPIServer: "",
+		"MINERU_OUTPUT_DIR":       "",
+		common.EnvMineruBackend:   "pipeline",
+		"MINERU_SERVER_URL":       "",
+		"MINERU_DELETE_OUTPUT":    1,
+	}
+	paddleOCREnvKeys = []string{
+		common.EnvPaddleOCRBaseUrl,
+		common.EnvPaddleOCRAPIURL,
+		common.EnvPaddleOCRAccessToken,
+		common.EnvPaddleOCRAlgorithm,
+	}
+	paddleOCRDefaultConfig = map[string]interface{}{
+		common.EnvPaddleOCRBaseUrl:     "",
+		common.EnvPaddleOCRAPIURL:      "",
+		common.EnvPaddleOCRAccessToken: nil,
+		common.EnvPaddleOCRAlgorithm:   "PaddleOCR-VL",
+	}
+	openDataLoaderEnvKeys = []string{
+		common.EnvOpenDataLoaderAPIServer,
+	}
+	openDataLoaderDefaultConfig = map[string]interface{}{
+		common.EnvOpenDataLoaderAPIServer: "",
+	}
+	monkeyOCRv2EnvKeys = []string{
+		common.EnvMonkeyOCRv2ServerURL,
+		common.EnvMonkeyOCRv2Timeout,
+	}
+	monkeyOCRv2DefaultConfig = map[string]interface{}{
+		common.EnvMonkeyOCRv2ServerURL: "",
+		common.EnvMonkeyOCRv2Timeout:   600,
+	}
+	monkeyOCREnvKeys = []string{
+		common.EnvMonkeyOCRAPIServer,
+		common.EnvMonkeyOCROutputDir,
+		common.EnvMonkeyOCRServerURL,
+		common.EnvMonkeyOCRBackend,
+		common.EnvMonkeyOCRDeleteOutput,
+	}
+	monkeyOCRDefaultConfig = map[string]interface{}{
+		common.EnvMonkeyOCRAPIServer:    "",
+		common.EnvMonkeyOCROutputDir:    "",
+		common.EnvMonkeyOCRServerURL:    "",
+		common.EnvMonkeyOCRBackend:      "vlm-engine",
+		common.EnvMonkeyOCRDeleteOutput: 1,
+	}
+)
+
+// collectEnvConfig collects environment variable values for the given keys
+// into a map pre-populated with defaultConfig. Returns nil if none of the
+// env vars are actually set, matching Python's _collect_env_config.
+func collectEnvConfig(envKeys []string, defaultConfig map[string]interface{}) map[string]interface{} {
+	config := make(map[string]interface{}, len(defaultConfig))
+	for k, v := range defaultConfig {
+		config[k] = v
+	}
+	found := false
+	for _, key := range envKeys {
+		value := os.Getenv(key)
+		if value != "" {
+			found = true
+			config[key] = value
+		}
+	}
+	if !found {
+		return nil
+	}
+	return config
+}
+
+// ensureOCRProviderFromEnv mirrors Python's _ensure_ocr_provider_from_env.
+// It finds or creates a provider, instance, and model for the given OCR provider.
+func (m *ModelProviderService) ensureOCRProviderFromEnv(ctx context.Context, tenantID, providerName, modelName string, config map[string]interface{}) error {
+	if config == nil {
+		return nil
+	}
+	userID := permission.UserIDFromContext(ctx)
+
+	// 1. Find or create the provider.
+	provider, err := m.modelProviderDAO.GetByTenantIDAndUserIDAndProviderName(ctx, dao.DB, tenantID, userID, providerName)
+	if err != nil {
+		if !dao.IsNotFoundErr(err) {
+			return fmt.Errorf("failed to get provider %s: %w", providerName, err)
+		}
+		providerID := common.GenerateToken()
+		provider = &entity.TenantModelProvider{
+			ID:           providerID,
+			UserID:       userID,
+			TenantID:     tenantID,
+			ProviderName: providerName,
+		}
+		if err = m.modelProviderDAO.Create(ctx, dao.DB, provider); err != nil {
+			return fmt.Errorf("failed to create provider %s: %w", providerName, err)
+		}
+	}
+
+	// 2. Find or create the instance (api_key stores the JSON config for dedup).
+	apiKeyBytes, err := json.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config for %s: %w", providerName, err)
+	}
+	apiKey := string(apiKeyBytes)
+
+	instance, err := m.modelInstanceDAO.GetInstanceByApiKey(ctx, dao.DB, apiKey, provider.ID)
+	if err != nil {
+		if !dao.IsNotFoundErr(err) {
+			return fmt.Errorf("failed to get instance for %s: %w", providerName, err)
+		}
+		instanceID := common.GenerateToken()
+		instance = &entity.TenantModelInstance{
+			ID:           instanceID,
+			ProviderID:   provider.ID,
+			InstanceName: modelName,
+			APIKey:       apiKey,
+			Extra:        "{}",
+		}
+		if err = m.modelInstanceDAO.Create(ctx, dao.DB, instance); err != nil {
+			return fmt.Errorf("failed to create instance for %s: %w", providerName, err)
+		}
+	}
+
+	// 3. Find or create the model.
+	_, err = m.modelDAO.GetByProviderIDAndInstanceIDAndModelTypeAndModelName(
+		ctx,
+		dao.DB,
+		provider.ID,
+		instance.ID,
+		int(entity.ModelTypeOCR),
+		modelName,
+	)
+	if err != nil {
+		if !dao.IsNotFoundErr(err) {
+			return fmt.Errorf("failed to get model for %s: %w", providerName, err)
+		}
+		var extraBytes []byte
+		extraBytes, err = json.Marshal(map[string]int{"max_tokens": 0})
+		if err != nil {
+			return fmt.Errorf("failed to marshal extra for %s model: %w", providerName, err)
+		}
+		modelID := common.GenerateToken()
+		tenantModel := &entity.TenantModel{
+			ID:         modelID,
+			ModelName:  modelName,
+			ProviderID: provider.ID,
+			InstanceID: instance.ID,
+			ModelType:  int(entity.ModelTypeOCR),
+			Status:     "active",
+			Extra:      string(extraBytes),
+		}
+		if err = m.modelDAO.Create(ctx, dao.DB, tenantModel); err != nil {
+			return fmt.Errorf("failed to create model for %s: %w", providerName, err)
+		}
+	}
+
+	return nil
+}
+
+func (m *ModelProviderService) AlterProviderInstance(ctx context.Context, providerIDOrName, instanceIDOrName, newInstanceName string, apiKey json.RawMessage, clearAPIKey bool, baseURL, region string, modelInfo []CreateInstanceModelInfo) (common.ErrorCode, error) {
+	baseURL = strings.TrimSpace(baseURL)
+	region = strings.TrimSpace(region)
+	providerIDOrName = strings.TrimSpace(providerIDOrName)
+
+	provider, err := m.resolveProviderInTenant(ctx, providerIDOrName, permission.OperationRead)
+	if err != nil {
+		if permissionresponse.IsPermissionError(err) {
+			code, normalizedErr := permissionresponse.NormalizeHidden(err)
+			return code, normalizedErr
+		}
+		return common.CodeNotFound, fmt.Errorf("provider '%s' does not exist", providerIDOrName)
+	}
+	providerName := provider.ProviderName
+
+	instance, err := m.resolveInstance(ctx, provider, instanceIDOrName)
+	if err != nil {
+		if errors.Is(err, errInstanceProviderMismatch) {
+			return common.CodeNotFound, instanceLookupError(provider, instanceIDOrName, err)
+		}
+		return common.CodeNotFound, fmt.Errorf("no instance found for provider '%s' and instance '%s'", providerName, instanceIDOrName)
+	}
+	if err = permission.NewDatabaseChecker(dao.DB).CheckResource(
+		ctx,
+		permission.ResourceRef{Kind: permission.ResourceKindModelInstance, ID: instance.ID},
+		permission.OperationUpdate,
+	); err != nil {
+		code, normalizedErr := permissionresponse.NormalizeHidden(err)
+		return code, normalizedErr
+	}
+
+	// Authorize every model mutation before changing the instance or any model.
+	existingModels, err := m.modelDAO.GetModelsByInstanceID(ctx, dao.DB, instance.ID)
+	if err != nil {
+		return common.CodeServerError, err
+	}
+	existingModelMap := make(map[string]*entity.TenantModel, len(existingModels))
+	for _, model := range existingModels {
+		existingModelMap[model.ModelName] = model
+	}
+	submittedModelNames := make(map[string]bool)
+	if modelInfo != nil {
+		for _, model := range modelInfo {
+			if model.ModelName != "" {
+				submittedModelNames[model.ModelName] = true
+			}
+		}
+	}
+	for name, model := range existingModelMap {
+		operation := permission.OperationUpdate
+		if !submittedModelNames[name] {
+			operation = permission.OperationDelete
+		}
+		if err = permission.NewDatabaseChecker(dao.DB).CheckResource(
+			ctx,
+			permission.ResourceRef{Kind: permission.ResourceKindModel, ID: model.ID},
+			operation,
+		); err != nil {
+			code, normalizedErr := permissionresponse.NormalizeHidden(err)
+			return code, normalizedErr
+		}
+	}
+	for _, model := range modelInfo {
+		if model.ModelName == "" {
+			continue
+		}
+		if _, exists := existingModelMap[model.ModelName]; !exists {
+			if err = permission.NewDatabaseChecker(dao.DB).CheckResource(
+				ctx,
+				permission.ResourceRef{Kind: permission.ResourceKindModelInstance, ID: instance.ID},
+				permission.OperationCreate,
+			); err != nil {
+				code, normalizedErr := permissionresponse.NormalizeHidden(err)
+				return code, normalizedErr
+			}
+			break
+		}
+	}
+
+	// Update instance record. Empty or omitted credentials keep the existing
+	// value; clear_api_key explicitly clears the stored credentials. Structured
+	// credential objects merge non-empty submitted fields into the saved config.
+	instanceUpdates := make(map[string]interface{})
+	if clearAPIKey || len(bytes.TrimSpace(apiKey)) > 0 {
+		updatedAPIKey, mergeErr := mergeProviderAPIKey(instance.APIKey, apiKey, clearAPIKey)
+		if mergeErr != nil {
+			return common.CodeBadRequest, mergeErr
+		}
+		instanceUpdates["api_key"] = updatedAPIKey
+	}
+	if newInstanceName != "" && newInstanceName != instance.InstanceName {
+		instanceUpdates["instance_name"] = newInstanceName
+		instance.InstanceName = newInstanceName
+	}
+
+	extraFields := make(map[string]interface{})
+	if baseURL != "" {
+		extraFields["base_url"] = baseURL
+	}
+	if region != "" {
+		extraFields["region"] = region
+	}
+	// Preserve existing extra fields not overwritten.
+	existingExtra := make(map[string]interface{})
+	if instance.Extra != "" {
+		if err = json.Unmarshal([]byte(instance.Extra), &existingExtra); err != nil {
+			return common.CodeServerError, err
+		}
+	}
+	for k, v := range extraFields {
+		existingExtra[k] = v
+	}
+	extraBytes, err := json.Marshal(existingExtra)
+	if err != nil {
+		return common.CodeServerError, err
+	}
+	instanceUpdates["extra"] = string(extraBytes)
+	if err = m.modelInstanceDAO.UpdateByID(ctx, dao.DB, instance.ID, instanceUpdates); err != nil {
+		return common.CodeServerError, fmt.Errorf("fail to update instance: %w", err)
+	}
+
+	// Upsert models: add new ones, update existing ones, remove ones no longer selected.
+	// Delete models that are no longer in the submitted model_info.
+	var idsToRemove []string
+	for name, mdl := range existingModelMap {
+		if !submittedModelNames[name] {
+			idsToRemove = append(idsToRemove, mdl.ID)
+		}
+	}
+	if len(idsToRemove) > 0 {
+		if _, err = m.modelDAO.DeleteByIDs(ctx, dao.DB, idsToRemove); err != nil {
+			return common.CodeServerError, err
+		}
+	}
+
+	// Add or update models from model_info.
+	if modelInfo != nil {
+		for _, mdl := range modelInfo {
+			if mdl.ModelName == "" {
+				continue
+			}
+
+			if existingMdl, exists := existingModelMap[mdl.ModelName]; exists {
+				// Update existing model.
+				updates := make(map[string]interface{})
+				if len(mdl.ModelTypes) > 0 {
+					combinedType := entity.ModelType(0)
+					for _, t := range mdl.ModelTypes {
+						combinedType |= entity.ModelTypeFromString(t)
+					}
+					if int(combinedType) != existingMdl.ModelType {
+						updates["model_type"] = int(combinedType)
+					}
+				}
+				mergedExtra := make(map[string]interface{})
+				if existingMdl.Extra != "" {
+					json.Unmarshal([]byte(existingMdl.Extra), &mergedExtra)
+				}
+				if mdl.Extra != nil {
+					for k, v := range mdl.Extra {
+						mergedExtra[k] = v
+					}
+				}
+				if mdl.MaxTokens > 0 {
+					mergedExtra["max_tokens"] = mdl.MaxTokens
+				}
+				extraBytes, _ = json.Marshal(mergedExtra)
+				updates["extra"] = string(extraBytes)
+				if len(updates) > 0 {
+					if err = m.modelDAO.UpdateByID(ctx, dao.DB, existingMdl.ID, updates); err != nil {
+						return common.CodeServerError, err
+					}
+				}
+			} else {
+				// Add new model.
+				if err = m.addModelToInstance(ctx, dao.DB, provider, instance, mdl); err != nil {
+					return common.CodeServerError, err
+				}
+			}
+		}
+	}
+
+	return common.CodeSuccess, nil
+}
+
+func (m *ModelProviderService) DropProviderInstances(ctx context.Context, providerIDOrName string, instanceIDOrNames []string) (common.ErrorCode, error) {
+	if len(instanceIDOrNames) == 0 {
+		return common.CodeBadRequest, errors.New("instances is required")
+	}
+
+	// Find provider by ID or name inside the request's active tenant.
+	provider, err := m.resolveProviderInTenant(ctx, providerIDOrName, permission.OperationRead)
+	if err != nil {
+		if permissionresponse.IsPermissionError(err) {
+			code, normalizedErr := permissionresponse.NormalizeHidden(err)
+			return code, normalizedErr
+		}
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return common.CodeNotFound, fmt.Errorf("no provider found for provider %q", providerIDOrName)
+		}
+		return common.CodeServerError, err
+	}
+
+	// First pass: resolve all instance IDs and collect not-found instances.
+	// Mirrors Python's drop_provider_instances which returns error immediately
+	// if any instance does not exist, without performing partial deletion.
+	notExistInstances := make([]string, 0)
+	instanceIDs := make([]string, 0, len(instanceIDOrNames))
+	for _, idOrName := range instanceIDOrNames {
+		instance, resolveErr := m.resolveInstance(ctx, provider, idOrName)
+		if resolveErr != nil {
+			if errors.Is(resolveErr, errInstanceProviderMismatch) {
+				return common.CodeNotFound, instanceLookupError(provider, idOrName, resolveErr)
+			}
+			if errors.Is(resolveErr, gorm.ErrRecordNotFound) {
+				notExistInstances = append(notExistInstances, idOrName)
+				continue
+			}
+			return common.CodeServerError, resolveErr
+		}
+		instanceIDs = append(instanceIDs, instance.ID)
+		if err = permission.NewDatabaseChecker(dao.DB).CheckResource(
+			ctx,
+			permission.ResourceRef{Kind: permission.ResourceKindModelInstance, ID: instance.ID},
+			permission.OperationDelete,
+		); err != nil {
+			code, normalizedErr := permissionresponse.NormalizeHidden(err)
+			return code, normalizedErr
+		}
+		models, modelErr := m.modelDAO.GetModelsByInstanceID(ctx, dao.DB, instance.ID)
+		if modelErr != nil {
+			return common.CodeServerError, modelErr
+		}
+		for _, model := range models {
+			if err = permission.NewDatabaseChecker(dao.DB).CheckResource(
+				ctx,
+				permission.ResourceRef{Kind: permission.ResourceKindModel, ID: model.ID},
+				permission.OperationDelete,
+			); err != nil {
+				code, normalizedErr := permissionresponse.NormalizeHidden(err)
+				return code, normalizedErr
+			}
+		}
+	}
+
+	if len(notExistInstances) > 0 {
+		return common.CodeNotFound, fmt.Errorf("no instance found for provider %q and instances %q", providerIDOrName, notExistInstances)
+	}
+
+	// Second pass: delete models and instances by IDs atomically.
+	// Mirrors Python's: delete_models_by_instance_ids(instance_ids)
+	//                   TenantModelInstanceService.delete_by_ids(instance_ids)
+	// Both deletes share one transaction so a failure of the instance delete
+	// cannot leave the tenant models already removed (partial deletion).
+	err = dao.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if _, err := m.modelDAO.DeleteByInstanceIDs(ctx, tx, instanceIDs); err != nil {
+			return err
+		}
+		if _, err := m.modelInstanceDAO.DeleteByIDs(ctx, tx, instanceIDs); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return common.CodeServerError, err
+	}
+
+	return common.CodeSuccess, nil
+}
+
+func (m *ModelProviderService) DropInstanceModels(ctx context.Context, providerIDOrName, instanceIDOrName string, modelNames []string) (common.ErrorCode, error) {
+	// Resolve the provider and instance inside the request's active tenant.
+	provider, err := m.resolveProviderInTenant(ctx, providerIDOrName, permission.OperationRead)
+	if err != nil {
+		if permissionresponse.IsPermissionError(err) {
+			code, normalizedErr := permissionresponse.NormalizeHidden(err)
+			return code, normalizedErr
+		}
+		return common.CodeDataError, fmt.Errorf("no provider found for provider '%s'", providerIDOrName)
+	}
+
+	instance, err := m.resolveInstance(ctx, provider, instanceIDOrName)
+	if err != nil {
+		if errors.Is(err, errInstanceProviderMismatch) {
+			return common.CodeDataError, instanceLookupError(provider, instanceIDOrName, err)
+		}
+		return common.CodeDataError, fmt.Errorf("no instance found for provider '%s' and instance '%s'", providerIDOrName, instanceIDOrName)
+	}
+	if err = permission.NewDatabaseChecker(dao.DB).CheckResource(
+		ctx,
+		permission.ResourceRef{Kind: permission.ResourceKindModelInstance, ID: instance.ID},
+		permission.OperationRead,
+	); err != nil {
+		code, normalizedErr := permissionresponse.NormalizeHidden(err)
+		return code, normalizedErr
+	}
+
+	// Fetch all models under this instance and validate all requested names exist.
+	modelObjs, err := m.modelDAO.GetModelsByInstanceID(ctx, dao.DB, instance.ID)
+	if err != nil {
+		return common.CodeServerError, err
+	}
+
+	existingNames := make(map[string]struct{}, len(modelObjs))
+	for _, obj := range modelObjs {
+		existingNames[obj.ModelName] = struct{}{}
+	}
+
+	notExist := make([]string, 0)
+	for _, name := range modelNames {
+		if _, ok := existingNames[name]; !ok {
+			notExist = append(notExist, name)
+		}
+	}
+	if len(notExist) > 0 {
+		return common.CodeNotFound, fmt.Errorf("models %v not found for provider '%s' and instance '%s'", notExist, providerIDOrName, instanceIDOrName)
+	}
+
+	// Collect IDs of only the requested models to delete.
+	requestedNames := make(map[string]struct{}, len(modelNames))
+	for _, name := range modelNames {
+		requestedNames[name] = struct{}{}
+	}
+	idsToDelete := make([]string, 0, len(modelNames))
+	for _, obj := range modelObjs {
+		if _, ok := requestedNames[obj.ModelName]; ok {
+			if err = permission.NewDatabaseChecker(dao.DB).CheckResource(
+				ctx,
+				permission.ResourceRef{Kind: permission.ResourceKindModel, ID: obj.ID},
+				permission.OperationDelete,
+			); err != nil {
+				code, normalizedErr := permissionresponse.NormalizeHidden(err)
+				return code, normalizedErr
+			}
+			idsToDelete = append(idsToDelete, obj.ID)
+		}
+	}
+
+	if _, err = m.modelDAO.DeleteByIDs(ctx, dao.DB, idsToDelete); err != nil {
+		return common.CodeServerError, err
+	}
+
+	return common.CodeSuccess, nil
+}
+
+func (m *ModelProviderService) ListInstanceModels(ctx context.Context, providerName, instanceName string) ([]map[string]interface{}, error) {
+	provider, err := m.resolveProviderInTenant(ctx, providerName, permission.OperationRead)
+	if err != nil {
+		if permissionresponse.IsPermissionError(err) {
+			_, normalizedErr := permissionresponse.NormalizeHidden(err)
+			return nil, normalizedErr
+		}
+		return nil, err
+	}
+
+	instance, err := m.resolveInstance(ctx, provider, instanceName)
+	if err != nil {
+		if errors.Is(err, errInstanceProviderMismatch) {
+			return nil, instanceLookupError(provider, instanceName, err)
+		}
+		return nil, err
+	}
+	if err = permission.NewDatabaseChecker(dao.DB).CheckResource(
+		ctx,
+		permission.ResourceRef{Kind: permission.ResourceKindModelInstance, ID: instance.ID},
+		permission.OperationRead,
+	); err != nil {
+		_, normalizedErr := permissionresponse.NormalizeHidden(err)
+		return nil, normalizedErr
+	}
+
+	// Get all models for this instance
+	modelObjs, err := m.modelDAO.GetModelsByInstanceID(ctx, dao.DB, instance.ID)
+	if err != nil {
+		return nil, err
+	}
+	modelRefs := make([]permission.ResourceRef, 0, len(modelObjs))
+	for _, model := range modelObjs {
+		modelRefs = append(modelRefs, permission.ResourceRef{Kind: permission.ResourceKindModel, ID: model.ID})
+	}
+	resourceAccesses, err := permission.NewDatabaseChecker(dao.DB).ResolveAccesses(ctx, modelRefs)
+	if err != nil {
+		_, normalizedErr := permissionresponse.NormalizeHidden(err)
+		return nil, normalizedErr
+	}
+
+	modelList := make([]map[string]interface{}, 0, len(modelObjs))
+	for _, model := range modelObjs {
+		access, ok := resourceAccesses[permission.ResourceRef{Kind: permission.ResourceKindModel, ID: model.ID}]
+		if !ok || !access.Allows(permission.OperationRead) {
+			continue
+		}
+		modelExtra := make(map[string]interface{})
+		if model.Extra != "" {
+			_ = json.Unmarshal([]byte(model.Extra), &modelExtra)
+		}
+
+		maxTokens := 8192
+		if v, ok := modelExtra["max_tokens"]; ok {
+			switch val := v.(type) {
+			case float64:
+				maxTokens = int(val)
+			case int:
+				maxTokens = val
+			}
+		}
+
+		verify := "unknown"
+		if v, ok := modelExtra["verify"].(string); ok {
+			verify = v
+		}
+
+		features := make([]string, 0)
+		if v, ok := modelExtra["is_tools"]; ok && isTruthy(v) {
+			features = append(features, "is_tools")
+		}
+		if v, ok := modelExtra["thinking"]; ok && isTruthy(v) {
+			features = append(features, "thinking")
+		}
+
+		modelList = append(modelList, map[string]interface{}{
+			"id":         model.ID,
+			"name":       model.ModelName,
+			"model_type": entity.ModelType(model.ModelType).HumanReadable(),
+			"max_tokens": maxTokens,
+			"status":     model.Status,
+			"verify":     verify,
+			"features":   features,
+			"extra":      modelExtra,
+		})
+	}
+
+	// Sort by name
+	sort.Slice(modelList, func(i, j int) bool {
+		return modelList[i]["name"].(string) < modelList[j]["name"].(string)
+	})
+
+	return modelList, nil
+}
+
+func (m *ModelProviderService) AlterModel(ctx context.Context, providerName, instanceName, modelName, modelID string, updateDict map[string]interface{}) (common.ErrorCode, error) {
+	modelName = strings.TrimSpace(modelName)
+	modelID = strings.TrimSpace(modelID)
+	if modelName == "" && modelID == "" {
+		return common.CodeBadRequest, errors.New("model name or model ID is required")
+	}
+
+	// Validate status early, before any DB lookup.
+	if status, ok := updateDict["status"].(string); ok && status != "" {
+		if status != "active" && status != "inactive" {
+			return common.CodeBadRequest, errors.New("status must be 'active' or 'inactive'")
+		}
+	}
+
+	// Check if provider exists
+	provider, err := m.resolveProviderInTenant(ctx, providerName, permission.OperationRead)
+	if err != nil {
+		if permissionresponse.IsPermissionError(err) {
+			code, normalizedErr := permissionresponse.NormalizeHidden(err)
+			return code, normalizedErr
+		}
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return common.CodeNotFound, fmt.Errorf("provider '%s' does not exist", providerName)
+		}
+		return common.CodeServerError, err
+	}
+
+	instance, err := m.resolveInstance(ctx, provider, instanceName)
+	if err != nil {
+		if errors.Is(err, errInstanceProviderMismatch) || errors.Is(err, gorm.ErrRecordNotFound) {
+			return common.CodeNotFound, instanceLookupError(provider, instanceName, err)
+		}
+		return common.CodeServerError, err
+	}
+	if err = permission.NewDatabaseChecker(dao.DB).CheckResource(
+		ctx,
+		permission.ResourceRef{Kind: permission.ResourceKindModelInstance, ID: instance.ID},
+		permission.OperationRead,
+	); err != nil {
+		code, normalizedErr := permissionresponse.NormalizeHidden(err)
+		return code, normalizedErr
+	}
+
+	var model *entity.TenantModel
+	if modelName != "" {
+		model, err = m.modelDAO.GetModelByProviderIDAndInstanceIDAndModelName(ctx, dao.DB, provider.ID, instance.ID, modelName)
+		if err != nil {
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return common.CodeServerError, err
+			}
+			return common.CodeNotFound, fmt.Errorf("model %q not found for provider %q and instance %q", modelName, providerName, instanceName)
+		}
+		if modelID != "" && model.ID != modelID {
+			return common.CodeBadRequest, errors.New("model ID does not match model name")
+		}
+	} else {
+		model, err = m.modelDAO.GetByID(ctx, dao.DB, modelID)
+		if err != nil {
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return common.CodeServerError, err
+			}
+			return common.CodeNotFound, fmt.Errorf("model with ID %q not found", modelID)
+		}
+		if model.ProviderID != provider.ID || model.InstanceID != instance.ID {
+			return common.CodeNotFound, fmt.Errorf("model with ID %q does not belong to provider %q and instance %q", modelID, providerName, instanceName)
+		}
+	}
+	if err = permission.NewDatabaseChecker(dao.DB).CheckResource(
+		ctx,
+		permission.ResourceRef{Kind: permission.ResourceKindModel, ID: model.ID},
+		permission.OperationUpdate,
+	); err != nil {
+		code, normalizedErr := permissionresponse.NormalizeHidden(err)
+		return code, normalizedErr
+	}
+
+	toUpdate := make(map[string]interface{})
+
+	// Handle status (validation already done above, here we only apply the change)
+	if status, ok := updateDict["status"].(string); ok && status != "" {
+		if status != model.Status {
+			toUpdate["status"] = status
+		}
+	}
+
+	// Handle model_type
+	if modelTypeVal, ok := updateDict["model_type"]; ok && modelTypeVal != nil {
+		targetModelType := resolveModelType(modelTypeVal)
+		if targetModelType != model.ModelType {
+			toUpdate["model_type"] = targetModelType
+		}
+	}
+
+	// Handle extra (max_tokens, extra)
+	newExtra := make(map[string]interface{})
+	if extraVal, ok := updateDict["extra"]; ok && extraVal != nil {
+		if extraMap, ok := extraVal.(map[string]interface{}); ok {
+			for k, v := range extraMap {
+				newExtra[k] = v
+			}
+		}
+	}
+	if maxTokensVal, ok := updateDict["max_tokens"]; ok {
+		switch v := maxTokensVal.(type) {
+		case int:
+			if v > 0 {
+				newExtra["max_tokens"] = v
+			}
+		case float64:
+			if v > 0 {
+				newExtra["max_tokens"] = int(v)
+			}
+		}
+	}
+	if len(newExtra) > 0 {
+		dbExtra := make(map[string]interface{})
+		if model.Extra != "" {
+			_ = json.Unmarshal([]byte(model.Extra), &dbExtra)
+		}
+		for k, v := range newExtra {
+			dbExtra[k] = v
+		}
+		extraBytes, err := json.Marshal(dbExtra)
+		if err != nil {
+			return common.CodeServerError, err
+		}
+		toUpdate["extra"] = string(extraBytes)
+	}
+
+	if len(toUpdate) > 0 {
+		if err = m.modelDAO.UpdateByID(ctx, dao.DB, model.ID, toUpdate); err != nil {
+			return common.CodeServerError, err
+		}
+	}
+
+	return common.CodeSuccess, nil
+}
+
+// resolveModelType converts a model_type value (string, []string, or float64) to an int bitmask.
+func resolveModelType(val interface{}) int {
+	switch v := val.(type) {
+	case string:
+		return int(entity.ModelTypeFromString(v))
+	case []interface{}:
+		types := make([]string, 0, len(v))
+		for _, t := range v {
+			if s, ok := t.(string); ok {
+				types = append(types, s)
+			}
+		}
+		return int(entity.ModelTypeFromStrings(types))
+	case float64:
+		return int(v)
+	default:
+		return 0
+	}
+}
+
+func validateEmbeddingModel(model *modelModule.Model, requestedDimension, requestedBatchSize int) error {
+	if model == nil {
+		return fmt.Errorf("embedding model is nil")
+	}
+
+	if requestedDimension <= 0 {
+		return fmt.Errorf("input dimension <= 0")
+	}
+
+	if requestedBatchSize <= 0 {
+		return fmt.Errorf("input batch size <= 0")
+	}
+
+	if model.MaxDimension == nil {
+		return fmt.Errorf("input embedding max dimension is nil, %s", model.Name)
+	}
+
+	if model.MaxBatchSize == nil {
+		return fmt.Errorf("input embedding max batch size is nil, %s", model.Name)
+	}
+
+	if *model.MaxBatchSize < requestedBatchSize {
+		return fmt.Errorf("input embedding max batch size is more than limitation, %s", model.Name)
+	}
+
+	if len(model.Dimensions) > 0 {
+		for _, dim := range model.Dimensions {
+			if dim == requestedDimension {
+				return nil
+			}
+		}
+		return fmt.Errorf(
+			"dimension %d is not supported by model %s, supported dimensions: %v",
+			requestedDimension,
+			model.Name,
+			model.Dimensions,
+		)
+	}
+	if model.MaxDimension != nil && requestedDimension > *model.MaxDimension {
+		return fmt.Errorf(
+			"dimension %d is not supported by model %s, max dimension: %d",
+			requestedDimension,
+			model.Name,
+			*model.MaxDimension,
+		)
+	}
+
+	return nil
+}
+
+type AddModelRequest struct {
+	ProviderName string                 `json:"provider_name"`
+	InstanceName string                 `json:"instance_name"`
+	ModelName    string                 `json:"model_name"`
+	ModelTypes   []string               `json:"model_type"`
+	MaxTokens    int                    `json:"max_tokens"`
+	Extra        map[string]interface{} `json:"extra"`
+}
+
+// The tool-calling verdict is no longer memoized: it is computed while the model
+// is resolved by ModelFactory and travels with the model metadata,
+// so there is no second lookup to amortize.
+
+type AddCustomModelRequest struct {
+	ProviderName string   `json:"provider_name"`
+	InstanceName string   `json:"instance_name"`
+	ModelName    string   `json:"model_name"`
+	ModelTypes   []string `json:"model_types"`
+	MaxTokens    int      `json:"max_tokens"`
+	Thinking     *bool    `json:"thinking"`
+}
+
+type ModelRequest struct {
+	ModelName    string   `json:"model_name"`
+	ModelTypes   []string `json:"model_types"`
+	MaxTokens    int      `json:"max_tokens"`
+	MaxDimension int      `json:"max_dimension"`
+	Dimensions   []int    `json:"dimensions"`
+	Thinking     *bool    `json:"thinking"`
+}
+
+func (m *ModelProviderService) AddModel(ctx context.Context, request *AddModelRequest) (common.ErrorCode, error) {
+	if request == nil {
+		return common.CodeBadRequest, errors.New("request is required")
+	}
+
+	modelName := strings.TrimSpace(request.ModelName)
+	if modelName == "" {
+		return common.CodeBadRequest, errors.New("model_name is required")
+	}
+
+	// Resolve the provider and instance inside the request's active tenant.
+	provider, err := m.resolveProviderInTenant(ctx, request.ProviderName, permission.OperationRead)
+	if err != nil {
+		if permissionresponse.IsPermissionError(err) {
+			code, normalizedErr := permissionresponse.NormalizeHidden(err)
+			return code, normalizedErr
+		}
+		return common.CodeDataError, fmt.Errorf("no provider found for provider '%s'", request.ProviderName)
+	}
+	instance, err := m.resolveInstance(ctx, provider, request.InstanceName)
+	if err != nil {
+		if errors.Is(err, errInstanceProviderMismatch) {
+			return common.CodeDataError, instanceLookupError(provider, request.InstanceName, err)
+		}
+		return common.CodeDataError, fmt.Errorf("no instance found for provider '%s' and instance '%s'", request.ProviderName, request.InstanceName)
+	}
+	if err = permission.NewDatabaseChecker(dao.DB).CheckResource(
+		ctx,
+		permission.ResourceRef{Kind: permission.ResourceKindModelInstance, ID: instance.ID},
+		permission.OperationCreate,
+	); err != nil {
+		code, normalizedErr := permissionresponse.NormalizeHidden(err)
+		return code, normalizedErr
+	}
+
+	// Check for duplicate model.
+	_, err = m.modelDAO.GetModelByProviderIDAndInstanceIDAndModelName(ctx, dao.DB, provider.ID, instance.ID, modelName)
+	if err == nil {
+		return common.CodeConflict, fmt.Errorf("model '%s' already exists for provider '%s' and instance '%s'", modelName, request.ProviderName, request.InstanceName)
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return common.CodeServerError, err
+	}
+
+	// Compute model type bitmask. Matches Python's calculate_model_type:
+	// empty and unrecognized type names are ignored, not rejected.
+	combinedType := entity.ModelType(0)
+	for _, rawType := range request.ModelTypes {
+		mt := strings.TrimSpace(rawType)
+		if mt == "" {
+			continue
+		}
+		combinedType |= entity.ModelTypeFromString(mt)
+	}
+
+	maxTokens := request.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 8192
+	}
+
+	// Build extra fields. Mirrors Python's add_model_to_instance.
+	extraFields := map[string]interface{}{
+		"max_tokens": maxTokens,
+	}
+
+	// Look up factory info to populate is_tools and thinking (matches Python).
+	targetProvider := dao.GetModelProviderManager().FindProvider(provider.ProviderName)
+	if targetProvider != nil {
+		targetModel := dao.GetModelProviderManager().FindModel(targetProvider, modelName)
+		if targetModel != nil {
+			if targetModel.Tools != nil && targetModel.Tools.Support {
+				extraFields["is_tools"] = true
+			}
+			if targetModel.Thinking != nil {
+				extraFields["thinking"] = true
+			}
+		}
+	}
+
+	if request.Extra != nil {
+		for k, v := range request.Extra {
+			extraFields[k] = v
+		}
+	}
+
+	extraBytes, err := json.Marshal(extraFields)
+	if err != nil {
+		return common.CodeServerError, errors.New("fail to marshal extra")
+	}
+
+	modelID := common.GenerateToken()
+	tenantModel := &entity.TenantModel{
+		ID:         modelID,
+		ModelName:  modelName,
+		ModelType:  int(combinedType),
+		ProviderID: provider.ID,
+		InstanceID: instance.ID,
+		Status:     "active",
+		Extra:      string(extraBytes),
+	}
+
+	if err = m.modelDAO.Create(ctx, dao.DB, tenantModel); err != nil {
+		return common.CodeServerError, fmt.Errorf("fail to create model '%s': %w", modelName, err)
+	}
+
+	return common.CodeSuccess, nil
+}
+
+// ListAllModels list all models
+func (m *ModelProviderService) ListAllModels(pageIndex, pageSize int) ([]map[string]interface{}, error) {
+	models, err := dao.GetModelProviderManager().ListAllModels()
+	if err != nil {
+		return nil, err
+	}
+	if err := common.ValidatePagination(&pageIndex, &pageSize, nil); err != nil {
+		return nil, err
+	}
+	start := (pageIndex - 1) * pageSize
+	if start >= len(models) {
+		return []map[string]interface{}{}, nil
+	}
+	// Models are loaded from a file and kept in memory, so slice-based pagination is appropriate.
+	// If models are stored in a database, apply pagination in the query instead.
+	return models[start:min(start+pageSize, len(models))], nil
+}
+
+func (m *ModelProviderService) ShowModel(modelName string) (*modelModule.Model, error) {
+	return dao.GetModelProviderManager().GetModelByNameOrAlias(modelName), nil
+}

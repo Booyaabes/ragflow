@@ -1,0 +1,622 @@
+// Copyright(C) 2023 InfiniFlow, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#pragma once
+
+#include <algorithm>
+
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#include <immintrin.h>
+#elif defined(__GNUC__) && defined(__aarch64__)
+#include <simde/x86/sse4.1.h>
+#endif
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <string>
+
+inline std::string FullWidthToHalfWidth(const std::string& input)
+{
+    std::string output;
+    size_t i = 0;
+
+    while (i < input.size())
+    {
+        const unsigned char first = static_cast<unsigned char>(input[i]);
+        if (first < 0x80)
+        {
+            output += static_cast<char>(first);
+            ++i;
+            continue;
+        }
+
+        size_t length = 0;
+        uint32_t codepoint = 0;
+        if ((first & 0xE0) == 0xC0 && first >= 0xC2 && i + 1 < input.size())
+        {
+            const unsigned char second = static_cast<unsigned char>(input[i + 1]);
+            if ((second & 0xC0) == 0x80)
+            {
+                codepoint = ((first & 0x1F) << 6) | (second & 0x3F);
+                length = 2;
+            }
+        }
+        else if ((first & 0xF0) == 0xE0 && i + 2 < input.size())
+        {
+            const unsigned char second = static_cast<unsigned char>(input[i + 1]);
+            const unsigned char third = static_cast<unsigned char>(input[i + 2]);
+            if ((second & 0xC0) == 0x80 && (third & 0xC0) == 0x80 &&
+                !(first == 0xE0 && second < 0xA0) && !(first == 0xED && second >= 0xA0))
+            {
+                codepoint = ((first & 0x0F) << 12) | ((second & 0x3F) << 6) | (third & 0x3F);
+                length = 3;
+            }
+        }
+
+        if (length == 0)
+        {
+            output += input[i++];
+            continue;
+        }
+
+        if (codepoint >= 0xFF01 && codepoint <= 0xFF5E)
+        {
+            output += static_cast<char>(codepoint - 0xFEE0);
+        }
+        else if (codepoint == 0x3000)
+        {
+            output += ' ';
+        }
+        else
+        {
+            output.append(input, i, length);
+        }
+        i += length;
+    }
+
+    return output;
+}
+
+[[nodiscard]] constexpr uint8_t ToUpper(uint8_t ch) noexcept { return ch >= 'a' && ch <= 'z' ? ch - 32 : ch; }
+
+[[nodiscard]] constexpr uint8_t ToLower(uint8_t ch) noexcept { return ch >= 'A' && ch <= 'Z' ? ch + 32 : ch; }
+
+inline void ToLower(char* data, size_t len)
+{
+#ifdef __SSE2__
+    while (len >= 16)
+    {
+        /* By Peter Cordes */
+        __m128i input = _mm_loadu_si128((__m128i*)data);
+        __m128i rangeshift = _mm_sub_epi8(input, _mm_set1_epi8('A' - 128));
+        __m128i nomodify = _mm_cmpgt_epi8(rangeshift, _mm_set1_epi8(25 - 128));
+        __m128i flip = _mm_andnot_si128(nomodify, _mm_set1_epi8(0x20));
+        _mm_storeu_si128((__m128i*)data, _mm_xor_si128(input, flip));
+        len -= 16;
+        data += 16;
+    }
+#endif
+    while (len-- > 0)
+    {
+        *data += ((unsigned char)(*data - 'A') < 26) << 5;
+        ++data;
+    }
+}
+
+inline void ToLower(const char* data, size_t len, char* out, size_t out_limit)
+{
+    if (out == nullptr || out_limit == 0)
+        return;
+    const size_t output_len = std::min(len, out_limit - 1);
+    if (output_len > 0)
+        memcpy(out, data, output_len);
+    char* begin = out;
+    char* end = out + output_len;
+    char* p = begin;
+#if defined(__SSE2__)
+    static constexpr int SSE2_BYTES = sizeof(__m128i);
+    const char* sse2_end = begin + (output_len & ~(SSE2_BYTES - 1));
+    const auto a_minus1 = _mm_set1_epi8('A' - 1);
+    const auto z_plus1 = _mm_set1_epi8('Z' + 1);
+    const auto delta = _mm_set1_epi8('a' - 'A');
+    for (; p < sse2_end; p += SSE2_BYTES)
+    {
+        auto bytes = _mm_loadu_si128((const __m128i*)p);
+        _mm_maskmoveu_si128(_mm_xor_si128(bytes, delta),
+                            _mm_and_si128(_mm_cmpgt_epi8(bytes, a_minus1), _mm_cmpgt_epi8(z_plus1, bytes)), p);
+    }
+#endif
+    for (; p < end; p += 1)
+    {
+        if ('A' <= (*p) && (*p) <= 'Z')
+            (*p) += 32;
+    }
+    (*end) = '\0';
+}
+
+inline std::string ToLowerString(std::string_view s)
+{
+    std::string result{s.data(), s.size()};
+    char* begin = result.data();
+    char* end = result.data() + s.size();
+
+    char* p = begin;
+#if defined(__SSE2__)
+    const size_t size = result.size();
+    static constexpr int SSE2_BYTES = sizeof(__m128i);
+    const char* sse2_end = begin + (size & ~(SSE2_BYTES - 1));
+
+    const auto a_minus1 = _mm_set1_epi8('A' - 1);
+    const auto z_plus1 = _mm_set1_epi8('Z' + 1);
+    const auto delta = _mm_set1_epi8('a' - 'A');
+    for (; p < sse2_end; p += SSE2_BYTES)
+    {
+        auto bytes = _mm_loadu_si128((const __m128i*)p);
+        _mm_maskmoveu_si128(_mm_xor_si128(bytes, delta),
+                            _mm_and_si128(_mm_cmpgt_epi8(bytes, a_minus1), _mm_cmpgt_epi8(z_plus1, bytes)), p);
+    }
+#endif
+    for (; p < end; p += 1)
+    {
+        if ('A' <= (*p) && (*p) <= 'Z')
+            (*p) += 32;
+    }
+    return result;
+}
+
+// Simple (1:1) lower-case mapping for Cyrillic U+0400-U+04FF. Upper/lower
+// pairs are contiguous inside the main blocks; U+0460-U+0481 and
+// U+048A-U+04BF interleave them (upper first), while U+04C3-U+04CE interleave
+// with the upper case on the odd code point. U+04C0/U+04C1 are the two
+// exceptions Unicode defines outside that pattern.
+[[nodiscard]] constexpr uint32_t ToLowerCyrillic(uint32_t cp) noexcept
+{
+    if (cp >= 0x0400 && cp <= 0x040F)
+        return cp + 0x50;
+    if (cp >= 0x0410 && cp <= 0x042F)
+        return cp + 0x20;
+    if (cp >= 0x0460 && cp <= 0x0481 && (cp & 1) == 0)
+        return cp + 1;
+    if (cp >= 0x048A && cp <= 0x04BF && (cp & 1) == 0)
+        return cp + 1;
+    if (cp == 0x04C0)
+        return 0x04CF;
+    if (cp == 0x04C1)
+        return 0x04C2;
+    if (cp >= 0x04C3 && cp <= 0x04CE && (cp & 1) == 1)
+        return cp + 1;
+    if (cp >= 0x04D0 && cp <= 0x04FF && (cp & 1) == 0)
+        return cp + 1;
+    return cp;
+}
+
+// ToLowerUTF8 folds ASCII A-Z and upper-case Cyrillic U+0400-U+04FF to lower
+// case in place. Byte length is preserved so callers that map token offsets
+// back to the source string keep their indices valid. The Snowball Russian
+// stemmer only accepts lower-case input, so index-side tokens must be folded
+// before stemming; ToLower above is deliberately ASCII-only and leaves
+// Cyrillic untouched.
+inline void ToLowerUTF8(char* data, size_t len)
+{
+    for (size_t i = 0; i < len;)
+    {
+        const unsigned char c = static_cast<unsigned char>(data[i]);
+        if (c < 0x80)
+        {
+            if ('A' <= c && c <= 'Z')
+                data[i] += 32;
+            i += 1;
+            continue;
+        }
+        // Cyrillic occupies the two-byte leads D0-D3. All foldings stay inside
+        // the same block, so the encoded length never changes.
+        if (c >= 0xD0 && c <= 0xD3 && i + 1 < len)
+        {
+            const unsigned char t = static_cast<unsigned char>(data[i + 1]);
+            if (t >= 0x80 && t <= 0xBF)
+            {
+                const uint32_t cp = ((c - 0xD0u) << 6) + (t - 0x80u) + 0x400u;
+                const uint32_t folded = ToLowerCyrillic(cp);
+                if (folded != cp)
+                {
+                    const uint32_t offset = folded - 0x400u;
+                    data[i] = static_cast<char>(0xD0u + (offset >> 6));
+                    data[i + 1] = static_cast<char>(0x80u + (offset & 0x3Fu));
+                }
+                i += 2;
+                continue;
+            }
+        }
+        // Other multi-byte sequences pass through byte for byte.
+        i += 1;
+    }
+}
+
+// Copies `len` bytes into `out`, folds them and terminates the result. Callers
+// must provide len + 1 bytes: byte length is preserved, so that is the only
+// space the fold needs.
+inline void ToLowerUTF8(const char* data, size_t len, char* out)
+{
+    memcpy(out, data, len);
+    ToLowerUTF8(out, len);
+    out[len] = '\0';
+}
+
+inline bool IsUTF8Sep(const uint8_t c) { return c < 128 && !std::isalnum(c); }
+
+template <typename T>
+inline uint32_t GetLeadingZeroBits(T x)
+{
+    if constexpr (sizeof(T) <= sizeof(unsigned int))
+    {
+        return __builtin_clz(x);
+    }
+    else if constexpr (sizeof(T) <= sizeof(unsigned long int))
+    {
+        return __builtin_clzl(x);
+    }
+    else
+    {
+        return __builtin_clzll(x);
+    }
+}
+
+template <typename T>
+inline uint32_t BitScanReverse(T x)
+{
+    return (std::max<size_t>(sizeof(T), sizeof(unsigned int))) * 8 - 1 - GetLeadingZeroBits(x);
+}
+
+/// return UTF-8 code point sequence length
+inline uint32_t UTF8SeqLength(const uint8_t first_octet)
+{
+    if (first_octet < 0x80 || first_octet >= 0xF8)
+        return 1;
+
+    const uint32_t bits = 8;
+    const auto first_zero = BitScanReverse(static_cast<uint8_t>(~first_octet));
+
+    return bits - 1 - first_zero;
+}
+
+static const uint8_t UTF8_BYTE_LENGTH_TABLE[256] = {
+    // start byte of 1-byte utf8 char: 0b0000'0000 ~ 0b0111'1111
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    // continuation byte: 0b1000'0000 ~ 0b1011'1111
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    // start byte of 2-byte utf8 char: 0b1100'0000 ~ 0b1101'1111
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    // start byte of 3-byte utf8 char: 0b1110'0000 ~ 0b1110'1111
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3,
+    // start byte of 4-byte utf8 char: 0b1111'0000 ~ 0b1111'0111
+    // invalid utf8 byte: 0b1111'1000~ 0b1111'1111
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    4,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+};
+
+inline uint32_t UTF8Length(const std::string_view str)
+{
+    uint32_t len = 0;
+    for (uint32_t i = 0, char_size = 0; i < str.size(); i += char_size)
+    {
+        char_size = UTF8_BYTE_LENGTH_TABLE[static_cast<uint8_t>(str[i])];
+        ++len;
+    }
+    return len;
+}
+
+static inline std::string UTF8Substr(const std::string& str, std::size_t start, std::size_t len)
+{
+    std::size_t str_len = str.length();
+    std::size_t i = 0;
+    std::size_t byte_index = 0;
+    std::size_t start_byte = 0;
+    std::size_t end_byte = 0;
+
+    while (byte_index < str_len && i < (start + len))
+    {
+        std::size_t char_len = UTF8_BYTE_LENGTH_TABLE[static_cast<uint8_t>(str[byte_index])];
+        if (i >= start)
+        {
+            if (i == start)
+            {
+                start_byte = byte_index;
+            }
+            end_byte = byte_index + char_len;
+        }
+
+        byte_index += char_len;
+        i += 1;
+    }
+
+    return str.substr(start_byte, end_byte - start_byte);
+}
+
+static inline std::string_view UTF8Substrview(const std::string_view str, const std::size_t start,
+                                              const std::size_t len)
+{
+    const std::size_t str_len = str.length();
+    std::size_t i = 0;
+    std::size_t byte_index = 0;
+    std::size_t start_byte = 0;
+    std::size_t end_byte = 0;
+
+    while (byte_index < str_len && i < (start + len))
+    {
+        const std::size_t char_len = UTF8_BYTE_LENGTH_TABLE[static_cast<uint8_t>(str[byte_index])];
+        if (i >= start)
+        {
+            if (i == start)
+            {
+                start_byte = byte_index;
+            }
+            end_byte = byte_index + char_len;
+        }
+
+        byte_index += char_len;
+        i += 1;
+    }
+
+    return str.substr(start_byte, end_byte - start_byte);
+}

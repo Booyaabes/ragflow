@@ -1,0 +1,128 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
+package parser
+
+import (
+	"encoding/base64"
+	"strings"
+	"testing"
+)
+
+func TestPictureParserKeepsImageWithoutOCR(t *testing.T) {
+	data := []byte("picture bytes")
+	res := NewPictureParser().ParseWithResult(t.Context(), "photo.png", data)
+	if res.Err != nil {
+		t.Fatal(res.Err)
+	}
+	if len(res.JSON) != 1 || res.JSON[0].ToMap()["text"] != "" {
+		t.Fatalf("picture text = %+v, want empty text", res.JSON)
+	}
+	wantImage := "data:image/png;base64," + base64.StdEncoding.EncodeToString(data)
+	if res.JSON[0].ToMap()["image"] != wantImage {
+		t.Fatalf("picture image = %v, want %q", res.JSON[0].ToMap()["image"], wantImage)
+	}
+	if len(res.Warnings) != 0 {
+		t.Fatalf("picture warnings = %v, want none", res.Warnings)
+	}
+}
+
+func TestNewPictureParser(t *testing.T) {
+	p := NewPictureParser()
+	if p == nil {
+		t.Fatal("NewPictureParser returned nil")
+	}
+}
+
+func TestPictureParser_ParseWithResult_NilSetup(t *testing.T) {
+	ctx := t.Context()
+	p := NewPictureParser()
+	res := p.ParseWithResult(ctx, "photo.png", []byte("\x89PNG"))
+	if res.Err != nil {
+		t.Errorf("unexpected error for nil setup: %v", res.Err)
+	}
+	if !res.Produced() {
+		t.Errorf("produced = %t, want true (image only allows json)", res.Produced())
+	}
+	file, ok := res.File["doc_type_kwd"].(string)
+	if !ok || file != "image" {
+		t.Errorf("doc_type_kwd = %q, want image", file)
+	}
+}
+
+func TestPictureParser_ParseWithResult_ValidExtensions(t *testing.T) {
+	ctx := t.Context()
+	exts := []string{"png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "webp", "svg", "ico", "avif", "heic", "apng"}
+	p := NewPictureParser()
+	for _, ext := range exts {
+		fn := "img." + ext
+		res := p.ParseWithResult(ctx, fn, []byte{1, 2, 3})
+		if res.Err != nil {
+			t.Errorf("unexpected error for .%s: %v", ext, res.Err)
+		}
+		if !res.Produced() {
+			t.Errorf("produced = %t for .%s, want true (image only allows json)", res.Produced(), ext)
+		}
+	}
+}
+
+func TestPictureParser_ParseWithResult_InvalidExtension(t *testing.T) {
+	ctx := t.Context()
+	p := NewPictureParser()
+	res := p.ParseWithResult(ctx, "sound.mp3", []byte{1})
+	if res.Err == nil {
+		t.Error("expected error for .mp3, got nil")
+	}
+	if !strings.Contains(res.Err.Error(), "mp3") {
+		t.Errorf("error should mention unsupported extension, got: %v", res.Err)
+	}
+}
+
+func TestPictureParser_ParseWithResult_VideoExtension(t *testing.T) {
+	ctx := t.Context()
+	p := NewPictureParser()
+	res := p.ParseWithResult(ctx, "video.mp4", []byte{1})
+	if res.Err == nil {
+		t.Error("expected error for video .mp4, got nil")
+	}
+	if !strings.Contains(strings.ToLower(res.Err.Error()), "video") {
+		t.Errorf("error should mention video, got: %v", res.Err)
+	}
+}
+
+func TestPictureParser_ParseWithResult_produced(t *testing.T) {
+	ctx := t.Context()
+	p := NewPictureParser()
+	res := p.ParseWithResult(ctx, "photo.jpg", []byte{1, 2, 3})
+	if res.Err != nil {
+		t.Fatalf("unexpected error: %v", res.Err)
+	}
+	if !res.Produced() {
+		t.Errorf("produced = %t, want true", res.Produced())
+	}
+}
+
+func TestImageExtensions(t *testing.T) {
+	for ext := range imageExtensions {
+		if ext == "" {
+			t.Error("empty extension in imageExtensions set")
+		}
+		// All extensions should be lowercase (no uppercase keys).
+		if strings.ToLower(ext) != ext {
+			t.Errorf("non-lowercase extension key: %q", ext)
+		}
+	}
+}

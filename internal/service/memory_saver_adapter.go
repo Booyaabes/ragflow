@@ -1,0 +1,104 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
+package service
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"ragflow/internal/agent/component"
+	"ragflow/internal/agent/runtime"
+	"ragflow/internal/permission"
+)
+
+// memorySaverAdapter bridges the component.MemorySaver interface to the
+// agent-internal memory queue. It is installed via component.SetMemorySaver
+// at boot time so that the Message component can persist conversation
+// turns to memory stores declared in the canvas DSL.
+type memorySaverAdapter struct {
+	svc *MemoryService
+}
+
+// NewMemorySaverAdapter returns a component.MemorySaver backed by the
+// given MemoryService.
+func NewMemorySaverAdapter(svc *MemoryService) component.MemorySaver {
+	return &memorySaverAdapter{svc: svc}
+}
+
+// Save checks the authenticated caller's access to each configured memory
+// before queueing the message. Internal runs without a request identity use
+// the identity carried by the canvas runtime state.
+func (a *memorySaverAdapter) Save(ctx context.Context, req component.MemorySaveRequest) error {
+	if a == nil || a.svc == nil {
+		return fmt.Errorf("memory: saver adapter not initialised")
+	}
+	if len(req.MemoryIDs) > 0 {
+		state, stateErr := runtime.GetStateFromContext(ctx)
+		if stateErr != nil || state == nil {
+			return fmt.Errorf("%w: canvas runtime state is required to use memory from an agent", permission.ErrInvalidPermission)
+		}
+		canvasID, _ := state.GetSysString("canvas_id")
+		stateUserID, _ := state.GetSysString("user_id")
+		stateTenantID, _ := state.GetSysString("tenant_id")
+		canvasID = strings.TrimSpace(canvasID)
+		stateUserID = strings.TrimSpace(stateUserID)
+		stateTenantID = strings.TrimSpace(stateTenantID)
+		if canvasID == "" {
+			return fmt.Errorf("%w: canvas id is required to use memory from an agent", permission.ErrInvalidPermission)
+		}
+		contextUserID := permission.UserIDFromContext(ctx)
+		if contextUserID == "" {
+			if stateUserID == "" {
+				return permission.ErrUnauthenticated
+			}
+			tenantID := permission.TenantIDFromContext(ctx)
+			if tenantID == "" {
+				tenantID = stateTenantID
+			}
+			ctx = permission.WithIdentity(ctx, stateUserID, tenantID)
+		}
+		checker := permission.NewDatabaseChecker(a.svc.db)
+		entry := permission.ResourceRef{Kind: permission.ResourceKindCanvas, ID: canvasID}
+		for _, memoryID := range req.MemoryIDs {
+			memoryID = strings.TrimSpace(memoryID)
+			if memoryID == "" {
+				continue
+			}
+			if err := checker.CheckDependency(ctx, entry,
+				permission.ResourceRef{Kind: permission.ResourceKindMemory, ID: memoryID},
+				permission.OperationRun, permission.OperationUse); err != nil {
+				return fmt.Errorf("memory %q: %w", memoryID, err)
+			}
+		}
+	}
+	msg := MemoryMessage{
+		UserID:        req.UserID,
+		AgentID:       req.AgentID,
+		SessionID:     req.SessionID,
+		UserInput:     req.UserInput,
+		AgentResponse: req.AgentResponse,
+	}
+	ok, detail, err := a.svc.saveAgentMessage(ctx, req.MemoryIDs, msg)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("memory: %s", detail)
+	}
+	return nil
+}
