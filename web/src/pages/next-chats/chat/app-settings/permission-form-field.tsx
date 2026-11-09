@@ -4,7 +4,11 @@ import { PermissionRole } from '@/constants/permission';
 import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 
-export function PermissionFormField({ name = 'permission' }: { name?: string }) {
+export function PermissionFormField({
+  name = 'permission',
+}: {
+  name?: string;
+}) {
   const { t } = useTranslation();
   const teamOptions = useMemo(() => {
     return Object.values(PermissionRole).map((x) => ({

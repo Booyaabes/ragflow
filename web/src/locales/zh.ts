@@ -1009,7 +1009,8 @@ NER：使用 spaCy NER 和基于规则的关键词提取来抽取 Entities 和 R
       assistantAvatar: '助理头像',
       language: '语言',
       permissions: '权限',
-      permissionsTip: '如果把权限设为“团队”，则所有团队成员都可以操作该聊天助理。',
+      permissionsTip:
+        '设为“团队”后，团队成员可以使用该聊天助理，但只有你可以编辑或删除它。',
       me: '只有我',
       team: '团队',
       emptyResponse: '空回复',

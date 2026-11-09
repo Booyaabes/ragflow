@@ -1116,7 +1116,8 @@ This auto-tagging feature enhances retrieval by adding another layer of domain-s
       assistantAvatar: 'Assistant avatar',
       language: 'Language',
       permissions: 'Permissions',
-      permissionsTip: 'You can set the permissions of the team members here.',
+      permissionsTip:
+        'Set to Team to let team members use this assistant. Only you can edit or delete it.',
       me: 'Only me',
       team: 'Team',
       emptyResponse: 'Empty response',
@@ -3555,7 +3556,8 @@ This delimiter is used to split the input text into several text pieces echo of 
         upload: 'Upload',
         photo: 'Photo',
         permissions: 'Permissions',
-        permissionsTip: 'You can set the permissions of the team members here.',
+        permissionsTip:
+          'Set to Team to let team members use this assistant. Only you can edit or delete it.',
         me: 'me',
         team: 'Team',
       },
